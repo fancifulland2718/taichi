@@ -1,3 +1,5 @@
+# For day-to-day iteration prefer scripts/build_llvm19_local.ps1
+# (same CMake flags, runs on the local workstation, no 6-hour timeout).
 name: Build LLVM 19 for Windows
 
 on:
