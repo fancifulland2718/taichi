@@ -1,13 +1,9 @@
 name: Build and Test
+# NOTE (fork): auto-triggers (pull_request / push master / cron) have
+# been removed on this fork so local commits don't spam the Actions tab.
+# Run manually via the "Run workflow" button on GitHub when needed.
 on:
-  pull_request:
-    types: [opened, synchronize, reopened]
-  push:
-    branches:
-      - master
-      - rc-*
-  schedule:
-    - cron: '0 18 * * *'  # For testing the offline cache, GMT 18 == GMT+8 02
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.event.number || github.run_id }}

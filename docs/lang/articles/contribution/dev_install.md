@@ -82,7 +82,7 @@ This guide will focus on the `build.py` approach. If you prefer to use the conve
 | :-------------- | ------------------------------------------------------------------------------- |
 | Windows         | Windows 7/8/10/11                                                               |
 | Python          | 3.6+                                                                            |
-| Visual Studio   | Visual Studio 2022 (any edition) with "Desktop Development with C++" component. |
+| Visual Studio   | Visual Studio 2026 (any edition) with "Desktop Development with C++" component. |
 
 </TabItem>
 
@@ -93,13 +93,13 @@ This guide will focus on the `build.py` approach. If you prefer to use the conve
 
 <blockquote>
 
-Taichi supports building from source with Clang++ >= 10.0 and MSVC from VS2022.
+Taichi supports building from source with Clang++ >= 10.0 and MSVC from VS 2026.
 
 For macOS developers, it is recommended to use AppleClang, which comes with the Command Line Tools for Xcode. You can install them by running `xcode-select --install`. Alternatively, you can also install Xcode.app from the Apple Store.
 
 For Linux developers, it is recommended to install Clang using the package manager specific to your operating system. On Ubuntu 22.04, running `sudo apt install clang-15` should be sufficient. For older Ubuntu distributions to use a newer version of Clang, please follow the instructions on [official LLVM Debian/Ubuntu Nightly Packages](https://apt.llvm.org/).
 
-For Windows developers, if none of the VS2022 editions are installed, `build.py` will automatically start a VS2022 BuildTools installer for you.
+For Windows developers, if none of the VS 2026 editions are installed, `build.py` will automatically start a VS 2026 BuildTools installer for you.
 
 </blockquote>
 
@@ -170,7 +170,7 @@ installed/bin/llvm-config --version  # You should get 19.1.7
 <TabItem value="windows">
 
 ```shell
-# LLVM 19.1.7 + MSVC 2022 (Visual Studio 17.10+)
+# LLVM 19.1.7 + MSVC 2026 (Visual Studio 18.x)
 
 cmake .. -G Ninja ^
   -DCMAKE_BUILD_TYPE=Release ^
@@ -187,7 +187,7 @@ cmake .. -G Ninja ^
 cmake --build . --target install --config Release
 ```
 
-1. Use a **Developer Command Prompt for VS 2022** (17.10 or later).
+1. Use a **Developer Command Prompt for VS 2026**.
 2. When the build completes, add an environment variable `LLVM_DIR`
    with value `<PATH_TO_BUILD>\build\installed\lib\cmake\llvm`.
 

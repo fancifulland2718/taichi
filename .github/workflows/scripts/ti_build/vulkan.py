@@ -33,7 +33,10 @@ def setup_vulkan(version: str = _VULKAN_VERSION):
     # elif (u.system, u.machine) == ("Darwin", "arm64"):
     # elif (u.system, u.machine) == ("Darwin", "x86_64"):
     elif (u.system, u.machine) == ("Windows", "AMD64"):
-        url = f"https://sdk.lunarg.com/sdk/download/{version}/windows/vulkansdk-windows-X64-{version}.exe"
+        # LunarG renamed the Windows installer to "VulkanSDK-<ver>-Installer.exe"
+        # some time around the 1.4 series; the older "vulkansdk-windows-X64-*.exe"
+        # naming returns 404 for all versions now.
+        url = f"https://sdk.lunarg.com/sdk/download/{version}/windows/VulkanSDK-{version}-Installer.exe"
         prefix = get_cache_home() / f"vulkan-{version}"
         download_dep(
             url,

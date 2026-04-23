@@ -33,8 +33,8 @@
 [CmdletBinding()]
 param(
     [string]$LlvmTag    = "llvmorg-19.1.7",
-    [string]$SourceDir  = "build/llvm19-src",
-    [string]$BuildDir   = "build/llvm19-build",
+    [string]$SourceDir  = ".llvm19/src",
+    [string]$BuildDir   = ".llvm19/build",
     [string]$InstallDir = "dist/taichi-llvm-19",
     [string]$ZipPath    = "dist/taichi-llvm-19-msvc2026.zip",
     [int]   $Jobs       = 0,
@@ -46,20 +46,25 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
-# Windows PowerShell 5.1 (as opposed to PowerShell Core / pwsh) promotes
-# stderr output from native commands (git, cmake, ninja) to terminating
-# errors when `$ErrorActionPreference = Stop` is set. We rely on explicit
-# $LASTEXITCODE checks instead, so relax the native-command handling.
-# (The variable is only read by PowerShell 7+, but setting it is harmless
-# on 5.1.)
-$PSNativeCommandUseErrorActionPreference = $false
+# Windows PowerShell 5.1 (default powershell.exe on Windows) treats any
+# stderr output from native commands as an error when $ErrorActionPreference
+# is set to Stop. That means git's informative "Cloning into..." message,
+# CMake's warnings, and compiler diagnostics all abort the script. The
+# helpers below temporarily relax that behaviour and rely on explicit
+# $LASTEXITCODE checks instead.
 
-# Helper that runs a native command and throws if its exit code is non-zero.
-# stderr is redirected into stdout so PS 5.1 does not treat it as an error.
 function Invoke-Native {
-    param([Parameter(Mandatory)][string]$Exe,
-          [Parameter(ValueFromRemainingArguments)][string[]]$Args)
-    & $Exe @Args 2>&1 | ForEach-Object { Write-Host $_ }
+    param(
+        [Parameter(Mandatory)][string]$Exe,
+        [Parameter(ValueFromRemainingArguments)][string[]]$RemainingArgs
+    )
+    $prevEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & $Exe @RemainingArgs
+    } finally {
+        $ErrorActionPreference = $prevEap
+    }
     if ($LASTEXITCODE -ne 0) {
         throw "$Exe exited with code $LASTEXITCODE"
     }
@@ -89,6 +94,28 @@ Write-Host "  ZipPath    : $ZipPath"
 Write-Host "  Jobs       : $Jobs"
 
 # ---------------------------------------------------------------------------
+# 0. Fast path: if the install tree already looks complete, skip the entire
+#    build. LLVM 19 is a ~30 minute compile; re-running it every time a
+#    caller invokes this script is expensive and has caused
+#    "ninja: error: failed recompaction: Permission denied" incidents
+#    when two concurrent invocations fought over .ninja_log.
+# ---------------------------------------------------------------------------
+$llvmCMakeProbe = Join-Path $InstallDir "lib\cmake\llvm\LLVMConfig.cmake"
+$llvmCoreProbe  = Join-Path $InstallDir "lib\LLVMCore.lib"
+if ((Test-Path $llvmCMakeProbe) -and (Test-Path $llvmCoreProbe) -and -not $Clean) {
+    Write-Step "Existing install detected — skipping build"
+    Write-Host "  Found     : $llvmCMakeProbe"
+    Write-Host "  Found     : $llvmCoreProbe"
+    Write-Host ""
+    Write-Host "Set LLVM_DIR and build Taichi:"
+    Write-Host "  `$env:LLVM_DIR = '$(Join-Path $InstallDir 'lib\cmake\llvm')'"
+    Write-Host "  python build.py --python 3.10"
+    Write-Host ""
+    Write-Host "Pass -Clean to force a full rebuild."
+    exit 0
+}
+
+# ---------------------------------------------------------------------------
 # 1. Locate MSVC via vswhere and enter the x64 dev environment.
 # ---------------------------------------------------------------------------
 function Enter-MsvcDevEnv {
@@ -97,7 +124,7 @@ function Enter-MsvcDevEnv {
         $vswhere = "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe"
     }
     if (-not (Test-Path $vswhere)) {
-        throw "vswhere.exe not found. Install Visual Studio 2026 or 2026 with the 'Desktop development with C++' workload."
+        throw "vswhere.exe not found. Install Visual Studio 2026 with the 'Desktop development with C++' workload."
     }
 
     $vsRoot = & $vswhere -latest -prerelease `
@@ -158,8 +185,16 @@ if ($Clean) {
 # 3. Clone LLVM (shallow) unless -SkipClone
 # ---------------------------------------------------------------------------
 if (-not $SkipClone) {
+    $llvmSub = Join-Path $SourceDir "llvm"
     if (-not (Test-Path $SourceDir)) {
         Write-Step "Clone llvm-project @ $LlvmTag"
+        Invoke-Native git clone --depth 1 --branch $LlvmTag https://github.com/llvm/llvm-project.git $SourceDir
+    } elseif (-not (Test-Path $llvmSub)) {
+        # Source dir exists but no llvm/ subtree — likely an aborted clone
+        # (just the .git folder). Wipe and re-clone rather than failing later
+        # with a confusing "source directory does not exist" CMake error.
+        Write-Host "  $SourceDir exists but has no llvm/ subtree — re-cloning."
+        Remove-Item -Recurse -Force $SourceDir
         Invoke-Native git clone --depth 1 --branch $LlvmTag https://github.com/llvm/llvm-project.git $SourceDir
     } else {
         Write-Host "  $SourceDir already exists — reusing (pass -SkipClone to silence this, or delete the dir)."
@@ -198,16 +233,14 @@ $cmakeArgs = @(
     "-DLLVM_BUILD_UTILS=OFF",
     "-DLLVM_HOST_TRIPLE=x86_64-pc-windows-msvc"
 )
-& cmake @cmakeArgs 2>&1 | ForEach-Object { Write-Host $_ }
-if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
+Invoke-Native cmake @cmakeArgs
 
 # ---------------------------------------------------------------------------
 # 5. Build & install
 # ---------------------------------------------------------------------------
 Write-Step "Build & install (parallel=$Jobs)"
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-& cmake --build $BuildDir --target install --config Release --parallel $Jobs 2>&1 | ForEach-Object { Write-Host $_ }
-if ($LASTEXITCODE -ne 0) { throw "CMake build failed" }
+Invoke-Native cmake --build $BuildDir --target install --config Release --parallel $Jobs
 $sw.Stop()
 Write-Host ("  Build time : {0:N1} minutes" -f $sw.Elapsed.TotalMinutes)
 

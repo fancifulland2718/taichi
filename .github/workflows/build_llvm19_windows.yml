@@ -19,7 +19,7 @@ permissions:
 
 jobs:
   build-llvm19-windows:
-    runs-on: windows-2022
+    runs-on: windows-2026
     timeout-minutes: 360
     steps:
       - name: Checkout (for workflow metadata)
@@ -70,7 +70,7 @@ jobs:
       - name: Package zip
         shell: pwsh
         run: |
-          $zipName = "taichi-llvm-19-msvc2022.zip"
+          $zipName = "taichi-llvm-19-msvc2026.zip"
           Compress-Archive -Path "dist/taichi-llvm-19/*" -DestinationPath $zipName
           Get-FileHash $zipName -Algorithm SHA256 | Tee-Object -FilePath "$zipName.sha256.txt"
 
@@ -78,9 +78,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.inputs.release_tag }}
-          name: LLVM 19 Windows MSVC2022
+          name: LLVM 19 Windows MSVC2026
           files: |
-            taichi-llvm-19-msvc2022.zip
-            taichi-llvm-19-msvc2022.zip.sha256.txt
+            taichi-llvm-19-msvc2026.zip
+            taichi-llvm-19-msvc2026.zip.sha256.txt
           draft: false
           prerelease: false

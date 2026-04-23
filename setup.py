@@ -102,7 +102,6 @@ class Clean(clean):
             remove_tree(self.build_temp, dry_run=self.dry_run)
         generated_folders = (
             "bin",
-            "dist",
             "python/taichi/assets",
             "python/taichi/_lib/runtime",
             "python/taichi/_lib/c_api",
@@ -113,6 +112,19 @@ class Clean(clean):
         for d in generated_folders:
             if os.path.exists(d):
                 remove_tree(d, dry_run=self.dry_run)
+        # Selectively clean dist/: remove wheels/eggs but preserve the local
+        # LLVM install (dist/taichi-llvm-19[…]) produced by
+        # scripts/build_llvm19_local.ps1 — otherwise the subsequent
+        # bdist_wheel step loses its LLVM toolchain.
+        if os.path.exists("dist"):
+            for name in os.listdir("dist"):
+                if name.startswith("taichi-llvm-"):
+                    continue
+                path = os.path.join("dist", name)
+                if os.path.isdir(path):
+                    remove_tree(path, dry_run=self.dry_run)
+                elif not self.dry_run:
+                    os.remove(path)
         generated_files = ["taichi/common/commit_hash.h", "taichi/common/version.h"]
         generated_files += glob.glob("taichi/runtime/llvm/runtime_*.bc")
         generated_files += glob.glob("python/taichi/_lib/core/*.so")
@@ -148,7 +160,7 @@ def get_cmake_args():
         if os.getenv("TAICHI_USE_MSBUILD", "0") in ("1", "ON"):
             use_msbuild = True
         if use_msbuild:
-            build_options.extend(["-G", "Visual Studio 17 2022"])
+            build_options.extend(["-G", "Visual Studio 17 2026"])
         else:
             build_options.extend(["-G", "Ninja", "--skip-generator-test"])
     if sys.platform == "darwin":

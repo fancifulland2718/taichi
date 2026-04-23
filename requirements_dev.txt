@@ -12,6 +12,11 @@ requests
 twine
 wheel
 pre-commit
+# scikit-build 0.19.x still references `distutils.command.build_py` via the
+# setuptools legacy-distutils shim, which setuptools >=80 removed. Pinning
+# setuptools below that boundary keeps the existing scikit-build-based
+# setup.py working until we migrate to scikit-build-core.
+setuptools<80
 scikit-build
 numpy
 ninja; platform_system != 'Windows'

@@ -1,8 +1,6 @@
 name: Performance Monitoring
+# NOTE (fork): push-to-master auto-trigger removed; run manually.
 on:
-  push:
-    branches:
-    - master
   workflow_dispatch: {}
   repository_dispatch:
     types: [benchmark-command]

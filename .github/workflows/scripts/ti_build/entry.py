@@ -33,6 +33,15 @@ def build_wheel(python: Command, pip: Command) -> None:
     Build the Taichi wheel
     """
 
+    # scikit-build 0.19.x imports `setuptools.command.build_py`, which in turn
+    # does `import distutils.command.build_py as orig`. Recent setuptools
+    # (>=79) have removed the `build_py` submodule attribute from their
+    # bundled `_distutils.command` shim, which breaks the import when
+    # SETUPTOOLS_USE_DISTUTILS defaults to the vendored copy. Forcing the
+    # stdlib distutils works on Python <= 3.11 where it is still available,
+    # and is the recommended fallback until we migrate to scikit-build-core.
+    os.environ.setdefault("SETUPTOOLS_USE_DISTUTILS", "stdlib")
+
     git.fetch("origin", "master", "--tags", "--force")
     proj_tags = []
     extra = []
@@ -59,7 +68,14 @@ def build_wheel(python: Command, pip: Command) -> None:
             extra.extend(["-p", "manylinux_2_27_x86_64"])
 
     python("setup.py", "clean")
-    python("misc/make_changelog.py", "--ver", "origin/master", "--repo_dir", "./", "--save")
+    try:
+        python("misc/make_changelog.py", "--ver", "origin/master", "--repo_dir", "./", "--save")
+    except CommandFailed as e:
+        # Changelog generation requires upstream release tags (v*) to be
+        # present in the repo. Forks that have not fetched upstream tags will
+        # fail here, but the changelog is not required to produce a wheel.
+        # Log and continue so local/dev builds stay functional.
+        misc.info(f"make_changelog.py failed (non-fatal, skipping): {e}")
 
     with nice():
         python("setup.py", *proj_tags, "bdist_wheel", *extra)

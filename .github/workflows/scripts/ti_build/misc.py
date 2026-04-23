@@ -62,6 +62,9 @@ def banner(msg: str) -> Callable:
 
         def wrapper(*args, **kwargs):
             _args = sig.bind(*args, **kwargs)
+            # Apply parameter defaults so that @banner("... {foo}") works
+            # when the caller relies on a default value for `foo`.
+            _args.apply_defaults()
             p(f"{C}:: -----BEGIN {msg}-----{N}".format(**_args.arguments))
             try:
                 ret = f(*args, **kwargs)

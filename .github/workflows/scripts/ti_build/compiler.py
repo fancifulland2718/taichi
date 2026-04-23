@@ -119,45 +119,81 @@ def _vs_devshell(vs):
 def setup_msvc() -> None:
     assert platform.system() == "Windows"
 
-    base = Path("C:\\Program Files (x86)\\Microsoft Visual Studio")
-    for ver in ("2022",):
-        for edition in ("Enterprise", "Professional", "Community", "BuildTools"):
-            vs = base / ver / edition
-            if not vs.exists():
-                continue
+    # Prefer vswhere so we can transparently pick up VS 2026 (or any
+    # future major). Fall back to the legacy hard-coded paths only if
+    # vswhere is unavailable.
+    vs: Path | None = None
+    vswhere_candidates = [
+        Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"))
+        / "Microsoft Visual Studio\\Installer\\vswhere.exe",
+        Path(os.environ.get("ProgramFiles", r"C:\Program Files"))
+        / "Microsoft Visual Studio\\Installer\\vswhere.exe",
+    ]
+    vswhere = next((p for p in vswhere_candidates if p.exists()), None)
+    if vswhere is not None:
+        try:
+            out = subprocess.check_output(
+                [
+                    str(vswhere),
+                    "-latest",
+                    "-prerelease",
+                    "-requires",
+                    "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
+                    "-property",
+                    "installationPath",
+                ],
+                text=True,
+            ).strip()
+            if out:
+                vs = Path(out)
+        except subprocess.CalledProcessError:
+            vs = None
 
-            if os.environ.get("TI_CI") and not os.environ.get("TAICHI_USE_MSBUILD"):
-                # Use Ninja + MSVC in CI, for better caching
-                _vs_devshell(vs)
-                cmake_args["CMAKE_C_COMPILER"] = "cl.exe"
-                cmake_args["CMAKE_CXX_COMPILER"] = "cl.exe"
-            else:
-                os.environ["TAICHI_USE_MSBUILD"] = "1"
+    # Legacy fallback — enumerate the layouts used by the VS 2026 installer.
+    if vs is None:
+        legacy_roots = [
+            Path(r"C:\Program Files (x86)\Microsoft Visual Studio"),
+            Path(r"C:\Program Files\Microsoft Visual Studio"),
+        ]
+        for base in legacy_roots:
+            for ver in ("2026",):
+                for edition in ("Enterprise", "Professional", "Community", "BuildTools"):
+                    candidate = base / ver / edition
+                    if candidate.exists():
+                        vs = candidate
+                        break
+                if vs:
+                    break
+            if vs:
+                break
 
-            return
-    else:
-        url = "https://aka.ms/vs/17/release/vs_BuildTools.exe"
-        out = base / "2022" / "BuildTools"
-        download_dep(
-            url,
-            out,
-            elevate=True,
-            args=[
-                "--passive",
-                "--wait",
-                "--norestart",
-                "--includeRecommended",
-                "--add",
-                "Microsoft.VisualStudio.Workload.VCTools",
-                # NOTE: We are using the custom built Clang++,
-                #       so components below are not necessary anymore.
-                # '--add',
-                # 'Microsoft.VisualStudio.Component.VC.Llvm.Clang',
-                # '--add',
-                # 'Microsoft.VisualStudio.ComponentGroup.NativeDesktop.Llvm.Clang',
-                # '--add',
-                # 'Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset',
-            ],
-        )
-        warn("Please restart build.py after Visual Studio Build Tools is installed.")
-        sys.exit(1)
+    if vs is not None:
+        # Always use Ninja + cl.exe for local builds. Ninja works
+        # identically with any MSVC toolchain (2022, 2026, future), avoids
+        # version-pinned generators like `Visual Studio 17 2022`, and
+        # lets sccache wrap cl.exe transparently.
+        _vs_devshell(vs)
+        cmake_args["CMAKE_C_COMPILER"] = "cl.exe"
+        cmake_args["CMAKE_CXX_COMPILER"] = "cl.exe"
+        os.environ["CMAKE_GENERATOR"] = "Ninja"
+        os.environ.pop("TAICHI_USE_MSBUILD", None)
+        return
+
+    # Nothing found — install VS 2026 Build Tools as a last resort.
+    url = "https://aka.ms/vs/18/release/vs_BuildTools.exe"
+    out = Path(r"C:\Program Files (x86)\Microsoft Visual Studio") / "2026" / "BuildTools"
+    download_dep(
+        url,
+        out,
+        elevate=True,
+        args=[
+            "--passive",
+            "--wait",
+            "--norestart",
+            "--includeRecommended",
+            "--add",
+            "Microsoft.VisualStudio.Workload.VCTools",
+        ],
+    )
+    warn("Please restart build.py after Visual Studio Build Tools is installed.")
+    sys.exit(1)

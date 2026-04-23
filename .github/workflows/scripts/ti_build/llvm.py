@@ -46,13 +46,14 @@ def _repo_root() -> str:
 def _find_local_llvm19() -> str:
     """Look for a local LLVM 19 install produced by build_llvm19_local.ps1.
 
-    Returns the install prefix (not the lib/cmake/llvm subdir) so callers
-    can point LLVM_DIR at it — the Taichi CMake scripts accept either the
-    prefix or the cmake subdir.
+    Returns the path to the lib/cmake/llvm subdirectory because CMake's
+    find_package(LLVM CONFIG) expects LLVM_DIR to point directly at the
+    directory containing LLVMConfig.cmake.
     """
-    candidate = os.path.join(_repo_root(), "dist", "taichi-llvm-19")
-    if os.path.isdir(os.path.join(candidate, "lib", "cmake", "llvm")):
-        return candidate
+    prefix = os.path.join(_repo_root(), "dist", "taichi-llvm-19")
+    cmake_dir = os.path.join(prefix, "lib", "cmake", "llvm")
+    if os.path.isfile(os.path.join(cmake_dir, "LLVMConfig.cmake")):
+        return cmake_dir
     return ""
 
 

@@ -1,6 +1,7 @@
 *.swp
 *.swo
 /.vs
+/.llvm19
 /.*_localrc
 /tags
 /Debug
