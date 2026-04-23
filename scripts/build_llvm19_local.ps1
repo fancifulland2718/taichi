@@ -5,7 +5,7 @@
 # 6-hour GitHub Actions timeout.
 #
 # Requirements (auto-detected where possible):
-#   * Visual Studio 2022 or 2026 with "Desktop development with C++" workload
+#   * Visual Studio 2026 with "Desktop development with C++" workload
 #     (locates MSVC via vswhere.exe)
 #   * CMake 3.20+ (bundled with VS works; or install separately)
 #   * Ninja on PATH (falls back to CMake-discovered ninja in VS)
@@ -19,7 +19,7 @@
 #   -SourceDir     Where to clone llvm-project (default .\build\llvm19-src)
 #   -BuildDir      CMake build tree     (default .\build\llvm19-build)
 #   -InstallDir    Install prefix       (default .\dist\taichi-llvm-19)
-#   -ZipPath       Output zip           (default .\dist\taichi-llvm-19-msvc2022.zip)
+#   -ZipPath       Output zip           (default .\dist\taichi-llvm-19-msvc2026.zip)
 #   -Jobs          Parallel compile jobs (default = logical CPU count)
 #   -SkipZip       Skip packaging the zip (install-only)
 #   -SkipClone     Reuse existing SourceDir (no fetch)
@@ -36,7 +36,7 @@ param(
     [string]$SourceDir  = "build/llvm19-src",
     [string]$BuildDir   = "build/llvm19-build",
     [string]$InstallDir = "dist/taichi-llvm-19",
-    [string]$ZipPath    = "dist/taichi-llvm-19-msvc2022.zip",
+    [string]$ZipPath    = "dist/taichi-llvm-19-msvc2026.zip",
     [int]   $Jobs       = 0,
     [switch]$SkipZip,
     [switch]$SkipClone,
@@ -45,6 +45,25 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+# Windows PowerShell 5.1 (as opposed to PowerShell Core / pwsh) promotes
+# stderr output from native commands (git, cmake, ninja) to terminating
+# errors when `$ErrorActionPreference = Stop` is set. We rely on explicit
+# $LASTEXITCODE checks instead, so relax the native-command handling.
+# (The variable is only read by PowerShell 7+, but setting it is harmless
+# on 5.1.)
+$PSNativeCommandUseErrorActionPreference = $false
+
+# Helper that runs a native command and throws if its exit code is non-zero.
+# stderr is redirected into stdout so PS 5.1 does not treat it as an error.
+function Invoke-Native {
+    param([Parameter(Mandatory)][string]$Exe,
+          [Parameter(ValueFromRemainingArguments)][string[]]$Args)
+    & $Exe @Args 2>&1 | ForEach-Object { Write-Host $_ }
+    if ($LASTEXITCODE -ne 0) {
+        throw "$Exe exited with code $LASTEXITCODE"
+    }
+}
 
 function Write-Step($msg) {
     Write-Host ""
@@ -78,7 +97,7 @@ function Enter-MsvcDevEnv {
         $vswhere = "$env:ProgramFiles\Microsoft Visual Studio\Installer\vswhere.exe"
     }
     if (-not (Test-Path $vswhere)) {
-        throw "vswhere.exe not found. Install Visual Studio 2022 or 2026 with the 'Desktop development with C++' workload."
+        throw "vswhere.exe not found. Install Visual Studio 2026 or 2026 with the 'Desktop development with C++' workload."
     }
 
     $vsRoot = & $vswhere -latest -prerelease `
@@ -141,8 +160,7 @@ if ($Clean) {
 if (-not $SkipClone) {
     if (-not (Test-Path $SourceDir)) {
         Write-Step "Clone llvm-project @ $LlvmTag"
-        & git clone --depth 1 --branch $LlvmTag https://github.com/llvm/llvm-project.git $SourceDir
-        if ($LASTEXITCODE -ne 0) { throw "git clone failed" }
+        Invoke-Native git clone --depth 1 --branch $LlvmTag https://github.com/llvm/llvm-project.git $SourceDir
     } else {
         Write-Host "  $SourceDir already exists — reusing (pass -SkipClone to silence this, or delete the dir)."
     }
@@ -180,7 +198,7 @@ $cmakeArgs = @(
     "-DLLVM_BUILD_UTILS=OFF",
     "-DLLVM_HOST_TRIPLE=x86_64-pc-windows-msvc"
 )
-& cmake @cmakeArgs
+& cmake @cmakeArgs 2>&1 | ForEach-Object { Write-Host $_ }
 if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
 
 # ---------------------------------------------------------------------------
@@ -188,7 +206,7 @@ if ($LASTEXITCODE -ne 0) { throw "CMake configure failed" }
 # ---------------------------------------------------------------------------
 Write-Step "Build & install (parallel=$Jobs)"
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
-& cmake --build $BuildDir --target install --config Release --parallel $Jobs
+& cmake --build $BuildDir --target install --config Release --parallel $Jobs 2>&1 | ForEach-Object { Write-Host $_ }
 if ($LASTEXITCODE -ne 0) { throw "CMake build failed" }
 $sw.Stop()
 Write-Host ("  Build time : {0:N1} minutes" -f $sw.Elapsed.TotalMinutes)
