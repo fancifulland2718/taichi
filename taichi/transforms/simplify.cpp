@@ -547,7 +547,14 @@ void full_simplify(IRNode *root,
       if (alg_simp(root, config))
         modified = true;
       print("alg_simp");
-      if (loop_invariant_code_motion(root, config))
+      // P2.b: Run loop_invariant_code_motion only in the first iteration.
+      // LICM has its own internal fixed-point loop (see
+      // LoopInvariantCodeMotion::run) that cascades all hoistable stmts in
+      // one call, so subsequent full_simplify iterations would only help if
+      // alg_simp/constant_fold create brand-new loop-invariant expressions,
+      // which is rare. Mirrors the existing first_iteration guard on
+      // whole_kernel_cse and cfg_optimization below.
+      if (first_iteration && loop_invariant_code_motion(root, config))
         modified = true;
       print("loop_invariant_code_motion");
       if (die(root))

@@ -91,3 +91,8 @@ imgui.ini
 .do-not-clean
 *.dylib
 *.ply
+
+# P2 bench probe/log scratch files
+tests/p2/*.txt
+tests/p2/*.log
+
