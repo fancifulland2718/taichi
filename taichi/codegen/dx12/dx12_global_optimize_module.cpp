@@ -6,6 +6,7 @@
 #include "taichi/ir/statements.h"
 #include "taichi/util/file_sequence_writer.h"
 #include "taichi/runtime/llvm/llvm_context.h"
+#include "taichi/runtime/llvm/llvm_opt_pipeline.h"
 
 #include "dx12_llvm_passes.h"
 #include "llvm/ADT/StringRef.h"
@@ -14,7 +15,7 @@
 
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Attributes.h"
-#include "llvm/Support/Host.h"
+#include "llvm/TargetParser/Host.h"
 #include "llvm/MC/TargetRegistry.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/Module.h"
@@ -24,7 +25,7 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/FormatVariadic.h"
 #include "llvm/Target/TargetMachine.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+// PassManagerBuilder was removed in LLVM 17; see llvm_opt_pipeline.h.
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar.h"
 #include "llvm/Transforms/Scalar/GVN.h"
@@ -109,51 +110,45 @@ std::vector<uint8_t> global_optimize_module(llvm::Module *module,
   std::unique_ptr<TargetMachine> target_machine(target->createTargetMachine(
       triple.str(), mcpu.str(), "", options, llvm::Reloc::PIC_,
       llvm::CodeModel::Small,
-      config.opt_level > 0 ? CodeGenOpt::Aggressive : CodeGenOpt::None));
+      config.opt_level > 0 ? llvm::CodeGenOptLevel::Aggressive
+                           : llvm::CodeGenOptLevel::None));
 
   TI_ERROR_UNLESS(target_machine.get(), "Could not allocate target machine!");
 
   module->setDataLayout(target_machine->createDataLayout());
 
-  // Lower taichi intrinsic first.
-  module_pass_manager.add(createTaichiIntrinsicLowerPass(&config));
-
-  module_pass_manager.add(createTargetTransformInfoWrapperPass(
-      target_machine->getTargetIRAnalysis()));
-  function_pass_manager.add(createTargetTransformInfoWrapperPass(
-      target_machine->getTargetIRAnalysis()));
-
-  PassManagerBuilder b;
-  b.OptLevel = 3;
-  b.Inliner = createFunctionInliningPass(b.OptLevel, 0, false);
-  b.LoopVectorize = true;
-  b.SLPVectorize = true;
-
-  target_machine->adjustPassManager(b);
-
-  b.populateFunctionPassManager(function_pass_manager);
-  b.populateModulePassManager(module_pass_manager);
-  // Add passes after inline.
-  module_pass_manager.add(createTaichiRuntimeContextLowerPass());
-
-  llvm::SmallString<256> str;
-  llvm::raw_svector_ostream OS(str);
-  // Write DXIL container to OS.
-  target_machine->addPassesToEmitFile(module_pass_manager, OS, nullptr,
-                                      CGFT_ObjectFile);
-
+  // Phase 1: lower Taichi intrinsics via the legacy PM (these are
+  // legacy ModulePass derivations living in taichi/codegen/dx12).
   {
-    TI_PROFILER("llvm_function_pass");
-    function_pass_manager.doInitialization();
-    for (llvm::Module::iterator i = module->begin(); i != module->end(); i++)
-      function_pass_manager.run(*i);
-
-    function_pass_manager.doFinalization();
+    TI_PROFILER("llvm_pre_opt_taichi_passes");
+    llvm::legacy::PassManager pre_opt_pm;
+    pre_opt_pm.add(createTaichiIntrinsicLowerPass(&config));
+    pre_opt_pm.run(*module);
   }
 
+  // Phase 2: run the standard O3 optimization pipeline via the New
+  // PassManager (PassManagerBuilder was removed in LLVM 17).
   {
-    TI_PROFILER("llvm_module_pass");
-    module_pass_manager.run(*module);
+    TI_PROFILER("llvm_module_opt_pipeline");
+    LLVMOptPipelineOptions opts;
+    opts.opt_level = llvm::OptimizationLevel::O3;
+    opts.loop_vectorize = true;
+    opts.slp_vectorize = true;
+    opts.run_post_gep_passes = true;
+    run_module_opt_pipeline(*module, target_machine.get(), opts);
+  }
+
+  // Phase 3: lower runtime context references and emit DXIL via the
+  // legacy PM (codegen still requires legacy infrastructure).
+  llvm::SmallString<256> str;
+  llvm::raw_svector_ostream OS(str);
+  {
+    TI_PROFILER("llvm_emit_dxil");
+    llvm::legacy::PassManager emit_pm;
+    emit_pm.add(createTaichiRuntimeContextLowerPass());
+    target_machine->addPassesToEmitFile(emit_pm, OS, nullptr,
+                                        llvm::CodeGenFileType::ObjectFile);
+    emit_pm.run(*module);
   }
   if (config.print_kernel_llvm_ir_optimized) {
     static FileSequenceWriter writer(

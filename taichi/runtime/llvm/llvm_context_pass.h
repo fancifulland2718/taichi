@@ -6,7 +6,13 @@
 #include "llvm/Pass.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Transforms/IPO.h"
-#include "llvm/Transforms/IPO/PassManagerBuilder.h"
+// NOTE: llvm/Transforms/IPO/PassManagerBuilder.h was removed in LLVM 17.
+// The module-level optimization pipeline is now built with the New Pass
+// Manager via taichi::lang::run_module_opt_pipeline (llvm_opt_pipeline.h).
+// The custom passes defined in this header (AddStructForFuncPass, the
+// AMDGPU helpers) are still Legacy passes because they are only used
+// standalone — not inside the optimization pipeline — and the Legacy
+// PassManager infrastructure is still supported on LLVM 19/20+.
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Support/SourceMgr.h"

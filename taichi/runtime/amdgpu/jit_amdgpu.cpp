@@ -1,6 +1,7 @@
 #include "taichi/runtime/amdgpu/jit_amdgpu.h"
 #include "taichi/runtime/llvm/llvm_context.h"
 #include "taichi/runtime/llvm/llvm_context_pass.h"
+#include "taichi/runtime/llvm/llvm_opt_pipeline.h"
 
 #include "llvm/IR/Module.h"
 #include "llvm/Transforms/Utils/Cloning.h"
@@ -66,7 +67,8 @@ std::string JITSessionAMDGPU::compile_module_to_hsaco(
 
   std::unique_ptr<llvm::TargetMachine> machine(target->createTargetMachine(
       triple_str, AMDGPUContext::get_instance().get_mcpu(), "", options,
-      llvm::Reloc::PIC_, llvm::CodeModel::Small, llvm::CodeGenOpt::Aggressive));
+      llvm::Reloc::PIC_, llvm::CodeModel::Small,
+      llvm::CodeGenOptLevel::Aggressive));
 
   llvm_module->setDataLayout(machine->createDataLayout());
 
@@ -86,24 +88,30 @@ std::string JITSessionAMDGPU::compile_module_to_hsaco(
     //    each other)
 
     auto module_clone = llvm::CloneModule(*llvm_module);
-    llvm::legacy::PassManager module_gen_gcn_pass_manager;
-    llvm::SmallString<0> gcnstr;
-    llvm::raw_svector_ostream llvm_stream_gcn(gcnstr);
     std::unique_ptr<llvm::TargetMachine> machine_gen_gcn(
         target->createTargetMachine(
             triple_str, AMDGPUContext::get_instance().get_mcpu(), "", options,
             llvm::Reloc::PIC_, llvm::CodeModel::Small,
-            llvm::CodeGenOpt::Aggressive));
-    llvm::PassManagerBuilder builder;
-    builder.OptLevel = 3;
-    builder.Inliner =
-        llvm::createFunctionInliningPass(builder.OptLevel, 0, false);
-    builder.populateModulePassManager(module_gen_gcn_pass_manager);
-    module_gen_gcn_pass_manager.add(llvm::createTargetTransformInfoWrapperPass(
-        machine_gen_gcn->getTargetIRAnalysis()));
+            llvm::CodeGenOptLevel::Aggressive));
+
+    // Run the optimization pipeline on the clone via the New PM, then
+    // emit GCN assembly via the legacy PM (codegen still requires it).
+    {
+      LLVMOptPipelineOptions opts;
+      opts.opt_level = llvm::OptimizationLevel::O3;
+      opts.loop_vectorize = true;
+      opts.slp_vectorize = true;
+      opts.run_post_gep_passes = false;
+      run_module_opt_pipeline(*module_clone, machine_gen_gcn.get(), opts);
+    }
+
+    llvm::legacy::PassManager module_gen_gcn_pass_manager;
+    llvm::SmallString<0> gcnstr;
+    llvm::raw_svector_ostream llvm_stream_gcn(gcnstr);
     machine_gen_gcn->addPassesToEmitFile(module_gen_gcn_pass_manager,
                                          llvm_stream_gcn, nullptr,
-                                         llvm::CGFT_AssemblyFile, true);
+                                         llvm::CodeGenFileType::AssemblyFile,
+                                         true);
     module_gen_gcn_pass_manager.run(*module_clone);
     std::string gcn(gcnstr.begin(), gcnstr.end());
     static FileSequenceWriter writer("taichi_kernel_amdgcn_{:04d}.gcn",
@@ -111,21 +119,16 @@ std::string JITSessionAMDGPU::compile_module_to_hsaco(
     writer.write(gcn);
   }
 
-  llvm::legacy::FunctionPassManager function_pass_manager(llvm_module.get());
-  llvm::legacy::PassManager module_pass_manager;
-
-  module_pass_manager.add(llvm::createTargetTransformInfoWrapperPass(
-      machine->getTargetIRAnalysis()));
-  function_pass_manager.add(llvm::createTargetTransformInfoWrapperPass(
-      machine->getTargetIRAnalysis()));
-
-  llvm::PassManagerBuilder builder;
-  builder.OptLevel = 3;
-  builder.Inliner =
-      llvm::createFunctionInliningPass(builder.OptLevel, 0, false);
-  machine->adjustPassManager(builder);
-  builder.populateFunctionPassManager(function_pass_manager);
-  builder.populateModulePassManager(module_pass_manager);
+  // Run the standard O3 optimization pipeline on the real module.
+  {
+    TI_PROFILER("llvm_module_opt_pipeline");
+    LLVMOptPipelineOptions opts;
+    opts.opt_level = llvm::OptimizationLevel::O3;
+    opts.loop_vectorize = true;
+    opts.slp_vectorize = true;
+    opts.run_post_gep_passes = false;
+    run_module_opt_pipeline(*llvm_module, machine.get(), opts);
+  }
 
   machine->Options.MCOptions.AsmVerbose = true;
 
@@ -142,14 +145,14 @@ std::string JITSessionAMDGPU::compile_module_to_hsaco(
   llvm::SmallString<0> outstr;
   llvm::raw_svector_ostream llvm_stream(outstr);
 
-  machine->addPassesToEmitFile(module_pass_manager, llvm_stream, nullptr,
-                               llvm::CGFT_ObjectFile, true);
-
-  function_pass_manager.doInitialization();
-  for (auto func = llvm_module->begin(); func != llvm_module->end(); ++func)
-    function_pass_manager.run(*func);
-  function_pass_manager.doFinalization();
-  module_pass_manager.run(*llvm_module);
+  // Emit HSACO object file via the legacy PM.
+  llvm::legacy::PassManager emit_pm;
+  machine->addPassesToEmitFile(emit_pm, llvm_stream, nullptr,
+                               llvm::CodeGenFileType::ObjectFile, true);
+  {
+    TI_PROFILER("llvm_emit_hsaco");
+    emit_pm.run(*llvm_module);
+  }
 
   std::string obj_str(outstr.begin(), outstr.end());
   std::ofstream(obj_path) << obj_str;

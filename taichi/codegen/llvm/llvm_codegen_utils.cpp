@@ -29,7 +29,14 @@ bool is_same_type(llvm::Type *a, llvm::Type *b) {
     return false;
   }
   if (a->isPointerTy()) {
-    return is_same_type(a->getPointerElementType(), b->getPointerElementType());
+    // Under opaque pointers (mandatory on LLVM 19+) a pointer no longer
+    // carries its pointee type, so every pointer compares equal to every
+    // other pointer of the same address space. Taichi identifies
+    // matching struct modules by name comparison elsewhere, so this
+    // coarse equality is sufficient for the uses of is_same_type().
+    auto *pa = llvm::cast<llvm::PointerType>(a);
+    auto *pb = llvm::cast<llvm::PointerType>(b);
+    return pa->getAddressSpace() == pb->getAddressSpace();
   }
   if (a->isFunctionTy() != b->isFunctionTy()) {
     return false;

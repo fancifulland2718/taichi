@@ -1679,10 +1679,10 @@ llvm::Value *TaskCodeGenLLVM::call(
   auto prefix = get_runtime_snode_name(snode);
   auto s = emit_struct_meta(snode);
   auto s_ptr =
-      builder->CreateBitCast(s, llvm::Type::getInt8PtrTy(*llvm_context));
+      builder->CreateBitCast(s, llvm::PointerType::get(*llvm_context, 0));
 
   node_ptr =
-      builder->CreateBitCast(node_ptr, llvm::Type::getInt8PtrTy(*llvm_context));
+      builder->CreateBitCast(node_ptr, llvm::PointerType::get(*llvm_context, 0));
 
   std::vector<llvm::Value *> func_arguments{s_ptr, node_ptr};
 
@@ -1795,13 +1795,15 @@ void TaskCodeGenLLVM::visit(SNodeLookupStmt *stmt) {
   TI_ASSERT(parent);
   auto snode = stmt->snode;
   if (snode->type == SNodeType::root) {
-    // FIXME: get parent_type from taichi instead of llvm.
-    llvm::Type *parent_ty = builder->getInt8Ty();
-    if (auto bit_cast = llvm::dyn_cast<llvm::BitCastInst>(parent)) {
-      parent_ty = bit_cast->getDestTy();
-      if (auto ptr_ty = llvm::dyn_cast<llvm::PointerType>(parent_ty))
-        parent_ty = ptr_ty->getPointerElementType();
-    }
+    // Derive the root node's LLVM struct type directly from the SNode
+    // metadata. Previously the code inspected the incoming bitcast's
+    // destination type via `PointerType::getPointerElementType()`, which
+    // is a deprecated typed-pointer API and disappears under LLVM 19's
+    // mandatory opaque pointers. `get_llvm_node_type` is the authoritative
+    // SNode→LLVM type mapping used across the struct compiler, so it
+    // produces the correct GEP element type unconditionally.
+    llvm::Type *parent_ty =
+        StructCompilerLLVM::get_llvm_node_type(module.get(), snode);
     llvm_val[stmt] =
         builder->CreateGEP(parent_ty, parent, llvm_val[stmt->input_index]);
   } else if (snode->type == SNodeType::dense ||
@@ -1842,7 +1844,7 @@ void TaskCodeGenLLVM::visit(GetChStmt *stmt) {
         stmt->output_snode->get_snode_tree_id(),
         stmt->output_snode->get_ch_from_parent_func_name(),
         builder->CreateBitCast(llvm_val[stmt->input_ptr],
-                               llvm::PointerType::getInt8PtrTy(*llvm_context)));
+                               llvm::PointerType::get(*llvm_context, 0)));
     llvm_val[stmt] = builder->CreateBitCast(
         ch, llvm::PointerType::get(StructCompilerLLVM::get_llvm_node_type(
                                        module.get(), stmt->output_snode),
@@ -2331,7 +2333,8 @@ void TaskCodeGenLLVM::visit(LoopIndexStmt *stmt) {
                            {tlctx->get_constant(0), tlctx->get_constant(0),
                             tlctx->get_constant(stmt->index)});
     if (stmt->index == 0 && !llvm::isa<llvm::GEPOperator>(GEP))
-      GEP = builder->CreateBitCast(GEP, struct_ty->getPointerTo());
+      GEP = builder->CreateBitCast(
+          GEP, llvm::PointerType::get(struct_ty->getContext(), 0));
     llvm_val[stmt] =
         builder->CreateLoad(llvm::Type::getInt32Ty(*llvm_context), GEP);
   } else {
@@ -2437,7 +2440,7 @@ void TaskCodeGenLLVM::visit(AdStackAllocaStmt *stmt) {
                                    stmt->size_in_bytes());
   auto alloca = create_entry_block_alloca(type, sizeof(int64));
   llvm_val[stmt] = builder->CreateBitCast(
-      alloca, llvm::PointerType::getInt8PtrTy(*llvm_context));
+      alloca, llvm::PointerType::get(*llvm_context, 0));
   call("stack_init", llvm_val[stmt]);
 }
 
@@ -2629,7 +2632,7 @@ llvm::Value *TaskCodeGenLLVM::get_tls_base_ptr() {
 }
 
 llvm::Type *TaskCodeGenLLVM::get_tls_buffer_type() {
-  return llvm::Type::getInt8PtrTy(*llvm_context);
+  return llvm::PointerType::get(*llvm_context, 0);
 }
 
 std::vector<llvm::Type *> TaskCodeGenLLVM::get_xlogue_argument_types() {
@@ -2655,13 +2658,13 @@ llvm::Type *TaskCodeGenLLVM::get_mesh_xlogue_function_type() {
 llvm::PointerType *TaskCodeGenLLVM::get_integer_ptr_type(int bits) {
   switch (bits) {
     case 8:
-      return llvm::Type::getInt8PtrTy(*llvm_context);
+      return llvm::PointerType::get(*llvm_context, 0);
     case 16:
-      return llvm::Type::getInt16PtrTy(*llvm_context);
+      return llvm::PointerType::get(*llvm_context, 0);
     case 32:
-      return llvm::Type::getInt32PtrTy(*llvm_context);
+      return llvm::PointerType::get(*llvm_context, 0);
     case 64:
-      return llvm::Type::getInt64PtrTy(*llvm_context);
+      return llvm::PointerType::get(*llvm_context, 0);
     default:
       break;
   }

@@ -1,7 +1,6 @@
 name: Publishing Release
+# NOTE (fork): nightly cron removed; trigger manually when shipping.
 on:
-  schedule:
-    - cron: '0 20 * * *'  # GMT 20 == GMT+8 04
   workflow_dispatch:
     # Manually trigger the release workflow, a version must be provided
     inputs:

@@ -135,7 +135,11 @@ TEST_P(LlvmOfflineCacheTest, ReadWrite) {
   {
     auto llvm_ctx = std::make_unique<llvm::LLVMContext>();
 
-    llvm_ctx->setOpaquePointers(false);
+    // Opaque pointers are mandatory on LLVM 15+ in the configurations
+    // Taichi now supports; the previous `setOpaquePointers(false)` call
+    // was removed in LLVM 19. The offline-cache bitcode this test emits
+    // is round-tripped through the same context, so the mode is
+    // self-consistent without the explicit toggle.
     LlvmOfflineCache::KernelCacheData kcache;
     kcache.created_at = 1;
     kcache.last_used_at = 1;

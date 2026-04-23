@@ -5,7 +5,6 @@ import operator
 import re
 import warnings
 from collections import ChainMap
-from sys import version_info
 import inspect
 import math
 
@@ -33,10 +32,8 @@ from taichi.lang.util import is_taichi_class, to_taichi_type
 from taichi.types import annotations, ndarray_type, primitive_types, texture_type
 from taichi.types.utils import is_integral
 
-if version_info < (3, 9):
-    from astunparse import unparse
-else:
-    from ast import unparse
+# Taichi requires Python >= 3.10, so ast.unparse is always available.
+from ast import unparse
 
 
 def reshape_list(flat_list, target_shape):

@@ -6,6 +6,7 @@ target_sources(llvm_runtime
     llvm_runtime_executor.cpp
     llvm_offline_cache.cpp
     llvm_context.cpp
+    llvm_opt_pipeline.cpp
     llvm_aot_module_loader.cpp
     llvm_aot_module_builder.cpp
     snode_tree_buffer_manager.cpp
@@ -21,6 +22,10 @@ target_include_directories(llvm_runtime
   )
 
 target_link_libraries(llvm_runtime PRIVATE ${llvm_libs})
+
+# llvm_context.cpp uses llvm::legacy::PassManager which is deprecated on
+# LLVM 19 and scheduled for Phase 6 migration to the new PassBuilder.
+target_silence_llvm_deprecated_warnings(llvm_runtime)
 
 
 if (APPLE AND "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64")

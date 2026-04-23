@@ -7,6 +7,9 @@ target_sources(cpu_runtime
     kernel_launcher.cpp
   )
 
+# jit_cpu.cpp includes PassManagerBuilder.h, deprecated on LLVM 19.
+target_silence_llvm_deprecated_warnings(cpu_runtime)
+
 #TODO #4832, some path here should not be included as they are
 # dependencies of other targets.
 target_include_directories(cpu_runtime

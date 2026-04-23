@@ -1,5 +1,6 @@
 #include "taichi/runtime/cuda/jit_cuda.h"
 #include "taichi/runtime/llvm/llvm_context.h"
+#include "taichi/runtime/llvm/llvm_opt_pipeline.h"
 
 namespace taichi::lang {
 
@@ -126,7 +127,7 @@ std::string JITSessionCUDA::compile_module_to_ptx(
   std::unique_ptr<TargetMachine> target_machine(target->createTargetMachine(
       triple.str(), CUDAContext::get_instance().get_mcpu(), cuda_mattrs(),
       options, llvm::Reloc::PIC_, llvm::CodeModel::Small,
-      CodeGenOpt::Aggressive));
+      llvm::CodeGenOptLevel::Aggressive));
 
   TI_ERROR_UNLESS(target_machine.get(), "Could not allocate target machine!");
 
@@ -136,14 +137,6 @@ std::string JITSessionCUDA::compile_module_to_ptx(
   llvm::SmallString<8> outstr;
   raw_svector_ostream ostream(outstr);
   ostream.SetUnbuffered();
-
-  legacy::FunctionPassManager function_pass_manager(module.get());
-  legacy::PassManager module_pass_manager;
-
-  module_pass_manager.add(createTargetTransformInfoWrapperPass(
-      target_machine->getTargetIRAnalysis()));
-  function_pass_manager.add(createTargetTransformInfoWrapperPass(
-      target_machine->getTargetIRAnalysis()));
 
   // NVidia's libdevice library uses a __nvvm_reflect to choose
   // how to handle denormalized numbers. (The pass replaces calls
@@ -178,51 +171,33 @@ std::string JITSessionCUDA::compile_module_to_ptx(
     }
   }
 
-  PassManagerBuilder b;
-  b.OptLevel = 3;
-  b.Inliner = createFunctionInliningPass(b.OptLevel, 0, false);
-  b.LoopVectorize = false;
-  b.SLPVectorize = false;
+  // Run the standard O3 optimization pipeline via the New PassManager.
+  // NVPTX does not use the generic LoopVectorize / SLPVectorize passes,
+  // so we leave them disabled — matching the original PassManagerBuilder
+  // configuration (`b.LoopVectorize = false; b.SLPVectorize = false;`).
+  {
+    TI_PROFILER("llvm_module_opt_pipeline");
+    LLVMOptPipelineOptions opts;
+    opts.opt_level = llvm::OptimizationLevel::O3;
+    opts.loop_vectorize = false;
+    opts.slp_vectorize = false;
+    opts.run_post_gep_passes = true;
+    run_module_opt_pipeline(*module, target_machine.get(), opts);
+  }
 
-  target_machine->adjustPassManager(b);
-
-  b.populateFunctionPassManager(function_pass_manager);
-  b.populateModulePassManager(module_pass_manager);
-
-  // Override default to generate verbose assembly.
+  // Emit PTX via the Legacy PassManager — `addPassesToEmitFile` still
+  // requires it in LLVM 19/20+ (codegen has not yet been ported).
   target_machine->Options.MCOptions.AsmVerbose = true;
 
-  /*
-    Optimization for llvm::GetElementPointer:
-    https://github.com/taichi-dev/taichi/issues/5472 The three other passes
-    "loop-reduce", "ind-vars", "cse" serves as preprocessing for
-    "separate-const-offset-gep".
-
-    Note there's an update for "separate-const-offset-gep" in llvm-12.
-  */
-  module_pass_manager.add(llvm::createLoopStrengthReducePass());
-  module_pass_manager.add(llvm::createIndVarSimplifyPass());
-  module_pass_manager.add(llvm::createSeparateConstOffsetFromGEPPass(false));
-  module_pass_manager.add(llvm::createEarlyCSEPass(true));
-
-  // Ask the target to add backend passes as necessary.
+  legacy::PassManager emit_pm;
   bool fail = target_machine->addPassesToEmitFile(
-      module_pass_manager, ostream, nullptr, llvm::CGFT_AssemblyFile, true);
+      emit_pm, ostream, nullptr, llvm::CodeGenFileType::AssemblyFile, true);
 
   TI_ERROR_IF(fail, "Failed to set up passes to emit PTX source\n");
 
   {
-    TI_PROFILER("llvm_function_pass");
-    function_pass_manager.doInitialization();
-    for (llvm::Module::iterator i = module->begin(); i != module->end(); i++)
-      function_pass_manager.run(*i);
-
-    function_pass_manager.doFinalization();
-  }
-
-  {
-    TI_PROFILER("llvm_module_pass");
-    module_pass_manager.run(*module);
+    TI_PROFILER("llvm_emit_ptx");
+    emit_pm.run(*module);
   }
 
   if (this->config_.print_kernel_llvm_ir_optimized) {
