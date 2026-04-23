@@ -61,10 +61,23 @@ def get_desired_python_version() -> str:
     v = sys.version_info
     this_version = f"{v.major}.{v.minor}"
 
+    # Supported Python versions for Taichi wheels. 3.9 has been dropped
+    # (reached upstream EOL) together with the distutils purge in setup.py.
+    _SUPPORTED = {"3.10", "3.11", "3.12", "3.13"}
+
     if version in ("3.x", "3", None):
         assert v.major == 3
+        if this_version not in _SUPPORTED:
+            raise RuntimeError(
+                f"Current Python {this_version} is not a supported Taichi build target. "
+                f"Supported: {sorted(_SUPPORTED)}"
+            )
         return this_version
     elif version and re.match(r"^3\.\d+$", version):
+        if version not in _SUPPORTED:
+            raise RuntimeError(
+                f"Unsupported Python version: {version}. Supported: {sorted(_SUPPORTED)}"
+            )
         return version
     elif version in ("native", "Native"):
         return "(Native)"

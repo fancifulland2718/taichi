@@ -12,12 +12,28 @@ import platform
 import shutil
 import subprocess
 import sys
-from distutils.command.clean import clean
-from distutils.dir_util import remove_tree
 
+# distutils was removed in Python 3.12. Use setuptools-provided
+# equivalents instead: setuptools.command.build.clean mirrors the old
+# distutils Clean command, and shutil.rmtree replaces remove_tree.
 from setuptools import find_packages
+from setuptools.command.build import build as _setuptools_build  # noqa: F401
+
+try:
+    from setuptools._distutils.command.clean import clean
+except ImportError:  # pragma: no cover - older setuptools fallback
+    from distutils.command.clean import clean  # type: ignore
+
 from skbuild import setup
 from skbuild.command.egg_info import egg_info
+
+
+def remove_tree(path, dry_run=False):
+    """Drop-in replacement for distutils.dir_util.remove_tree."""
+    if dry_run:
+        print(f"would remove tree {path}")
+        return
+    shutil.rmtree(path, ignore_errors=True)
 
 root_dir = os.path.dirname(os.path.abspath(__file__))
 
@@ -29,9 +45,10 @@ classifiers = [
     "Intended Audience :: Science/Research",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
 ]
 
 
@@ -220,7 +237,7 @@ setup(
     author="Taichi developers",
     author_email="yuanmhu@gmail.com",
     url="https://github.com/taichi-dev/taichi",
-    python_requires=">=3.9,<4.0",
+    python_requires=">=3.10,<4.0",
     install_requires=[
         "numpy",
         "colorama",

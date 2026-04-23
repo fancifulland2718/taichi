@@ -12,12 +12,18 @@ from .python import path_prepend
 
 
 # -- code --
-@banner("Setup Vulkan 1.3.296.0")
-def setup_vulkan():
+# Vulkan SDK pinned version. 1.3.296.0 -> 1.4.304.1 as part of the Phase A
+# toolchain refresh. The SDK layout and component IDs we use are stable
+# across minor versions, so the only thing that changes is the URL / path.
+_VULKAN_VERSION = os.environ.get("VULKAN_SDK_VERSION", "1.4.304.1")
+
+
+@banner("Setup Vulkan {version}")
+def setup_vulkan(version: str = _VULKAN_VERSION):
     u = platform.uname()
     if u.system == "Linux":
-        url = "https://sdk.lunarg.com/sdk/download/1.3.296.0/linux/vulkansdk-linux-x86_64-1.3.296.0.tar.xz"
-        prefix = get_cache_home() / "vulkan-1.3.296.0"
+        url = f"https://sdk.lunarg.com/sdk/download/{version}/linux/vulkansdk-linux-x86_64-{version}.tar.xz"
+        prefix = get_cache_home() / f"vulkan-{version}"
         download_dep(url, prefix, strip=1)
         sdk = prefix / "x86_64"
         os.environ["VULKAN_SDK"] = str(sdk)
@@ -27,8 +33,8 @@ def setup_vulkan():
     # elif (u.system, u.machine) == ("Darwin", "arm64"):
     # elif (u.system, u.machine) == ("Darwin", "x86_64"):
     elif (u.system, u.machine) == ("Windows", "AMD64"):
-        url = "https://sdk.lunarg.com/sdk/download/1.3.296.0/windows/VulkanSDK-1.3.296.0-Installer.exe"
-        prefix = get_cache_home() / "vulkan-1.3.296.0"
+        url = f"https://sdk.lunarg.com/sdk/download/{version}/windows/vulkansdk-windows-X64-{version}.exe"
+        prefix = get_cache_home() / f"vulkan-{version}"
         download_dep(
             url,
             prefix,

@@ -106,16 +106,25 @@ For Windows developers, if none of the VS2022 editions are installed, `build.py`
 
 ### Install LLVM
 
-#### Install pre-built, customized LLVM binaries
+#### Install pre-built LLVM binaries
 
-`build.py` will automatically download and setup a suitable version of pre-built LLVM binaries.
+`build.py` will automatically download and set up a suitable version of
+pre-built stock LLVM 19.1.x binaries. Taichi no longer maintains any
+custom LLVM source patches — the only customizations are the CMake
+configuration flags used when building LLVM (`LLVM_ENABLE_RTTI=ON`,
+`LLVM_TARGETS_TO_BUILD="X86;NVPTX;AMDGPU"`, plus the `DirectX`
+experimental target on Windows).
+
+If you already have a compatible LLVM 19 install on your machine, set
+`LLVM_DIR` to point at `<prefix>/lib/cmake/llvm` and the downloader will
+be skipped.
 
 #### Alternatively, build LLVM from source
 
 <details>
-<summary><font color="#006284">Build LLVM 15.0.0 from source</font></summary>
+<summary><font color="#006284">Build LLVM 19.1.7 from source</font></summary>
 
-We provide instructions here if you need to build LLVM 15.0.0 from source.
+We provide instructions here if you need to build LLVM 19.1.7 from source.
 
 ````mdx-code-block
 <Tabs
@@ -128,31 +137,32 @@ We provide instructions here if you need to build LLVM 15.0.0 from source.
 <TabItem value="linux">
 
 ```shell
-wget https://github.com/llvm/llvm-project/archive/refs/tags/llvmorg-15.0.5.tar.gz
+git clone --depth 1 --branch llvmorg-19.1.7 https://github.com/llvm/llvm-project.git
 
-tar zxvf llvmorg-15.0.5.tar.gz
+cd llvm-project/llvm
 
-cd llvm-project-llvmorg-15.0.5/llvm
+mkdir build && cd build
 
-mkdir build
+cmake .. \
+  -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_ENABLE_RTTI=ON \
+  -DLLVM_ENABLE_ASSERTIONS=OFF \
+  -DLLVM_ENABLE_TERMINFO=OFF \
+  -DLLVM_ENABLE_ZSTD=OFF \
+  -DLLVM_TARGETS_TO_BUILD="X86;NVPTX;AMDGPU" \
+  -DLLVM_INCLUDE_TESTS=OFF \
+  -DLLVM_INCLUDE_BENCHMARKS=OFF \
+  -DCMAKE_INSTALL_PREFIX=installed
 
-cd build
-
-cmake .. -DLLVM_ENABLE_RTTI:BOOL=ON -DBUILD_SHARED_LIBS:BOOL=OFF -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD="X86;NVPTX" -DLLVM_ENABLE_ASSERTIONS=ON -DLLVM_ENABLE_TERMINFO=OFF
-
-# If you are building on Apple M1, use -DLLVM_TARGETS_TO_BUILD="AArch64".
-
-# If you are building on NVIDIA Jetson TX2, use -DLLVM_TARGETS_TO_BUILD="ARM;NVPTX"
-
+# If you are building on Apple Silicon, use -DLLVM_TARGETS_TO_BUILD="AArch64".
 # If you are building for a PyPI release, add -DLLVM_ENABLE_Z3_SOLVER=OFF to reduce the library dependency.
 
-make -j 8
-
-sudo make install
+ninja -j 8
+ninja install
 
 # Check your LLVM installation
-
-llvm-config --version  # You should get 15.0.5
+installed/bin/llvm-config --version  # You should get 19.1.7
 ```
 
 </TabItem>
@@ -160,18 +170,26 @@ llvm-config --version  # You should get 15.0.5
 <TabItem value="windows">
 
 ```shell
-# For Windows
+# LLVM 19.1.7 + MSVC 2022 (Visual Studio 17.10+)
 
-# LLVM 15.0.0 + MSVC 2019
+cmake .. -G Ninja ^
+  -DCMAKE_BUILD_TYPE=Release ^
+  -DLLVM_ENABLE_RTTI=ON ^
+  -DLLVM_ENABLE_ASSERTIONS=OFF ^
+  -DLLVM_ENABLE_TERMINFO=OFF ^
+  -DLLVM_ENABLE_ZSTD=OFF ^
+  -DLLVM_TARGETS_TO_BUILD="X86;NVPTX;AMDGPU" ^
+  -DLLVM_EXPERIMENTAL_TARGETS_TO_BUILD="DirectX" ^
+  -DLLVM_INCLUDE_TESTS=OFF ^
+  -DLLVM_INCLUDE_BENCHMARKS=OFF ^
+  -DCMAKE_INSTALL_PREFIX=installed
 
-cmake .. -G "Visual Studio 16 2019" -A x64 -DLLVM_ENABLE_RTTI:BOOL=ON -DBUILD_SHARED_LIBS:BOOL=OFF -DCMAKE_BUILD_TYPE=Release -DLLVM_TARGETS_TO_BUILD="X86;NVPTX" -DLLVM_ENABLE_ASSERTIONS=ON -Thost=x64 -DLLVM_BUILD_TESTS:BOOL=OFF -DCMAKE_INSTALL_PREFIX=installed -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL -DCMAKE_CXX_STANDARD=17
-cmake --build . --target=INSTALL --config=Release
+cmake --build . --target install --config Release
 ```
 
-1. Use Visual Studio 2017+ to build **LLVM.sln**.
-2. Ensure that you use the **Release** configuration. After building the `INSTALL` project (under folder **CMakePredefinedTargets** in the Solution Explorer window).
-3. If you use MSVC 2019+, ensure that you use **C++17** for the `INSTALL` project.
-4. When the build completes, add an environment variable `LLVM_DIR` with value `<PATH_TO_BUILD>/build/installed/lib/cmake/llvm`.
+1. Use a **Developer Command Prompt for VS 2022** (17.10 or later).
+2. When the build completes, add an environment variable `LLVM_DIR`
+   with value `<PATH_TO_BUILD>\build\installed\lib\cmake\llvm`.
 
 </TabItem>
 
