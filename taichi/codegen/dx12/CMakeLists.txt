@@ -9,6 +9,10 @@ target_sources(dx12_codegen
     dx12_lower_runtime_context.cpp
   )
 
+# dx12_global_optimize_module.cpp uses llvm::legacy::PassManager /
+# PassManagerBuilder, deprecated on LLVM 19. Phase 6 migration.
+target_silence_llvm_deprecated_warnings(dx12_codegen)
+
 target_include_directories(dx12_codegen
   PRIVATE
     ${PROJECT_SOURCE_DIR}/external/eigen

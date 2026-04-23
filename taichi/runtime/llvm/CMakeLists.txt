@@ -22,6 +22,10 @@ target_include_directories(llvm_runtime
 
 target_link_libraries(llvm_runtime PRIVATE ${llvm_libs})
 
+# llvm_context.cpp uses llvm::legacy::PassManager which is deprecated on
+# LLVM 19 and scheduled for Phase 6 migration to the new PassBuilder.
+target_silence_llvm_deprecated_warnings(llvm_runtime)
+
 
 if (APPLE AND "${CMAKE_SYSTEM_PROCESSOR}" STREQUAL "arm64")
     target_link_libraries(llvm_runtime PRIVATE ${llvm_aarch64_libs})

@@ -64,18 +64,22 @@ Phase 6.
 
 Total: 14 legacy-PM **usage** sites across 7 files + 5 header includes.
 
-## Infrastructure added in Phase A.2
+## Infrastructure note (updated after implementation)
 
-`taichi/codegen/llvm/ptr_type_tracker.h` (new, ~40 lines):
+The original plan sketched a `PtrTypeTracker` side-channel (`DenseMap<Value*,
+Type*>`) for call sites that could not recover the pointee type from
+SNode / alloca metadata. During the actual rewrite all four typed-pointer
+sites were resolvable without it:
 
-- `class PtrTypeTracker` maintains a `DenseMap<Value*, Type*>` that maps
-  an SSA pointer value to the element type it was created with.
-- Populate in every Taichi-side wrapper around `CreateAlloca`, `CreateGEP`,
-  `CreateBitCast`, `CreateCall (returning ptr)`, and on `Argument`
-  materialization.
-- `Type* get_element_type(Value* ptr)` replaces direct
-  `ptr->getType()->getPointerElementType()` calls. Asserts on lookup
-  miss so we catch unhandled producers early.
+- Sites 1, 2 (`codegen_llvm.cpp`) use
+  `StructCompilerLLVM::get_llvm_node_type()` / `PointerType::get(ctx, 0)`.
+- Site 3 (`llvm_codegen_utils.cpp::is_same_type`) degenerates to an
+  address-space comparison under opaque pointers, which matches how the
+  helper is consumed elsewhere (callers disambiguate struct identity by
+  LLVM type name, not by pointer element type).
+- Site 4 (`llvm_offline_cache_test.cpp`) simply drops the
+  `setOpaquePointers(false)` call.
 
-This header is the only new file introduced in Phase A. It has zero
-runtime cost and is header-only (the map lives on `TaichiLLVMContext`).
+Consequently no new header was added in Phase A.2. A dedicated
+`PtrTypeTracker` will be introduced only if a future Phase uncovers a
+call site that genuinely needs post-hoc pointee recovery.

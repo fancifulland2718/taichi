@@ -1795,13 +1795,15 @@ void TaskCodeGenLLVM::visit(SNodeLookupStmt *stmt) {
   TI_ASSERT(parent);
   auto snode = stmt->snode;
   if (snode->type == SNodeType::root) {
-    // FIXME: get parent_type from taichi instead of llvm.
-    llvm::Type *parent_ty = builder->getInt8Ty();
-    if (auto bit_cast = llvm::dyn_cast<llvm::BitCastInst>(parent)) {
-      parent_ty = bit_cast->getDestTy();
-      if (auto ptr_ty = llvm::dyn_cast<llvm::PointerType>(parent_ty))
-        parent_ty = ptr_ty->getPointerElementType();
-    }
+    // Derive the root node's LLVM struct type directly from the SNode
+    // metadata. Previously the code inspected the incoming bitcast's
+    // destination type via `PointerType::getPointerElementType()`, which
+    // is a deprecated typed-pointer API and disappears under LLVM 19's
+    // mandatory opaque pointers. `get_llvm_node_type` is the authoritative
+    // SNode→LLVM type mapping used across the struct compiler, so it
+    // produces the correct GEP element type unconditionally.
+    llvm::Type *parent_ty =
+        StructCompilerLLVM::get_llvm_node_type(module.get(), snode);
     llvm_val[stmt] =
         builder->CreateGEP(parent_ty, parent, llvm_val[stmt->input_index]);
   } else if (snode->type == SNodeType::dense ||
@@ -2331,7 +2333,8 @@ void TaskCodeGenLLVM::visit(LoopIndexStmt *stmt) {
                            {tlctx->get_constant(0), tlctx->get_constant(0),
                             tlctx->get_constant(stmt->index)});
     if (stmt->index == 0 && !llvm::isa<llvm::GEPOperator>(GEP))
-      GEP = builder->CreateBitCast(GEP, struct_ty->getPointerTo());
+      GEP = builder->CreateBitCast(
+          GEP, llvm::PointerType::get(struct_ty->getContext(), 0));
     llvm_val[stmt] =
         builder->CreateLoad(llvm::Type::getInt32Ty(*llvm_context), GEP);
   } else {

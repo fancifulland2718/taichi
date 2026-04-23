@@ -6,6 +6,10 @@ target_sources(cpu_codegen
     codegen_cpu.cpp
   )
 
+# codegen_cpu.cpp uses llvm::legacy::PassManager / PassManagerBuilder,
+# deprecated on LLVM 19. Migration is tracked in Phase 6.
+target_silence_llvm_deprecated_warnings(cpu_codegen)
+
 target_include_directories(cpu_codegen
   PRIVATE
     ${PROJECT_SOURCE_DIR}

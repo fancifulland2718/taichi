@@ -7,6 +7,10 @@ target_sources(amdgpu_runtime
     kernel_launcher.cpp
   )
 
+# jit_amdgpu.cpp uses llvm::legacy::PassManager / PassManagerBuilder,
+# deprecated on LLVM 19. Migration is tracked in Phase 6.
+target_silence_llvm_deprecated_warnings(amdgpu_runtime)
+
 target_include_directories(amdgpu_runtime
   PRIVATE
     ${PROJECT_SOURCE_DIR}
