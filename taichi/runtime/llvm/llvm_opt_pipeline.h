@@ -19,6 +19,17 @@
 
 namespace taichi::lang {
 
+/// Map an integer llvm_opt_level (0-3) to the matching llvm::OptimizationLevel.
+/// Values out of range are clamped: negative → O0, >3 → O3.
+inline llvm::OptimizationLevel llvm_opt_level_from_int(int level) {
+  switch (level) {
+    case 0:  return llvm::OptimizationLevel::O0;
+    case 1:  return llvm::OptimizationLevel::O1;
+    case 2:  return llvm::OptimizationLevel::O2;
+    default: return llvm::OptimizationLevel::O3;
+  }
+}
+
 struct LLVMOptPipelineOptions {
   // Optimization level. Mirrors the historical `PassManagerBuilder::OptLevel = 3`.
   llvm::OptimizationLevel opt_level = llvm::OptimizationLevel::O3;

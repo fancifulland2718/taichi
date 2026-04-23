@@ -2680,21 +2680,28 @@ KernelCodegen::KernelCodegen(const Params &params)
 
   spirv_opt_ = std::make_unique<spvtools::Optimizer>(target_env);
   spirv_opt_->SetMessageConsumer(spriv_message_consumer);
-  if (params.enable_spv_opt) {
-    // From: SPIRV-Tools/source/opt/optimizer.cpp
+  if (params.spv_opt_level >= 1) {
+    // Level 1 — fast: dead-code / dead-branch elimination only.
     spirv_opt_->RegisterPass(spvtools::CreateWrapOpKillPass())
         .RegisterPass(spvtools::CreateDeadBranchElimPass())
-        .RegisterPass(spvtools::CreateMergeReturnPass())
-        .RegisterPass(spvtools::CreateInlineExhaustivePass())
+        .RegisterPass(spvtools::CreateAggressiveDCEPass());
+  }
+  if (params.spv_opt_level >= 2) {
+    // Level 2 — standard: add inlining + mem2reg-equivalent local opts.
+    spirv_opt_->RegisterPass(spvtools::CreateInlineExhaustivePass())
         .RegisterPass(spvtools::CreateEliminateDeadFunctionsPass())
-        .RegisterPass(spvtools::CreateAggressiveDCEPass())
         .RegisterPass(spvtools::CreatePrivateToLocalPass())
         .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
         .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
         .RegisterPass(spvtools::CreateScalarReplacementPass())
         .RegisterPass(spvtools::CreateLocalAccessChainConvertPass())
         .RegisterPass(spvtools::CreateLocalMultiStoreElimPass())
-        .RegisterPass(spvtools::CreateCCPPass())
+        .RegisterPass(spvtools::CreateCCPPass());
+  }
+  if (params.spv_opt_level >= 3) {
+    // Level 3 — full: loop unrolling + the remaining cleanup passes
+    // (legacy default behaviour).
+    spirv_opt_->RegisterPass(spvtools::CreateMergeReturnPass())
         .RegisterPass(spvtools::CreateLoopUnrollPass(true))
         .RegisterPass(spvtools::CreateRedundancyEliminationPass())
         .RegisterPass(spvtools::CreateCombineAccessChainsPass())

@@ -868,8 +868,56 @@ class TaichiMain:
             count = _ti_core.clean_offline_cache_files(path)
             print(f"Deleted {count} offline cache files in {path}")
 
+        def warmup(cmd_args, parser):
+            """Run a Taichi script with the offline cache enabled so that the
+            compiled kernels are saved to disk.  Subsequent runs that use the
+            same script (and same config) will load from the cache instead of
+            recompiling — eliminating the cold-start penalty.
+
+            Usage::
+
+                ti cache warmup my_script.py [-- script_args...]
+            """
+            parser.add_argument(
+                "script",
+                help="Path to the Taichi script to pre-compile.",
+            )
+            parser.add_argument(
+                "--",
+                dest="script_args",
+                nargs=argparse.REMAINDER,
+                default=[],
+                help="Additional arguments forwarded to the target script.",
+            )
+            args, extra = parser.parse_known_args(cmd_args)
+
+            import subprocess  # pylint: disable=C0415
+            import sys as _sys  # pylint: disable=C0415
+
+            script_path = os.path.abspath(args.script)
+            if not os.path.isfile(script_path):
+                print(f"Error: script not found: {script_path}", file=_sys.stderr)
+                raise SystemExit(1)
+
+            env = os.environ.copy()
+            # Force offline cache on for the warmup run.
+            env["TI_OFFLINE_CACHE"] = "1"
+            print(f"[ti cache warmup] Pre-compiling: {script_path}")
+            cmd = [_sys.executable, script_path] + extra
+            result = subprocess.run(cmd, env=env)
+            if result.returncode != 0:
+                print(
+                    f"[ti cache warmup] Script exited with code {result.returncode}",
+                    file=_sys.stderr,
+                )
+                raise SystemExit(result.returncode)
+            print("[ti cache warmup] Done. Kernels are now cached on disk.")
+
         # TODO(PGZXB): Provide more tools to manage the offline cache files
-        subcmds_map = {"clean": (clean, "Clean all offline cache files in given path")}
+        subcmds_map = {
+            "clean": (clean, "Clean all offline cache files in given path"),
+            "warmup": (warmup, "Pre-compile a script and save kernels to the offline cache"),
+        }
 
         def print_help():
             print("usage: ti cache <command> [<args>]")

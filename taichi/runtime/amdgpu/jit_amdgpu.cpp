@@ -98,7 +98,7 @@ std::string JITSessionAMDGPU::compile_module_to_hsaco(
     // emit GCN assembly via the legacy PM (codegen still requires it).
     {
       LLVMOptPipelineOptions opts;
-      opts.opt_level = llvm::OptimizationLevel::O3;
+      opts.opt_level = llvm_opt_level_from_int(config_.llvm_opt_level);
       opts.loop_vectorize = true;
       opts.slp_vectorize = true;
       opts.run_post_gep_passes = false;
@@ -119,11 +119,11 @@ std::string JITSessionAMDGPU::compile_module_to_hsaco(
     writer.write(gcn);
   }
 
-  // Run the standard O3 optimization pipeline on the real module.
+  // Run the standard optimization pipeline on the real module.
   {
     TI_PROFILER("llvm_module_opt_pipeline");
     LLVMOptPipelineOptions opts;
-    opts.opt_level = llvm::OptimizationLevel::O3;
+    opts.opt_level = llvm_opt_level_from_int(config_.llvm_opt_level);
     opts.loop_vectorize = true;
     opts.slp_vectorize = true;
     opts.run_post_gep_passes = false;

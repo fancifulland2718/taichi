@@ -279,13 +279,14 @@ void KernelCodeGenCPU::optimize_module(llvm::Module *module) {
 
   module->setDataLayout(target_machine->createDataLayout());
 
-  // Run the standard O3 optimization pipeline via the New PassManager.
+  // Run the LLVM optimization pipeline at the configured level (O0-O3).
+  // llvm_opt_level=3 (default) matches the previous hardcoded O3 behaviour.
   // CPU keeps LoopVectorize + SLPVectorize enabled (same as the legacy
   // `PassManagerBuilder` setup).
   {
     TI_PROFILER("llvm_module_opt_pipeline");
     LLVMOptPipelineOptions opts;
-    opts.opt_level = llvm::OptimizationLevel::O3;
+    opts.opt_level = llvm_opt_level_from_int(compile_config.llvm_opt_level);
     opts.loop_vectorize = true;
     opts.slp_vectorize = true;
     opts.run_post_gep_passes = true;

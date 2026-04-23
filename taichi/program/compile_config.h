@@ -14,6 +14,11 @@ struct CompileConfig {
   int simd_width;
   int opt_level;
   int external_optimization_level;
+  // LLVM backend: 0=O0 (fast compile, worse runtime) … 3=O3 (default, best
+  // runtime). Exposed so users can trade compile-time speed against kernel
+  // performance on first cold launch. Does NOT affect SPIR-V opt (use
+  // external_optimization_level for that). Included in the offline-cache key.
+  int llvm_opt_level;
   int max_vector_width;
   bool print_preprocessed_ir;
   bool print_ir;

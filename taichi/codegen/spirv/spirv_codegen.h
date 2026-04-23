@@ -23,7 +23,12 @@ class KernelCodegen {
     std::vector<CompiledSNodeStructs> compiled_structs;
     Arch arch;
     DeviceCapabilityConfig caps;
-    bool enable_spv_opt{true};
+    bool enable_spv_opt{true};  // kept for back-compat; ignored when spv_opt_level>0
+    // 0 = no SPIR-V optimisation
+    // 1 = fast (dead-code / dead-branch only)
+    // 2 = standard (+ inlining, mem2reg-equivalent)
+    // 3 = full  (all passes; legacy default behaviour)
+    int spv_opt_level{3};
   };
 
   explicit KernelCodegen(const Params &params);

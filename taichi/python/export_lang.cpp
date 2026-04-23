@@ -158,6 +158,7 @@ void export_lang(py::module &m) {
       .def(py::init<>())
       .def_readwrite("arch", &CompileConfig::arch)
       .def_readwrite("opt_level", &CompileConfig::opt_level)
+      .def_readwrite("llvm_opt_level", &CompileConfig::llvm_opt_level)
       .def_readwrite("print_ir", &CompileConfig::print_ir)
       .def_readwrite("print_preprocessed_ir",
                      &CompileConfig::print_preprocessed_ir)

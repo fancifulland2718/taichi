@@ -126,12 +126,12 @@ std::vector<uint8_t> global_optimize_module(llvm::Module *module,
     pre_opt_pm.run(*module);
   }
 
-  // Phase 2: run the standard O3 optimization pipeline via the New
-  // PassManager (PassManagerBuilder was removed in LLVM 17).
+  // Phase 2: run the optimization pipeline at the configured level (O0-O3)
+  // via the New PassManager (PassManagerBuilder was removed in LLVM 17).
   {
     TI_PROFILER("llvm_module_opt_pipeline");
     LLVMOptPipelineOptions opts;
-    opts.opt_level = llvm::OptimizationLevel::O3;
+    opts.opt_level = llvm_opt_level_from_int(config.llvm_opt_level);
     opts.loop_vectorize = true;
     opts.slp_vectorize = true;
     opts.run_post_gep_passes = true;
