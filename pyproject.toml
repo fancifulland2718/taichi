@@ -1,14 +1,8 @@
 [build-system]
-# scikit-build-core replaces the legacy scikit-build + setup.py pipeline.
-# It integrates bdist_wheel natively (no more `wheel` FutureWarning) and
-# works with any modern setuptools/Python including 3.14.
 requires = [
-    "scikit-build-core>=0.10",
-    "pybind11>=2.13",
-    # Required so isolated PEP 517 builds (pip install ., python -m build)
-    # can pick Ninja even when it's not on the system PATH. On platforms
-    # without a prebuilt ninja wheel this silently falls back to Make.
-    "ninja; platform_system != 'Linux' or platform_machine != 'aarch64'",
+  "scikit-build-core>=0.10",
+  "pybind11>=2.13",
+  "ninja; platform_system != 'Linux' or platform_machine != 'aarch64'",
 ]
 build-backend = "scikit_build_core.build"
 
@@ -20,72 +14,54 @@ readme = "README_FORGE.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10,<4.0"
 authors = [
-    { name = "Taichi Forge contributors" },
+  { name = "Taichi Forge contributors" },
 ]
 keywords = ["graphics", "simulation", "compiler", "gpu"]
 classifiers = [
-    "Development Status :: 4 - Beta",
-    "Topic :: Software Development :: Compilers",
-    "Topic :: Multimedia :: Graphics",
-    "Topic :: Games/Entertainment :: Simulation",
-    "Intended Audience :: Science/Research",
-    "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Programming Language :: Python :: 3.13",
-    "Programming Language :: Python :: 3.14",
+  "Development Status :: 4 - Beta",
+  "Topic :: Software Development :: Compilers",
+  "Topic :: Multimedia :: Graphics",
+  "Topic :: Games/Entertainment :: Simulation",
+  "Intended Audience :: Science/Research",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: Apache Software License",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
 ]
 dependencies = [
-    # numpy 2.1 is the first release that ships cp314 wheels; older numpy
-    # would compile from source on 3.14 which is fragile.
-    "numpy>=1.23; python_version < '3.14'",
-    "numpy>=2.1; python_version >= '3.14'",
-    "colorama",
-    "dill",
-    "rich",
+  "numpy>=1.23; python_version < '3.14'",
+  "numpy>=2.1; python_version >= '3.14'",
+  "colorama",
+  "dill",
+  "rich",
 ]
 
 [project.urls]
-Homepage = "https://github.com/taichi-dev/taichi"
-Issues = "https://github.com/taichi-dev/taichi/issues"
+Homepage = "https://github.com/fancifulland2718/taichi-forge"
+Issues = "https://github.com/fancifulland2718/taichi-forge/issues"
 
 [project.scripts]
 ti = "taichi._main:main"
 
 [tool.scikit-build]
-# Minimum CMake / Ninja
 cmake.version = ">=3.20"
 cmake.build-type = "Release"
-
-# Persist the CMake build directory so incremental rebuilds work between
-# `pip install .` and `python -m build -w` invocations.
 build-dir = "_skbuild/{wheel_tag}"
-
-# Ship the Python package at `python/taichi/` as `taichi/` inside the wheel.
 wheel.packages = ["python/taichi"]
-
-# Strip shared libs that are bundled transitively but not actually needed
-# at runtime by the Python extension.
 wheel.exclude = [
-    "**/libSPIRV-Tools-shared.so",
-    "**/libSPIRV-Tools-shared.dll",
+  "**/libSPIRV-Tools-shared.so",
+  "**/libSPIRV-Tools-shared.dll",
 ]
-
-# Keep the full ABI tag (cp310, cp311, ...) because taichi_python links
-# against CPython directly via pybind11. No `limited-api` / cp3xx-abi3.
 wheel.py-api = ""
 
 [tool.scikit-build.cmake.define]
-# version.txt tracks the fork's version; the CMake macros below are kept in
-# sync manually. Update both when releasing.
 TI_VERSION_MAJOR = "0"
 TI_VERSION_MINOR = "1"
 TI_VERSION_PATCH = "0"
 
-# Dynamic version: read from version.txt (same file CMake reads). The
-# leading "v" is optional and stripped by the regex.
 [tool.scikit-build.metadata.version]
 provider = "scikit_build_core.metadata.regex"
 input = "version.txt"
@@ -93,13 +69,12 @@ regex = 'v?(?P<version>[0-9]+\.[0-9]+\.[0-9]+(?:[-+.][0-9A-Za-z.-]+)?)'
 
 [tool.pytest.ini_options]
 filterwarnings = [
-    "ignore:Calling non-taichi function",
-    "ignore:`np.int` is a deprecated alias",
-    "ignore:Operator \"is\" in Taichi scope is deprecated",
-    "ignore:Operator \"is not\" in Taichi scope is deprecated"
+  "ignore:Calling non-taichi function",
+  "ignore:`np.int` is a deprecated alias",
+  "ignore:Operator \"is\" in Taichi scope is deprecated",
+  "ignore:Operator \"is not\" in Taichi scope is deprecated",
 ]
 
 [tool.yapf]
 based_on_style = "pep8"
 blank_line_before_nested_class_or_def = false
-
