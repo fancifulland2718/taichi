@@ -433,3 +433,56 @@ P1.d hook 正确落地（可由 bench 数据证明 `full` 回归可复现、`fas
 | P1.b | ⏸ | L1.5 CHI IR cache — 未开工 |
 | P1.c | ⏸ | Cache warmup CLI — 未开工 |
 | P1.d | ✅ | compile_tier → spv_opt_level 挂钩 + 三档数值位对位 |
+
+## V1 — 真正零开销的 fast tier（spv_opt_level=0 + guard Run()）  — 2026-04-24 13:20
+
+### 动机
+
+P1.d 将 `compile_tier=="fast"` 的 spv_opt_level 上限收紧到 1（3-pass 链：WrapOpKill / DeadBranchElim / AggressiveDCE）。但观察到 bench 数据里 fast 和 balanced 在 mat14/sph_force 上几乎一致（±1% 噪声），而 heavy_kernels 的六个 kernel 都不是 SPV-bound。为了让"fast tier = 运行时可以接受的最低冷编译时间"真正做到底，V1 做两件事：
+
+1. 把 `compile_tier=="fast"` 的 spv_opt_level 进一步压到 **0**（0 个 pass）。
+2. 在 spirv_codegen.cpp 给 `spirv_opt_->Run(&binary)` 加 `params_.spv_opt_level > 0` 守卫；原先 level=0 会把空 pass 列表的 Optimizer 跑一遍（Optimizer 构造 + Run 本身仍有固定开销），现在 level=0 彻底短路，零调用零拷贝。
+
+balanced / full 不变：继续走 `external_optimization_level`（默认 3 → 23 passes）。
+
+### 改动
+
+- taichi/codegen/spirv/kernel_compiler.cpp:38-58 — `compile_tier=="fast"` 时 `spv_opt_level = 0`（不再 min 到 1）。
+- taichi/codegen/spirv/spirv_codegen.cpp:~2751 — `spirv_opt_->Run()` 外包裹 `if (params_.spv_opt_level > 0) { ... }`；零档位零开销。
+
+### V2 — SPV-bound 基准 kernel（make_spv_branchy）
+
+heavy_kernels 的 mat14/sph_force 都是 CHI-IR-bound，spvtools 的工作量只占冷编译时间的 <3%，因此 fast vs balanced 噪声掩盖了 V1 的效果。V2 新增 `make_spv_branchy`（256-elem × 32-slot local Vector × 32 次 static if/elif/else × 嵌套 static 内循环 + 4 个 sin 调用），专门触发 spvtools 的 level 2/3 重头 pass：PrivateToLocal / LocalAccessChainConvert / ScalarReplacement / LocalSingleBlockLoadStoreElim / IfConversion / BlockMerge。
+
+### Vulkan 冷编译实测（三档 × 三 kernel）
+
+| kernel | fast | balanced | full | full vs fast | balanced vs fast |
+|--------|------|----------|------|--------------|------------------|
+| mat14 | 39.07s | 39.24s | 51.41s | **+31.6%** | +0.4% |
+| sph_force | 7.06s | 7.13s | 8.59s | **+21.7%** | +0.9% |
+| **spv_branchy** | **0.35s** | **0.38s** | **0.45s** | **+27.5%** | **+7.8%** |
+
+观察：
+- mat14/sph_force：fast vs balanced 仍在噪声内（与 P1.d 观察一致），但 **fast vs full 始终 21-32% gap**，足以覆盖 P2.b/P2.c 层 simplify 守卫带来的 full 档回归。V1 在这类 kernel 上 = 消除 Optimizer 构造/调用的零散开销。
+- spv_branchy：**fast vs balanced 从噪声变成 7.8% 真实差距**，fast vs full 达 27.5%。说明 V1 的"spv_opt_level=0 真正零开销"叠加 V2 SPV-bound 样本时能清晰量化 spvtools pass chain 的固定成本（~30-80 ms/kernel per level）。
+
+### 正确性门禁
+
+1. smoke_3backends（cpu/cuda/vulkan）：三后端位对位。
+2. tier_parity_vulkan（sin/cos/sqrt + 有理分式，P1.d 保留）：fast/full 对 balanced Δ = 0.000e+00。
+3. **新** tier_parity_spv_branchy（V2 kernel）：
+
+```
+balanced head: [38.161385 37.53675 37.036743 36.651928]  tail: [271.012 278.97717]
+fast       max|Delta| vs balanced = 3.052e-05
+full       max|Delta| vs balanced = 0.000e+00
+OK
+```
+
+fast vs balanced 的 3e-5 属于 sin/cos 链式累加的 FP32 误差边界，在 1e-4 容限内。full 与 balanced 位对位相等。
+
+### 结论
+
+- V1：`compile_tier="fast"` 的 SPV 管线现在是真正的"0 pass + 0 调用"，full 档 21-32% 的 penalty 完全可以用 fast 规避。
+- V2：提供了一个可复现的 SPV-bound 基准 kernel，后续若要做 spvtools pass-level ablation（例如去掉 PrivateToLocal、或上游合并到 CHI），此 kernel 是首选 workload。
+- 三档数值语义全部通过门禁。

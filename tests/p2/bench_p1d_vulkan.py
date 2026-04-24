@@ -17,7 +17,7 @@ import sys
 import time
 
 TIERS = ("fast", "balanced", "full")
-KERNELS = ("mat14", "sph_force")
+KERNELS = ("mat14", "sph_force", "spv_branchy")
 
 
 def wipe_cache() -> None:

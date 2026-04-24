@@ -291,3 +291,44 @@ HEAVY_KERNELS = [
     ("diffuse_auto", make_diffuse_auto, 20,  40),
     ("sph_force",    make_sph_force,    20,  40),
 ]
+
+
+# ---------------------------------------------------------------------------
+# 7.  spv_branchy  –  SPV-bound kernel for Vulkan tiered-opt benchmarking.
+#     Stresses the spvtools optimizer passes that dominate level 2/3 cost:
+#     PrivateToLocal, LocalAccessChainConvert, ScalarReplacement,
+#     LocalSingleBlockLoadStoreElim, IfConversion, BlockMerge.
+#     Compile on mat14/sph_force is dominated by CHI IR + SPV codegen, so
+#     the 23 spvtools passes are noise on those kernels. This one is built
+#     specifically so that tier="fast" (level 0) vs "balanced" (level 3)
+#     differ outside the noise band.
+# ---------------------------------------------------------------------------
+def make_spv_branchy(ti):
+    N = 256
+    out = ti.field(ti.f32, shape=N)
+
+    @ti.kernel
+    def run():
+        for i in out:
+            buf = ti.Vector.zero(ti.f32, 32)
+            for k in ti.static(range(32)):
+                a = ti.f32(i * (k + 1)) * 0.001
+                if ti.static(k % 4 == 0):
+                    buf[k] = ti.sin(a) + ti.cos(a * 2.0)
+                elif ti.static(k % 4 == 1):
+                    buf[k] = ti.sqrt(ti.abs(a) + 1.0)
+                elif ti.static(k % 4 == 2):
+                    buf[k] = a / (1.0 + a * a)
+                else:
+                    buf[k] = a * a - a
+            s = ti.f32(0.0)
+            for k in ti.static(range(32)):
+                if buf[k] > 0.0:
+                    s += buf[k] * 1.25
+                else:
+                    s -= buf[k] * 0.5
+                for j in ti.static(range(4)):
+                    s += ti.sin(buf[k] * float(j + 1))
+            out[i] = s
+
+    return run

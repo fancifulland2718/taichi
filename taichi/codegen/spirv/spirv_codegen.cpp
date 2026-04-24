@@ -2747,7 +2747,10 @@ void KernelCodegen::run(TaichiKernelAttributes &kernel_attribs,
     std::vector<uint32_t> optimized_spv(task_res.spirv_code);
 
     bool success = true;
-    {
+    // V1: guard Optimizer::Run() on spv_opt_level>0. At level 0 the pass
+    // list is empty and Run() would still traverse the whole binary for
+    // nothing — on fast-tier compiles this adds up across many tasks.
+    if (params_.spv_opt_level > 0) {
       bool result = false;
       TI_WARN_IF(
           (result = !spirv_opt_->Run(optimized_spv.data(), optimized_spv.size(),
