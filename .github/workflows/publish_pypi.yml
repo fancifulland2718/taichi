@@ -97,7 +97,13 @@ jobs:
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     env:
       PY: ${{ matrix.python }}
+      # CMAKE_POLICY_VERSION_MINIMUM=3.5 is required because vendored
+      # external/SPIRV-Tools (and a few other deps under external/) still
+      # declare cmake_minimum_required(VERSION < 3.5). CMake >=4 removed
+      # compatibility with those old policies and hard-errors at configure
+      # time unless we opt into the compatibility shim.
       TAICHI_CMAKE_ARGS: >-
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5
         -DTI_WITH_VULKAN:BOOL=ON
         -DTI_WITH_OPENGL:BOOL=ON
         -DTI_WITH_CUDA:BOOL=OFF
@@ -148,7 +154,10 @@ jobs:
       - name: Install python build deps
         run: |
           python -m pip install --upgrade pip build
-          python -m pip install --upgrade "scikit-build-core>=0.10" cmake "pybind11>=2.13" ninja
+          # numpy is imported by cmake/PythonNumpyPybind11.cmake at configure
+          # time to resolve the numpy include dir; without it the include path
+          # ends up empty and any numpy.h include later breaks the C++ build.
+          python -m pip install --upgrade "scikit-build-core>=0.10" cmake "pybind11>=2.13" ninja numpy
 
       - name: Override version
         shell: bash
@@ -192,7 +201,9 @@ jobs:
         python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     env:
       PY: ${{ matrix.python }}
+      # See comment in build_linux for the CMAKE_POLICY_VERSION_MINIMUM flag.
       TAICHI_CMAKE_ARGS: >-
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5
         -DTI_WITH_VULKAN:BOOL=ON
         -DTI_WITH_OPENGL:BOOL=ON
         -DTI_WITH_CUDA:BOOL=OFF
@@ -245,7 +256,8 @@ jobs:
         shell: pwsh
         run: |
           python -m pip install --upgrade pip build
-          python -m pip install --upgrade "scikit-build-core>=0.10" cmake "pybind11>=2.13"
+          # numpy is needed at CMake configure time by PythonNumpyPybind11.cmake.
+          python -m pip install --upgrade "scikit-build-core>=0.10" cmake "pybind11>=2.13" numpy
 
       - name: Override version
         shell: pwsh
