@@ -19,6 +19,20 @@ struct CompileConfig {
   // performance on first cold launch. Does NOT affect SPIR-V opt (use
   // external_optimization_level for that). Included in the offline-cache key.
   int llvm_opt_level;
+  // P2.c: Compile-time optimization tier.
+  // "fast"     — aggressively skip the most expensive IR passes
+  //              (whole_kernel_cse entirely; keep single-shot LICM /
+  //              cfg_optimization). Best cold-compile wall clock; may
+  //              leave some redundant computations in the IR.
+  // "balanced" — (default) P2.0/P2.a/P2.b behavior: whole_kernel_cse /
+  //              cfg_optimization / loop_invariant_code_motion run only
+  //              in the first full_simplify iteration.
+  // "full"     — re-run the three expensive passes on every
+  //              full_simplify iteration, matching the <=1.7.4 release
+  //              behavior. Longest compile, occasionally squeezes out
+  //              a few more redundant stmts.
+  // Included in the offline-cache key.
+  std::string compile_tier{"balanced"};
   int max_vector_width;
   bool print_preprocessed_ir;
   bool print_ir;

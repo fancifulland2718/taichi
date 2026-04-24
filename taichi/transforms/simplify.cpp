@@ -526,6 +526,23 @@ void full_simplify(IRNode *root,
                                  args.kernel_name + ".simplify", root);
   TI_AUTO_PROF;
   if (config.advanced_optimization) {
+    // P2.c CompileTier:
+    //   "fast"     — alias of "balanced" at the IR-pass layer; P2.d will
+    //                give it a distinct (background opt-on-warm) meaning.
+    //   "balanced" — default post-P2.0/P2.a/P2.b behavior: single-shot
+    //                LICM / whole_kernel_cse / cfg_optimization.
+    //   "full"     — legacy (pre-P2.0) behavior: re-run LICM /
+    //                whole_kernel_cse / cfg_optimization on every outer
+    //                full_simplify iteration. Opt-in safety net for IRs
+    //                where repeated simplification exposes further
+    //                invariants / redundancies.
+    //
+    //   NOTE: We deliberately do NOT drop whole_kernel_cse under "fast".
+    //   On CSE-heavy kernels (e.g. mat14) the uncompressed IR hits
+    //   downstream LLVM passes with pathological size and can hang
+    //   codegen. Any future "more aggressive than balanced" behavior
+    //   belongs in P2.d (background thread), not here.
+    const bool tier_full = (config.compile_tier == "full");
     bool first_iteration = true;
     while (true) {
       bool modified = false;
@@ -547,14 +564,16 @@ void full_simplify(IRNode *root,
       if (alg_simp(root, config))
         modified = true;
       print("alg_simp");
-      // P2.b: Run loop_invariant_code_motion only in the first iteration.
-      // LICM has its own internal fixed-point loop (see
-      // LoopInvariantCodeMotion::run) that cascades all hoistable stmts in
-      // one call, so subsequent full_simplify iterations would only help if
-      // alg_simp/constant_fold create brand-new loop-invariant expressions,
-      // which is rare. Mirrors the existing first_iteration guard on
-      // whole_kernel_cse and cfg_optimization below.
-      if (first_iteration && loop_invariant_code_motion(root, config))
+      // P2.b/P2.c: Run loop_invariant_code_motion only in the first
+      // iteration (or every iteration under tier="full"). LICM has its
+      // own internal fixed-point loop (see LoopInvariantCodeMotion::run)
+      // that cascades all hoistable stmts in one call, so subsequent
+      // full_simplify iterations would only help if alg_simp /
+      // constant_fold create brand-new loop-invariant expressions, which
+      // is rare. Mirrors the first_iteration guard on whole_kernel_cse
+      // and cfg_optimization below.
+      if ((first_iteration || tier_full) &&
+          loop_invariant_code_motion(root, config))
         modified = true;
       print("loop_invariant_code_motion");
       if (die(root))
@@ -566,15 +585,18 @@ void full_simplify(IRNode *root,
       if (die(root))
         modified = true;
       print("die");
-      // Run whole_kernel_cse only in the first iteration: it is expensive for
-      // large kernels (O(N^2) without the use-def map) and subsequent
-      // iterations rarely expose new CSE opportunities.  This mirrors the
-      // existing first_iteration guard on cfg_optimization.
-      if (config.opt_level > 0 && first_iteration && whole_kernel_cse(root))
+      // Run whole_kernel_cse only in the first iteration (or every
+      // iteration under tier="full"). It is expensive for large kernels
+      // (O(users) even with the use-def map introduced in P2.0) and
+      // subsequent iterations rarely expose new CSE opportunities. We do
+      // NOT skip it under tier="fast" — see CompileTier comment above.
+      if (config.opt_level > 0 &&
+          (first_iteration || tier_full) && whole_kernel_cse(root))
         modified = true;
       // Don't do this time-consuming optimization pass again if the IR is
-      // not modified.
-      if (config.opt_level > 0 && first_iteration && config.cfg_optimization &&
+      // not modified. Under tier="full", run every iteration.
+      if (config.opt_level > 0 && (first_iteration || tier_full) &&
+          config.cfg_optimization &&
           cfg_optimization(
               root, args.after_lower_access, args.autodiff_enabled,
               !config.real_matrix_scalarize && !config.force_scalarize_matrix))
