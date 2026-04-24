@@ -77,3 +77,37 @@ call. Cold speed-up at N=1600 is 9.062 s → 23 ms = **≈394×**.
 
 - Default config (`unrolling_hard_limit=0`) → `ASTTransformer._check_unroll_hard_limit` is still called but both guards short-circuit on the 0-check. No semantic change — confirmed bit-exact on cpu/cuda/vulkan vs budgeted config and Δ≤4e-6 across backends on a 16-iter static-sin kernel.
 - Existing `unrolling_limit=32` SyntaxWarning path preserved unchanged.
+
+---
+
+## P3.c — irpass::scalarize early-exit (C++, wheel rebuild)
+
+Scope: pre-scan IR once; if no `TensorType` ret_types and no
+`MatrixInitStmt` / `MatrixPtrStmt` / `MatrixOfGlobalPtrStmt` /
+`MatrixOfMatrixPtrStmt`, return `false` immediately — skipping 4 later
+sub-passes (`Scalarize` / `ScalarizePointers` / `ExtractLocalPointers`
+/ `FuseMatrixPtr`). Provably semantics-preserving: when the pre-scan
+reports zero matrix stmts, the 4 sub-passes have nothing to mutate, so the
+post-state is identical to the pre-state.
+
+### Bench (subprocess-per-row, `bench_p3c_scalar.py`)
+
+Scalar-only saxpy-like kernel on CPU, `N = 1 << 20`. Compile wall-clock:
+
+| unroll | compile dt (s) |
+| ---:| ---:|
+|   32 |         0.097 |
+|  128 |         0.181 |
+|  512 |         0.849 |
+
+The early-exit path is reached at all 3 + 1 call sites
+(`compile_to_offloads.cpp` L76/L317/L418, `make_block_local.cpp` L47).
+Compared to pre-P3.c wheel the scalarize wrapper total drops from the sum
+of 5 sub-pass walks to a single `HasMatrixStmt` scan — measured
+6–34 μs per invocation via `TI_COMPILE_PROFILE` on realistic kernels.
+
+### Parity
+
+3-backend (cpu/cuda/vulkan) `parity_p3.py` and `smoke_p3a.py` pass
+bit-exact on the freshly rebuilt wheel `taichi-1.8.0-cp310-cp310-win_amd64.whl`
+(commit `8c1ceec6`): Δ=0 on default-vs-budgeted, Δ≤4e-6 across backends.

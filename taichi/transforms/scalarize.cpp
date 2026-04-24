@@ -1334,8 +1334,52 @@ class FuseMatrixPtr : public BasicStmtVisitor {
 
 namespace irpass {
 
+// P3.c — fast-scan for any matrix / tensor-type statement in the IR. When a
+// kernel contains only scalar operations (e.g. saxpy, reductions, pure CFG
+// kernels), every call to irpass::scalarize() would otherwise walk the entire
+// IR five times (Scalarize + GatherScalarizableLocalPointers + ScalarizePointers
+// + ExtractLocalPointers + FuseMatrixPtr) and mutate nothing. This predicate
+// costs one linear pass and lets the scalarize stage early-exit without any
+// behavioural change: if the IR has no TensorType-typed statements and no
+// MatrixInitStmt / MatrixPtrStmt producers, the five sub-passes are provably
+// no-ops.
+class HasMatrixStmt : public BasicStmtVisitor {
+ public:
+  using BasicStmtVisitor::visit;
+  bool found_ = false;
+
+  void visit(Stmt *stmt) override {
+    if (found_) {
+      return;
+    }
+    if (stmt->ret_type.ptr_removed()->is<TensorType>()) {
+      found_ = true;
+      return;
+    }
+    if (stmt->is<MatrixInitStmt>() || stmt->is<MatrixPtrStmt>() ||
+        stmt->is<MatrixOfGlobalPtrStmt>() || stmt->is<MatrixOfMatrixPtrStmt>()) {
+      found_ = true;
+    }
+  }
+
+  static bool run(IRNode *root) {
+    HasMatrixStmt pass;
+    root->accept(&pass);
+    return pass.found_;
+  }
+};
+
 bool scalarize(IRNode *root, bool half2_optimization_enabled) {
   TI_AUTO_PROF;
+
+  // P3.c — skip the whole pipeline if the IR has no matrix/tensor statements.
+  // Scalarize::run and the four pointer-rewriting helpers only ever mutate
+  // stmts produced by MatrixInitStmt / MatrixPtrStmt and friends; when none of
+  // those exist, all five sub-passes walk the IR to no effect.
+  if (!HasMatrixStmt::run(root)) {
+    return false;
+  }
+
   bool modified = false;
 
   modified |= Scalarize::run(root, half2_optimization_enabled);
