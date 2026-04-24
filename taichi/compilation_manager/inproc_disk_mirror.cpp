@@ -41,20 +41,27 @@ std::size_t &mirror_misses() {
 
 // Read the cap once per process. 0 disables the mirror entirely.
 std::size_t mirror_cap_bytes() {
-  static const std::size_t cached = [] {
+  // Explicit return type is required: on Windows x64 std::size_t is
+  // unsigned long long, but on Linux x86_64 it is unsigned long, while
+  // the literal 1024ull is unsigned long long. Without the trailing
+  // -> std::size_t, gcc deduces inconsistent types across the early
+  // return (`std::size_t{0}`) and the multiplication results and fails
+  // with "inconsistent types deduced for lambda return type".
+  static const std::size_t cached = []() -> std::size_t {
+    constexpr std::size_t kMB = static_cast<std::size_t>(1024) * 1024;
     const char *v = std::getenv("TI_INPROC_DISK_MIRROR_MB");
     if (v != nullptr) {
       try {
         long n = std::stol(v);
         if (n <= 0) {
-          return std::size_t{0};
+          return 0;
         }
-        return static_cast<std::size_t>(n) * 1024ull * 1024ull;
+        return static_cast<std::size_t>(n) * kMB;
       } catch (...) {
         // Fall through to default on malformed input.
       }
     }
-    return static_cast<std::size_t>(256) * 1024ull * 1024ull;
+    return static_cast<std::size_t>(256) * kMB;
   }();
   return cached;
 }
