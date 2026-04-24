@@ -75,7 +75,11 @@ def build_wheel(python: Command, pip: Command) -> None:
         misc.info(f"make_changelog.py failed (non-fatal, skipping): {e}")
 
     with nice():
-        python("-m", "build", "-w", *extra)
+        # `python -I -m build` runs in isolated mode which drops cwd from
+        # sys.path[0]. Without -I, the repo-local build.py would shadow the
+        # PyPI `build` package and the invocation would fail with an argparse
+        # error ("unrecognized arguments: -w").
+        python("-I", "-m", "build", "-w", *extra)
 
 
 @banner("Install Build Wheel Dependencies")
