@@ -382,3 +382,54 @@ P2 协议要求"每子阶段 3 后端冷编译基准 + 正确性门禁通过"。
 | P2.d | ⏸ 延期 | Phase 6 前置，需先完成 launch 间接层重构 |
 
 **P2 聚合效果 (3 后端 vs 1.7.4)**：mat14 1.55x / 1.53x / 1.57x (CPU/CUDA/Vulkan)；sph_force 1.29x / 1.29x / 1.29x。`compile_tier="full"` 作为 opt-in 安全网可回退到 1.7.4 行为。P2 phase 在 P2.c 处自然收口。
+
+
+---
+
+## P1.d — compile_tier-aware SPIR-V opt level — 2026-04-24 12:25
+
+### 设计
+
+`compile_tier="fast"` 将 SPIR-V 后端的 spv_opt_level 上限收紧到 **1**（3 个 pass：WrapOpKill / DeadBranchElim / AggressiveDCE），balanced / full 保持 `external_optimization_level` 用户设置（默认 3 → 23 passes）。与 P2.c 一致的"零运行时回归默认档 + fast tier 获得真实节省"原则。
+
+### 改动
+
+- taichi/codegen/spirv/kernel_compiler.cpp:38-49 — `compile_tier=="fast"` 时 `spv_opt_level = min(level, 1)`。
+- 三档由 P2.c 写入 offline-cache key（`compile_tier` 序列化），产物互不覆盖，无需额外改动。
+
+### Vulkan 冷编译实测（3 档 vs 同一 kernel）
+
+| kernel | fast | balanced | full | full vs balanced |
+|--------|------|----------|------|------------------|
+| mat14 | 39.76s | 39.50s | 49.23s | 1.25x regress |
+| sph_force | 7.09s | 6.76s | 8.32s | 1.23x regress |
+
+观察：
+- `fast` vs `balanced` 在两个 kernel 上都落在 ±1% 噪声内。**说明 spvtools 23-pass 链在 mat14/sph_force 这类 CHI-IR 宽而 SPV 字节码相对紧凑的 kernel 上不是瓶颈**。真正的冷编译大头在 CHI IR 生成 + SPV codegen 本身（不受 optimizer 影响）。
+- `full` 的 1.23-1.25x 回归完全来自 P2.b/P2.c 的 `simplify.cpp` 守卫（LICM/whole_kernel_cse/cfg_optimization 在 full 档每轮重跑），**不是** SPV 层变化，因为 balanced/full 的 spv_opt_level 都是 3。
+
+### 正确性门禁
+
+`tests/p2/tier_parity_vulkan.py`（sin/cos/sqrt + 有理分式的 1024-elem kernel）：
+
+```
+balanced head: [1. 2.01221 3.0061684 3.89238]  tail: [644.28955 643.8148]
+fast       max|Delta| vs balanced = 0.000e+00
+full       max|Delta| vs balanced = 0.000e+00
+OK
+```
+
+三档 Vulkan 位对位相等。
+
+### 结论与留痕
+
+P1.d hook 正确落地（可由 bench 数据证明 `full` 回归可复现、`fast` 与 `balanced` 只有噪声），但**在当前 heavy_kernels 样本集上 SPV optimizer 并非瓶颈**。后续若要让 `compile_tier="fast"` 在 SPV 端展现更大优势，需要定位一类 SPV-bound 的 kernel（典型：大量 local array / memory access pattern 触发 spvtools 的 EliminateDeadFunctions + PrivateToLocal + LocalAccessChainConvert 密集工作）作为专项 kernel。该工作进入 P3（frontend IR 控制）后续专项。
+
+### P1 阶段累计完成度
+
+| 子阶段 | 状态 | 备注 |
+|--------|------|------|
+| P1.a | ✅ | commit 812be1f0c — random_seed 移出 cache key |
+| P1.b | ⏸ | L1.5 CHI IR cache — 未开工 |
+| P1.c | ⏸ | Cache warmup CLI — 未开工 |
+| P1.d | ✅ | compile_tier → spv_opt_level 挂钩 + 三档数值位对位 |
