@@ -32,14 +32,12 @@ jobs:
     steps:
       - name: Install build deps
         run: |
-          # Install cmake and git from system repos.
-          # Do NOT install ninja-build from yum/dnf — the repo version (1.10.x) has a
-          # known depslog bug ("multiple outputs aren't supported") that breaks LLVM 20.
-          # Install a modern Ninja (1.12+) via pip instead.
+          # Only cmake and git are needed — we use Unix Makefiles instead of Ninja.
+          # Ninja versions shipped by yum/dnf in manylinux images are 1.10.x which have
+          # a known depslog limitation ("multiple outputs aren't supported") that breaks
+          # LLVM 20's generated build files.  Unix Makefiles has no such restriction and
+          # make is always present in every manylinux image, so this is the safer choice.
           yum install -y cmake git || dnf install -y cmake git
-          pip3 install --upgrade ninja
-          # Verify ninja ≥ 1.11 is on PATH
-          ninja --version
 
       - name: Clone LLVM
         run: |
@@ -48,7 +46,7 @@ jobs:
 
       - name: Configure LLVM
         run: |
-          cmake -S llvm-project/llvm -B build -G Ninja \
+          cmake -S llvm-project/llvm -B build -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX="$PWD/dist/taichi-llvm-20" \
             -DLLVM_ENABLE_PROJECTS="" \
@@ -68,7 +66,7 @@ jobs:
             -DLLVM_BUILD_UTILS=OFF
 
       - name: Build & install LLVM
-        run: cmake --build build --target install --config Release
+        run: cmake --build build --target install --config Release -- -j$(nproc)
 
       - name: Package zip
         run: |
