@@ -1,0 +1,79 @@
+## tottime
+         486948 function calls (484064 primitive calls) in 0.967 seconds
+
+   Ordered by: internal time
+   List reduced from 352 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+       16    0.719    0.045    0.719    0.045 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\kernel_impl.py:703(launch_kernel)
+        1    0.046    0.046    0.080    0.080 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\misc.py:337(init)
+        1    0.032    0.032    0.032    0.032 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\impl.py:394(create_program)
+     5936    0.028    0.000    0.043    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\textwrap.py:241(_wrap_chunks)
+        2    0.015    0.007    0.015    0.007 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\impl.py:498(clear)
+     5936    0.010    0.000    0.010    0.000 {method 'split' of 're.Pattern' objects}
+2419/2131    0.010    0.000    0.013    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\expr.py:16(__init__)
+    89888    0.005    0.000    0.005    0.000 {method 'pop' of 'list' objects}
+    97112    0.005    0.000    0.005    0.000 {method 'append' of 'list' objects}
+      464    0.005    0.000    0.007    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\impl.py:73(expr_init)
+   114242    0.004    0.000    0.004    0.000 {built-in method builtins.len}
+     2800    0.004    0.000    0.071    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer_utils.py:274(get_pos_info)
+     3200    0.004    0.000    0.007    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\tokenize.py:431(_tokenize)
+  2096/16    0.004    0.000    0.121    0.008 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer_utils.py:19(__call__)
+      784    0.003    0.000    0.022    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer.py:68(build_Name)
+       16    0.003    0.000    0.149    0.009 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\kernel_impl.py:652(materialize)
+     2800    0.003    0.000    0.066    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer_utils.py:284(gen_line)
+       16    0.003    0.000    0.003    0.000 {built-in method builtins.compile}
+      117    0.003    0.000    0.003    0.000 {built-in method nt.stat}
+     5936    0.003    0.000    0.015    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\textwrap.py:160(_split)
+     5936    0.002    0.000    0.002    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\textwrap.py:179(<listcomp>)
+      656    0.002    0.000    0.013    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ops.py:124(_binary_operation)
+    32/16    0.002    0.000    0.118    0.007 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer.py:1306(build_range_for)
+     5936    0.002    0.000    0.067    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\textwrap.py:350(wrap)
+     5936    0.002    0.000    0.002    0.000 {method 'translate' of 'str' objects}
+  656/240    0.002    0.000    0.082    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer.py:1041(build_BinOp)
+     5936    0.002    0.000    0.005    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\textwrap.py:146(_munge_whitespace)
+     3104    0.002    0.000    0.002    0.000 {method 'match' of 're.Pattern' objects}
+       64    0.002    0.000    0.003    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\impl.py:187(subscript)
+       16    0.002    0.000    0.009    0.001 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\inspect.py:1101(getblock)
+
+
+
+## cumulative
+         486948 function calls (484064 primitive calls) in 0.967 seconds
+
+   Ordered by: cumulative time
+   List reduced from 352 to 30 due to restriction <30>
+
+   ncalls  tottime  percall  cumtime  percall filename:lineno(function)
+        1    0.000    0.000    0.968    0.968 D:\taichi\tests\p3\profile_p3d_many.py:40(run_once)
+       16    0.000    0.000    0.871    0.054 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\kernel_impl.py:1128(wrapped)
+       16    0.001    0.000    0.871    0.054 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\kernel_impl.py:1034(__call__)
+       16    0.719    0.045    0.719    0.045 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\kernel_impl.py:703(launch_kernel)
+       16    0.001    0.000    0.150    0.009 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\kernel_impl.py:1026(ensure_compiled)
+       16    0.003    0.000    0.149    0.009 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\kernel_impl.py:652(materialize)
+       16    0.000    0.000    0.121    0.008 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\kernel_impl.py:675(taichi_ast_generator)
+       16    0.000    0.000    0.121    0.008 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\transform.py:5(transform_tree)
+  2096/16    0.004    0.000    0.121    0.008 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer_utils.py:19(__call__)
+       16    0.000    0.000    0.121    0.008 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer.py:933(build_Module)
+       16    0.000    0.000    0.120    0.007 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer.py:618(build_FunctionDef)
+    80/16    0.000    0.000    0.119    0.007 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer.py:1745(build_stmts)
+    32/16    0.000    0.000    0.118    0.007 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer.py:1507(build_For)
+    32/16    0.002    0.000    0.118    0.007 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer.py:1306(build_range_for)
+      240    0.000    0.000    0.100    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer.py:120(build_Assign)
+  656/240    0.002    0.000    0.082    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer.py:1041(build_BinOp)
+        1    0.046    0.046    0.080    0.080 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\misc.py:337(init)
+     2800    0.004    0.000    0.071    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer_utils.py:274(get_pos_info)
+     5936    0.002    0.000    0.067    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\textwrap.py:350(wrap)
+     2800    0.003    0.000    0.066    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer_utils.py:284(gen_line)
+     5936    0.028    0.000    0.043    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\textwrap.py:241(_wrap_chunks)
+        1    0.032    0.032    0.032    0.032 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\impl.py:394(create_program)
+       16    0.000    0.000    0.023    0.001 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\kernel_impl.py:123(_get_tree_and_ctx)
+      784    0.003    0.000    0.022    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\ast\ast_transformer.py:68(build_Name)
+     5936    0.002    0.000    0.022    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\textwrap.py:344(_split_chunks)
+     5936    0.003    0.000    0.015    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\textwrap.py:160(_split)
+        2    0.000    0.000    0.015    0.007 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\misc.py:204(reset)
+        2    0.000    0.000    0.015    0.007 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\impl.py:517(reset)
+        2    0.015    0.007    0.015    0.007 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\impl.py:498(clear)
+2419/2131    0.010    0.000    0.013    0.000 C:\Users\Administrator\AppData\Local\Programs\Python\Python310\lib\site-packages\taichi\lang\expr.py:16(__init__)
+
+
