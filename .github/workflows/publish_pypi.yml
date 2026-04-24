@@ -92,7 +92,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        # NOTE: 3.14 is experimental; scikit-build 0.19 still emits distutils
+        # deprecation warnings on 3.14 but produces a working wheel.
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     env:
       PY: ${{ matrix.python }}
       TAICHI_CMAKE_ARGS: >-
@@ -182,7 +184,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.10", "3.11", "3.12", "3.13"]
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     env:
       PY: ${{ matrix.python }}
       TAICHI_CMAKE_ARGS: >-

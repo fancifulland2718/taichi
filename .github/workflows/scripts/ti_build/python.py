@@ -63,7 +63,7 @@ def get_desired_python_version() -> str:
 
     # Supported Python versions for Taichi wheels. 3.9 has been dropped
     # (reached upstream EOL) together with the distutils purge in setup.py.
-    _SUPPORTED = {"3.10", "3.11", "3.12", "3.13"}
+    _SUPPORTED = {"3.10", "3.11", "3.12", "3.13", "3.14"}
 
     if version in ("3.x", "3", None):
         assert v.major == 3

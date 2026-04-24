@@ -606,22 +606,32 @@ class TaskCodeGenCUDA : public TaskCodeGenLLVM {
   llvm::Value *create_intrinsic_load(llvm::Value *ptr,
                                      llvm::Type *ty) override {
     // Issue an "__ldg" instruction to cache data in the read-only data cache.
-    auto intrin = ty->isFloatingPointTy() ? llvm::Intrinsic::nvvm_ldg_global_f
-                                          : llvm::Intrinsic::nvvm_ldg_global_i;
-    // Special treatment for bool types. As nvvm_ldg_global_i does not support
-    // 1-bit integer, so we convert them to i8.
-    if (ty->getScalarSizeInBits() == 1) {
-      auto *new_ty = tlctx->get_data_type<uint8>();
-      auto *new_ptr =
-          builder->CreatePointerCast(ptr, llvm::PointerType::get(new_ty, 0));
-      auto *v = builder->CreateIntrinsic(
-          intrin, {new_ty, llvm::PointerType::get(new_ty, 0)},
-          {new_ptr, tlctx->get_constant(new_ty->getScalarSizeInBits())});
-      return builder->CreateIsNotNull(v);
+    //
+    // LLVM 20 removed the ``llvm::Intrinsic::nvvm_ldg_global_{f,i}``
+    // intrinsics. The recommended replacement is an ordinary load tagged
+    // with ``!invariant.load`` metadata: the NVPTX backend lowers such
+    // loads to ``ld.global.nc`` (== ``__ldg``) just like the old intrinsics
+    // did. This form is also accepted by LLVM 19, so we use it
+    // unconditionally.
+    //
+    // Special treatment for bool types. As the underlying ld.global.nc does
+    // not support 1-bit integer, so we convert them to i8 first.
+    llvm::Type *load_ty = ty;
+    llvm::Value *load_ptr = ptr;
+    const bool is_bool = ty->getScalarSizeInBits() == 1;
+    if (is_bool) {
+      load_ty = tlctx->get_data_type<uint8>();
+      load_ptr = builder->CreatePointerCast(
+          ptr, llvm::PointerType::get(load_ty, 0));
     }
-    return builder->CreateIntrinsic(
-        intrin, {ty, llvm::PointerType::get(ty, 0)},
-        {ptr, tlctx->get_constant(ty->getScalarSizeInBits())});
+    auto *load = builder->CreateLoad(load_ty, load_ptr);
+    load->setMetadata(
+        llvm::LLVMContext::MD_invariant_load,
+        llvm::MDNode::get(*llvm_context, llvm::ArrayRef<llvm::Metadata *>{}));
+    if (is_bool) {
+      return builder->CreateIsNotNull(load);
+    }
+    return load;
   }
 
   void visit(GlobalLoadStmt *stmt) override {

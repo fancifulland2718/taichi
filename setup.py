@@ -49,6 +49,7 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
 ]
 
 
@@ -62,7 +63,13 @@ def get_version():
     return version.lstrip("v")
 
 
-project_name = os.getenv("PROJECT_NAME", "taichi")
+# The upstream project is published on PyPI as ``taichi``.
+# This fork is published as ``taichi-forge`` to avoid clashing with the
+# upstream distribution. The Python *import* name remains ``taichi`` so
+# existing user code (``import taichi as ti``) keeps working verbatim.
+# Override with ``PROJECT_NAME=taichi`` when building a drop-in replacement
+# wheel for internal use.
+project_name = os.getenv("PROJECT_NAME", "taichi-forge")
 version = get_version()
 TI_VERSION_MAJOR, TI_VERSION_MINOR, TI_VERSION_PATCH = version.split(".")
 
@@ -245,13 +252,21 @@ setup(
     packages=packages,
     package_dir={"": package_dir},
     version=version,
-    description="The Taichi Programming Language",
+    description=(
+        "Taichi Forge — a community-maintained fork of the Taichi "
+        "Programming Language (import name: ``taichi``)."
+        if project_name == "taichi-forge"
+        else "The Taichi Programming Language"
+    ),
     author="Taichi developers",
     author_email="yuanmhu@gmail.com",
     url="https://github.com/taichi-dev/taichi",
     python_requires=">=3.10,<4.0",
     install_requires=[
-        "numpy",
+        # numpy 2.1 is the first release that ships cp314 wheels; older
+        # numpy will compile from source on 3.14 which is fragile.
+        "numpy>=1.23; python_version < '3.14'",
+        "numpy>=2.1; python_version >= '3.14'",
         "colorama",
         "dill",
         "rich",

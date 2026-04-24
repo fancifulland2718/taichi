@@ -1,8 +1,11 @@
 [build-system]
 requires = [
-    "setuptools>=64", "wheel",
-    "numpy", "pybind11", "cmake>=3.20",
-    "scikit-build", "ninja; platform_system != 'Windows'",
+    # Pin setuptools below 80 because scikit-build 0.19 still imports the
+    # legacy `distutils.command.build_py` shim that setuptools >=80 removed.
+    # Remove once we migrate to scikit-build-core.
+    "setuptools>=64,<80", "wheel",
+    "numpy", "pybind11>=2.13", "cmake>=3.20",
+    "scikit-build>=0.18", "ninja; platform_system != 'Windows'",
 ]
 build-backend = "setuptools.build_meta"
 
