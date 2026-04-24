@@ -32,12 +32,12 @@ jobs:
     steps:
       - name: Install build deps
         run: |
-          # Only cmake and git are needed — we use Unix Makefiles instead of Ninja.
-          # Ninja versions shipped by yum/dnf in manylinux images are 1.10.x which have
-          # a known depslog limitation ("multiple outputs aren't supported") that breaks
-          # LLVM 20's generated build files.  Unix Makefiles has no such restriction and
-          # make is always present in every manylinux image, so this is the safer choice.
-          yum install -y cmake git || dnf install -y cmake git
+          # cmake, git, and zip are needed.
+          # We use Unix Makefiles instead of Ninja because yum/dnf in manylinux images
+          # ships Ninja 1.10.x which has a known depslog limitation ("multiple outputs
+          # aren't supported") that breaks LLVM 20.  Unix Makefiles + make has no such
+          # restriction and make is always present in every manylinux image.
+          yum install -y cmake git zip || dnf install -y cmake git zip
 
       - name: Clone LLVM
         run: |

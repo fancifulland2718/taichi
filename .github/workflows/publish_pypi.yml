@@ -166,13 +166,15 @@ jobs:
 
       - name: Audit wheel (auditwheel repair)
         run: |
-          python -m pip install auditwheel
+          python -m pip install auditwheel patchelf
           mkdir -p wheelhouse
-          # Note: we target manylinux_2_28 because LLVM 20 prebuilt is
-          # linked against newer libc. If the prebuilt is manylinux2014
-          # compatible, switch to --plat manylinux2014_x86_64.
+          # ubuntu-22.04 ships glibc 2.35, so the wheel will reference glibc 2.35
+          # symbols.  auditwheel repair --plat manylinux_2_28_x86_64 would fail because
+          # 2.28 < 2.35.  Use manylinux_2_35_x86_64 which PyPI accepts (PEP 600).
+          # To produce a more-compatible manylinux_2_28 wheel, switch the build_linux
+          # job to run inside a quay.io/pypa/manylinux_2_28_x86_64 container instead.
           auditwheel show dist/*.whl || true
-          auditwheel repair dist/*.whl -w wheelhouse/ --plat manylinux_2_28_x86_64 || cp dist/*.whl wheelhouse/
+          auditwheel repair dist/*.whl -w wheelhouse/ --plat manylinux_2_35_x86_64 || cp dist/*.whl wheelhouse/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
