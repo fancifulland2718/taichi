@@ -131,7 +131,8 @@ std::vector<uint8_t> global_optimize_module(llvm::Module *module,
   {
     TI_PROFILER("llvm_module_opt_pipeline");
     LLVMOptPipelineOptions opts;
-    opts.opt_level = llvm_opt_level_from_int(config.llvm_opt_level);
+    opts.opt_level = llvm_opt_level_from_int(
+        effective_llvm_opt_level(config.llvm_opt_level, config.compile_tier));
     opts.loop_vectorize = true;
     opts.slp_vectorize = true;
     opts.run_post_gep_passes = true;

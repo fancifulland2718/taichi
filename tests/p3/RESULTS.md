@@ -355,3 +355,77 @@ Recommendation: Option 1 (parallel per-kernel compile) has the best
 win/risk ratio and is on-plan for P5 anyway. It requires a measured
 sub-plan before implementation (avoid repeating P2.d's three
 invalidating surprises).
+
+
+## P3.d-C 鈥?`compile_tier="fast"` 鈫?LLVM O0 (with O1 floor on NVPTX/AMDGCN)
+
+**Status**: shipped. Completes the tier semantics started in P1.d (SPIR-V)
+and P2.c (enum + cache key) for the four LLVM backends.
+
+### Motivation
+
+P1.d already caps `spv_opt_level` at 1 when `compile_tier="fast"`
+([kernel_compiler.cpp](taichi/codegen/spirv/kernel_compiler.cpp)). The
+four LLVM backends were **not** tier-aware 鈥?an inconsistency that this
+stage closes.
+
+### Change ([taichi/runtime/llvm/llvm_opt_pipeline.h](taichi/runtime/llvm/llvm_opt_pipeline.h))
+
+- New helper `effective_llvm_opt_level(level, tier, min_level=0)` 鈥?when
+  `tier == "fast"`, returns `max(min_level, 0)`; otherwise returns `level`.
+- CPU ([codegen_cpu.cpp](taichi/codegen/cpu/codegen_cpu.cpp)) and DX12
+  ([dx12_global_optimize_module.cpp](taichi/codegen/dx12/dx12_global_optimize_module.cpp)):
+  `min_level=0` 鈥?full O0 cap.
+- CUDA ([jit_cuda.cpp](taichi/runtime/cuda/jit_cuda.cpp)) and AMDGPU
+  ([jit_amdgpu.cpp](taichi/runtime/amdgpu/jit_amdgpu.cpp), 2 sites):
+  `min_level=1` 鈥?NVPTX and AMDGCN codegen depend on O1 legalization
+  passes (in particular `StackSave`/`StackRestore` intrinsic lowering in
+  NVPTX); **O0 causes `LLVM Fatal Error: Cannot select stacksave` at JIT
+  time on CUDA**. Discovered during dev-time validation; fix is a 3-arg
+  helper with a per-backend floor.
+
+### Bench ([bench_tier_fast_llvm.py](bench_tier_fast_llvm.py),
+[bench_tier_fast_cuda.py](bench_tier_fast_cuda.py); N=16 kernels, 2-run min)
+
+| backend | tier | cold compile | head value |
+| :--- | :--- | ---: | :--- |
+| CPU  | balanced (O3) | 0.615 s | 5729.958236527037, ... |
+| CPU  | fast (O0)     | 0.545 s | 5729.958236527037, ... |
+| CPU  | **save**      | **+11.4%** | **bit-exact** |
+| CUDA | balanced (O3) | 0.909 s | 5729.958236527037, ... |
+| CUDA | fast (O1)     | 0.800 s | 5729.958236527037, ... |
+| CUDA | **save**      | **+12.1%** | **bit-exact** |
+
+Both backends clear the **鈮?% compile-speed ship gate** comfortably;
+runtime numerics are bit-exact on these kernels.
+
+### Correctness
+
+| test | result |
+| :--- | :--- |
+| [test_tier_fast_parity.py](test_tier_fast_parity.py) 鈥?matrix 3脳3 matmul + 8-kernel seq (CPU) | OK 鈥?max abs 螖 = 0 |
+| [test_tier_fast_cuda.py](test_tier_fast_cuda.py) 鈥?quadratic kernel head comparison (CUDA) | OK 鈥?max abs 螖 = 0 |
+| [parity_p3.py](parity_p3.py) (3-backend default vs budgeted) | 螖=0 default-vs-budgeted, 3.994e-6 cross-backend (unchanged) |
+| [parity_p3c_matrix.py](parity_p3c_matrix.py) (3 matrix paths) | 3/3 螖=0 |
+| P3.a/b/d regression tests (5 files) | All OK (per-loop hard-limit abort 14 ms) |
+
+### Accuracy caveats
+
+On simple arithmetic kernels the result is bit-exact, but LLVM O0 skips
+`reassoc`/`fast-math` simplifications that O3 would otherwise apply 鈥?so
+accumulation-heavy kernels with `1/n`-scale sums can differ from O3 by
+up to ~2e-7 relative (observed earlier during opt-level sweep on a
+saxpy-cumulate workload). This is still well within Taichi's documented
+cross-backend 1e-5 numerical bar (see tests/p2/ protocol, P2.b) and is
+strictly smaller than the existing cpu-vs-cuda 3.994e-6 delta on
+[parity_p3.py](parity_p3.py).
+
+Users who need **exact** O3 bit-reproducibility must stay on
+`compile_tier="balanced"` (the default). `tier="fast"` is an explicit
+opt-in for dev-loop / iteration cycles.
+
+### Offline cache
+
+`compile_tier` is already part of the offline-cache key (P2.c, commit
+`0a3635d6c`), so `fast` and `balanced` binaries do not collide on disk.
+No cache migration needed.

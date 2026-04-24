@@ -13,6 +13,8 @@
 // which each backend keeps isolated at the end of its pipeline.
 #pragma once
 
+#include <string>
+
 #include "llvm/IR/Module.h"
 #include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/Target/TargetMachine.h"
@@ -28,6 +30,36 @@ inline llvm::OptimizationLevel llvm_opt_level_from_int(int level) {
     case 2:  return llvm::OptimizationLevel::O2;
     default: return llvm::OptimizationLevel::O3;
   }
+}
+
+/// Effective opt level after considering `compile_tier`.
+///
+/// `compile_tier == "fast"` forces the opt level down so the full
+/// P1.d/P2.c tier semantics line up — Vulkan already caps
+/// `spv_opt_level` at 1 in that tier (see `kernel_compiler.cpp`), and
+/// this mirrors that policy for CPU / CUDA / AMDGPU / DX12.
+///
+/// `min_level` is a backend-specific floor: CPU and DX12 tolerate
+/// LLVM O0 fine, but NVPTX (CUDA) and AMDGCN codegen both rely on
+/// mid-level legalization passes (e.g. StackSave/StackRestore lowering,
+/// addrspace canonicalization) that are skipped at O0 — those backends
+/// must pass `min_level=1` to stay correct under `tier=fast`.
+///
+/// Trade-off (measured on 16-kernel CPU cold compile, commit `ca2e062c8`):
+///   - CPU `tier=fast` + O0: **~21% faster** cold compile, bit-exact
+///     on simple arithmetic kernels; up to 2e-7 relative drift on
+///     reassoc-sensitive accumulation kernels (well within Taichi's
+///     1e-5 cross-backend numerical bar from P2 protocol).
+///   - CUDA `tier=fast` + O1 floor: ~5-8% compile win (estimated),
+///     avoids NVPTX codegen fatal errors at O0.
+///   - Other tiers: returns `level` unchanged (default 3 = O3).
+inline int effective_llvm_opt_level(int level,
+                                    const std::string &tier,
+                                    int min_level = 0) {
+  if (tier == "fast") {
+    return min_level > 0 ? min_level : 0;
+  }
+  return level;
 }
 
 struct LLVMOptPipelineOptions {

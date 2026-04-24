@@ -178,7 +178,9 @@ std::string JITSessionCUDA::compile_module_to_ptx(
   {
     TI_PROFILER("llvm_module_opt_pipeline");
     LLVMOptPipelineOptions opts;
-    opts.opt_level = llvm_opt_level_from_int(config_.llvm_opt_level);
+    opts.opt_level = llvm_opt_level_from_int(
+        effective_llvm_opt_level(config_.llvm_opt_level, config_.compile_tier,
+                                 /*min_level=*/1));
     opts.loop_vectorize = false;
     opts.slp_vectorize = false;
     opts.run_post_gep_passes = true;
