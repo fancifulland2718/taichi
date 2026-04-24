@@ -1,80 +1,325 @@
-[build-system]
-requires = [
-  "scikit-build-core>=0.10",
-  "pybind11>=2.13",
-  "ninja; platform_system != 'Linux' or platform_machine != 'aarch64'",
-]
-build-backend = "scikit_build_core.build"
+name: Publish wheels to PyPI
 
-[project]
-name = "taichi-forge"
-dynamic = ["version"]
-description = "Taichi Forge - a community-maintained fork of the Taichi Programming Language (import name: taichi)."
-readme = "README_FORGE.md"
-license = { text = "Apache-2.0" }
-requires-python = ">=3.10,<4.0"
-authors = [
-  { name = "Taichi Forge contributors" },
-]
-keywords = ["graphics", "simulation", "compiler", "gpu"]
-classifiers = [
-  "Development Status :: 4 - Beta",
-  "Topic :: Software Development :: Compilers",
-  "Topic :: Multimedia :: Graphics",
-  "Topic :: Games/Entertainment :: Simulation",
-  "Intended Audience :: Science/Research",
-  "Intended Audience :: Developers",
-  "License :: OSI Approved :: Apache Software License",
-  "Programming Language :: Python :: 3.10",
-  "Programming Language :: Python :: 3.11",
-  "Programming Language :: Python :: 3.12",
-  "Programming Language :: Python :: 3.13",
-  "Programming Language :: Python :: 3.14",
-]
-dependencies = [
-  "numpy>=1.23; python_version < '3.14'",
-  "numpy>=2.1; python_version >= '3.14'",
-  "colorama",
-  "dill",
-  "rich",
-]
+# Builds Taichi wheels for Windows (x64) and Linux (x86_64, manylinux) across
+# Python 3.10-3.13 and optionally publishes to PyPI.
+#
+# Trigger:
+#   * workflow_dispatch — manual, with a version input. If `publish=true`
+#     the built wheels are uploaded to PyPI via Trusted Publishing (OIDC).
+#     If `publish=false` the wheels are only attached as workflow artifacts
+#     and a GitHub Release draft — useful to validate the pipeline before
+#     pushing to PyPI.
+#   * push of a tag matching `v*` — full production release. Requires the
+#     repo's PyPI Trusted Publisher binding to be configured (see
+#     docs/design/pypi_release.md).
+#
+# Permission-handling notes (the "no permission to create release" pitfall):
+#   * `permissions.contents: write` is REQUIRED so that
+#     softprops/action-gh-release can create/update the GitHub Release
+#     from within the workflow (default token lacks write scope).
+#   * `permissions.id-token: write` is REQUIRED for PyPI Trusted
+#     Publishing via `pypa/gh-action-pypi-publish` (OIDC handshake).
+#   * If the release step still returns 403 "Resource not accessible by
+#     integration", check: (a) repo settings → Actions → General →
+#     Workflow permissions is set to "Read and write", and (b) for forks
+#     the `pull_request` trigger cannot mint an id-token — use
+#     `workflow_dispatch` or push a tag from the canonical branch.
 
-[project.urls]
-Homepage = "https://github.com/fancifulland2718/taichi-forge"
-Issues = "https://github.com/fancifulland2718/taichi-forge/issues"
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version (e.g. 1.8.0 or 1.8.0.dev20260424); leaves empty for whatever is in version.txt"
+        required: false
+        default: ""
+      publish:
+        description: "Upload to PyPI after building (true/false)"
+        required: false
+        default: "false"
+      target:
+        description: "pypi | testpypi — which index to publish to"
+        required: false
+        default: "testpypi"
+  push:
+    tags:
+      - "v*"
 
-[project.scripts]
-ti = "taichi._main:main"
+permissions:
+  # Needed by softprops/action-gh-release to create/update the GitHub Release.
+  contents: write
+  # Needed by pypa/gh-action-pypi-publish (Trusted Publishing / OIDC).
+  id-token: write
 
-[tool.scikit-build]
-cmake.version = ">=3.20"
-cmake.build-type = "Release"
-build-dir = "_skbuild/{wheel_tag}"
-wheel.packages = ["python/taichi"]
-wheel.exclude = [
-  "**/libSPIRV-Tools-shared.so",
-  "**/libSPIRV-Tools-shared.dll",
-]
-wheel.py-api = ""
+env:
+  TI_SKIP_VERSION_CHECK: "ON"
+  TI_CI: "1"
+  # LLVM 20 prebuilt asset tag shipped via Build LLVM workflow.
+  # Required so the workflow can download the prebuilt LLVM zip instead of
+  # spending ~20 minutes rebuilding it in-job.
+  LLVM20_WIN_URL: ${{ vars.LLVM20_WIN_URL }}
+  LLVM20_LINUX_MANYLINUX_URL: ${{ vars.LLVM20_LINUX_MANYLINUX_URL }}
 
-[tool.scikit-build.cmake.define]
-TI_VERSION_MAJOR = "0"
-TI_VERSION_MINOR = "1"
-TI_VERSION_PATCH = "0"
+jobs:
+  resolve_version:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.set.outputs.version }}
+      is_tag: ${{ steps.set.outputs.is_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: set
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            ver="${GITHUB_REF#refs/tags/v}"
+            echo "is_tag=true" >> "$GITHUB_OUTPUT"
+          elif [[ -n "${{ github.event.inputs.version }}" ]]; then
+            ver="${{ github.event.inputs.version }}"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+          else
+            ver="$(tr -d ' \t\n' < version.txt)"
+            echo "is_tag=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "Resolved version: $ver"
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
 
-[tool.scikit-build.metadata.version]
-provider = "scikit_build_core.metadata.regex"
-input = "version.txt"
-regex = 'v?(?P<version>[0-9]+\.[0-9]+\.[0-9]+(?:[-+.][0-9A-Za-z.-]+)?)'
+  build_linux:
+    name: Linux wheel (py${{ matrix.python }})
+    needs: resolve_version
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # NOTE: 3.14 is experimental; scikit-build 0.19 still emits distutils
+        # deprecation warnings on 3.14 but produces a working wheel.
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    env:
+      PY: ${{ matrix.python }}
+      TAICHI_CMAKE_ARGS: >-
+        -DTI_WITH_VULKAN:BOOL=ON
+        -DTI_WITH_OPENGL:BOOL=ON
+        -DTI_WITH_CUDA:BOOL=OFF
+        -DTI_WITH_LLVM:BOOL=ON
+        -DTI_WITH_C_API:BOOL=ON
+        -DTI_BUILD_TESTS:BOOL=OFF
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
 
-[tool.pytest.ini_options]
-filterwarnings = [
-  "ignore:Calling non-taichi function",
-  "ignore:`np.int` is a deprecated alias",
-  "ignore:Operator \"is\" in Taichi scope is deprecated",
-  "ignore:Operator \"is not\" in Taichi scope is deprecated",
-]
+      - name: Setup Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
 
-[tool.yapf]
-based_on_style = "pep8"
-blank_line_before_nested_class_or_def = false
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ninja-build ccache libxrandr-dev \
+            libxinerama-dev libxcursor-dev libxi-dev libx11-dev \
+            libxrender-dev libgl-dev libtinfo-dev libxml2-dev
+
+      - name: Setup Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: 1.4.304.1
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-use-cache: true
+
+      - name: Download prebuilt LLVM 20
+        env:
+          LLVM20_LINUX_URL: ${{ vars.LLVM20_LINUX_URL || env.LLVM20_LINUX_MANYLINUX_URL }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${LLVM20_LINUX_URL}" ]]; then
+            echo "::error::LLVM20_LINUX_URL (or LLVM20_LINUX_MANYLINUX_URL) is not configured as a repository variable."
+            echo "  Go to Settings → Secrets and variables → Actions → Variables and add the URL."
+            exit 1
+          fi
+          mkdir -p dist
+          curl -fsSL "$LLVM20_LINUX_URL" -o /tmp/llvm20.zip
+          mkdir -p dist/taichi-llvm-20
+          python -m zipfile -e /tmp/llvm20.zip dist/taichi-llvm-20
+          echo "LLVM_DIR=$GITHUB_WORKSPACE/dist/taichi-llvm-20/lib/cmake/llvm" >> "$GITHUB_ENV"
+
+      - name: Install python build deps
+        run: |
+          python -m pip install --upgrade pip build
+          python -m pip install --upgrade "scikit-build-core>=0.10" cmake "pybind11>=2.13"
+
+      - name: Override version
+        shell: bash
+        run: |
+          echo -n "${{ needs.resolve_version.outputs.version }}" > version.txt
+          cat version.txt
+
+      - name: Build wheel
+        # `python -I -m build` runs in isolated mode, which drops cwd from
+        # sys.path[0] so the repo-local build.py does not shadow the PyPI
+        # `build` package.
+        run: |
+          python -I -m build --wheel --no-isolation
+
+      - name: Audit wheel (auditwheel repair)
+        run: |
+          python -m pip install auditwheel patchelf
+          mkdir -p wheelhouse
+          # ubuntu-22.04 ships glibc 2.35, so the wheel will reference glibc 2.35
+          # symbols.  auditwheel repair --plat manylinux_2_28_x86_64 would fail because
+          # 2.28 < 2.35.  Use manylinux_2_35_x86_64 which PyPI accepts (PEP 600).
+          # To produce a more-compatible manylinux_2_28 wheel, switch the build_linux
+          # job to run inside a quay.io/pypa/manylinux_2_28_x86_64 container instead.
+          auditwheel show dist/*.whl || true
+          auditwheel repair dist/*.whl -w wheelhouse/ --plat manylinux_2_35_x86_64 || cp dist/*.whl wheelhouse/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-linux-py${{ matrix.python }}
+          path: wheelhouse/*.whl
+          if-no-files-found: error
+
+  build_windows:
+    name: Windows wheel (py${{ matrix.python }})
+    needs: resolve_version
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12", "3.13", "3.14"]
+    env:
+      PY: ${{ matrix.python }}
+      TAICHI_CMAKE_ARGS: >-
+        -DTI_WITH_VULKAN:BOOL=ON
+        -DTI_WITH_OPENGL:BOOL=ON
+        -DTI_WITH_CUDA:BOOL=OFF
+        -DTI_WITH_LLVM:BOOL=ON
+        -DTI_WITH_C_API:BOOL=ON
+        -DTI_BUILD_TESTS:BOOL=OFF
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Python ${{ matrix.python }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Setup MSVC dev cmd
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install Ninja
+        uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Setup Vulkan SDK
+        uses: humbletim/setup-vulkan-sdk@v1.2.1
+        with:
+          vulkan-query-version: 1.4.304.1
+          vulkan-components: Vulkan-Headers, Vulkan-Loader
+          vulkan-use-cache: true
+
+      - name: Download prebuilt LLVM 20
+        shell: pwsh
+        run: |
+          $url = "${{ env.LLVM20_WIN_URL }}"
+          if (-not $url) {
+            Write-Error "LLVM20_WIN_URL is not configured as a repo variable. Run the 'Build LLVM 20 for Windows' workflow first and set the variable to the release asset URL."
+            exit 1
+          }
+          New-Item -ItemType Directory -Force -Path dist/taichi-llvm-20 | Out-Null
+          Invoke-WebRequest -Uri $url -OutFile $env:TEMP/llvm20.zip
+          Expand-Archive -Path $env:TEMP/llvm20.zip -DestinationPath dist/taichi-llvm-20
+          "LLVM_DIR=$(Resolve-Path dist/taichi-llvm-20/lib/cmake/llvm)" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+
+      - name: Install python build deps
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip build
+          python -m pip install --upgrade "scikit-build-core>=0.10" cmake "pybind11>=2.13"
+
+      - name: Override version
+        shell: pwsh
+        run: |
+          Set-Content -Path version.txt -NoNewline -Value "${{ needs.resolve_version.outputs.version }}"
+          Get-Content version.txt
+
+      - name: Build wheel
+        shell: pwsh
+        run: |
+          # Isolated mode drops cwd from sys.path so the local build.py
+          # does not shadow the PyPI `build` package.
+          python -I -m build --wheel --no-isolation
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-windows-py${{ matrix.python }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  collect_and_release:
+    name: GitHub Release + PyPI upload
+    needs: [resolve_version, build_linux, build_windows]
+    runs-on: ubuntu-latest
+    # Only publish when:
+    #   * a v-tag was pushed, OR
+    #   * workflow_dispatch was invoked with publish=true
+    if: |
+      needs.resolve_version.outputs.is_tag == 'true' ||
+      github.event.inputs.publish == 'true'
+    environment:
+      name: ${{ github.event.inputs.target == 'pypi' && 'pypi' || 'testpypi' }}
+      url: ${{ github.event.inputs.target == 'pypi' && 'https://pypi.org/p/taichi-forge' || 'https://test.pypi.org/p/taichi-forge' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Gather wheels
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find artifacts -type f -name '*.whl' -exec cp -v {} dist/ \;
+          ls -la dist/
+
+      - name: Create GitHub Release
+        # Uses GITHUB_TOKEN. Requires `permissions.contents: write` at the
+        # workflow level (set above). On forks, this step will silently
+        # skip if the token cannot create releases; switch to a PAT stored
+        # as a secret named RELEASE_PAT in that case.
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ needs.resolve_version.outputs.version }}
+          name: Taichi v${{ needs.resolve_version.outputs.version }}
+          generate_release_notes: true
+          draft: ${{ needs.resolve_version.outputs.is_tag != 'true' }}
+          prerelease: ${{ contains(needs.resolve_version.outputs.version, 'dev') || contains(needs.resolve_version.outputs.version, 'rc') }}
+          files: dist/*.whl
+          fail_on_unmatched_files: true
+          token: ${{ secrets.RELEASE_PAT || secrets.GITHUB_TOKEN }}
+
+      - name: Publish to TestPyPI
+        if: github.event.inputs.target == 'testpypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
+          skip-existing: true
+          packages-dir: dist
+
+      - name: Publish to PyPI
+        if: needs.resolve_version.outputs.is_tag == 'true' || github.event.inputs.target == 'pypi'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          skip-existing: true
+          packages-dir: dist
