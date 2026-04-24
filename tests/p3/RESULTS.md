@@ -60,18 +60,27 @@ N=1600 the user gets a clear error in 13 ms instead of waiting 9 s.
 Each row spawns a fresh python interpreter — zero in-process cache. Inner
 `dt` measures just the kernel compile + sync (excludes `import taichi`).
 
-|   N | HL |  inner dt (s) | status |
+|   N | HL |  inner dt (s) | result |
 | ---:| ---:| ---:| ---:|
-|  800 |  0 |        2.499 |     ok |
-|  800 | 50 |        0.023 | aborted |
-| 1600 |  0 |        9.062 |     ok |
-| 1600 | 50 |        0.023 | aborted |
+|  800 |  0 |        2.499 | compiled + ran (baseline) |
+|  800 | 50 |        0.023 | raised `TaichiCompilationError` |
+| 1600 |  0 |        9.062 | compiled + ran (baseline) |
+| 1600 | 50 |        0.023 | raised `TaichiCompilationError` |
+
+**Semantics of the `raised` rows:** the guard is fail-fast, *not* silent
+trimming. When the unroll count exceeds `unrolling_hard_limit`,
+`ASTTransformer._check_unroll_hard_limit` throws `TaichiCompilationError`
+before any IR/codegen runs — the kernel is **never executed with a reduced
+unroll**. The user must either raise the limit or rewrite the loop. Default
+is `unrolling_hard_limit=0` (disabled), so baseline behaviour is unchanged
+unless the user opts in.
 
 Baselines match the in-process bench within <1 % (2.46 s→2.50 s, 9.04 s→9.06 s):
 the savings are genuinely cold-compile, not a JIT-warm artefact. The abort
 floor is ~23 ms in a fresh interpreter vs ~13 ms when warm; the delta is the
 one-time kernel-wrap / launcher initialisation inside `run()` on the first
-call. Cold speed-up at N=1600 is 9.062 s → 23 ms = **≈394×**.
+call. Cold latency at N=1600 drops from 9.062 s to a 23 ms error = **≈394×
+faster failure**, not a 394× compile speed-up for a working kernel.
 
 ## Parity vs V1/V2
 
@@ -81,6 +90,15 @@ call. Cold speed-up at N=1600 is 9.062 s → 23 ms = **≈394×**.
 ---
 
 ## P3.c — irpass::scalarize early-exit (C++, wheel rebuild)
+
+**Correctness argument (why no user-facing opt-in is needed).** The four
+sub-passes we skip (`Scalarize` / `ScalarizePointers` / `ExtractLocalPointers`
+/ `FuseMatrixPtr`) are pure IR rewriters whose visitors only mutate matrix
+statements. When the `HasMatrixStmt` pre-scan reports zero such statements,
+those passes are provably no-ops on the input IR, so pre- and post-state
+are identical — 3-backend bit-exact parity (`parity_p3.py` Δ=0) confirms
+this empirically. This is a semantics-preserving short-circuit, not a
+perf/accuracy trade-off, so it ships enabled with no knob.
 
 Scope: pre-scan IR once; if no `TensorType` ret_types and no
 `MatrixInitStmt` / `MatrixPtrStmt` / `MatrixOfGlobalPtrStmt` /
