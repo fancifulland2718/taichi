@@ -214,6 +214,26 @@ void compile_function(IRNode *ir,
 void compile_taichi_functions(IRNode *ir,
                               const CompileConfig &compile_config,
                               Function::IRStage target_stage);
+
+// P-Compile-1 phase 2-A profiling — counts how many `full_simplify` calls in
+// `offload_to_executable` actually ran versus were short-circuited by the
+// `pipeline_dirty` tracker. Counters are process-global and updated only by
+// the driver in compile_to_offloads.cpp. Use `reset_full_simplify_stats()`
+// before a benchmark, and `get_full_simplify_stats(run, skipped)` after.
+void get_full_simplify_stats(uint64_t *run, uint64_t *skipped);
+void reset_full_simplify_stats();
+
+// P-Compile-1 phase 2-A inner profiling — counts `full_simplify()` entries at
+// the function level (across ALL call sites in the codebase) and how many
+// returned `any_modified == false` (i.e. the IR was already at the simplify
+// fixed point on entry). Also tracks total outer-loop iterations consumed.
+// Used to drive the Phase 2-B go/no-go decision: if `noop_returns / entries`
+// is low, the dirty-tracker driver-level skip already captures the easy
+// wins and deeper internal pass fusion is the only remaining lever.
+void get_fs_inner_stats(uint64_t *entries,
+                        uint64_t *noop_returns,
+                        uint64_t *total_iterations);
+void reset_fs_inner_stats();
 }  // namespace irpass
 
 }  // namespace taichi::lang

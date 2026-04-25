@@ -7,11 +7,35 @@
 #include "taichi/program/kernel.h"
 #include "taichi/program/program.h"
 #include "taichi/transforms/utils.h"
+#include <atomic>
 #include <set>
 #include <unordered_set>
 #include <utility>
 
 namespace taichi::lang {
+
+// P-Compile-1 phase 2-A inner profiling counters. Updated by `full_simplify`.
+namespace {
+std::atomic<uint64_t> g_fs_entries{0};
+std::atomic<uint64_t> g_fs_noop{0};
+std::atomic<uint64_t> g_fs_iters{0};
+}  // namespace
+
+namespace irpass {
+void get_fs_inner_stats(uint64_t *entries,
+                        uint64_t *noop_returns,
+                        uint64_t *total_iterations) {
+  if (entries) *entries = g_fs_entries.load(std::memory_order_relaxed);
+  if (noop_returns) *noop_returns = g_fs_noop.load(std::memory_order_relaxed);
+  if (total_iterations)
+    *total_iterations = g_fs_iters.load(std::memory_order_relaxed);
+}
+void reset_fs_inner_stats() {
+  g_fs_entries.store(0, std::memory_order_relaxed);
+  g_fs_noop.store(0, std::memory_order_relaxed);
+  g_fs_iters.store(0, std::memory_order_relaxed);
+}
+}  // namespace irpass
 
 // Common subexpression elimination, store forwarding, useless local store
 // elimination; Simplify if statements into conditional stores.
@@ -525,6 +549,7 @@ bool full_simplify(IRNode *root,
   auto print = make_pass_printer(args.verbose, config.print_ir_dbg_info,
                                  args.kernel_name + ".simplify", root);
   TI_AUTO_PROF;
+  g_fs_entries.fetch_add(1, std::memory_order_relaxed);
   // Aggregated across all outer-loop iterations. Returned to the caller so
   // that compile_to_offloads.cpp can short-circuit the next full_simplify
   // when nothing dirty has happened since (P-Compile-1 phase 1).
@@ -607,11 +632,14 @@ bool full_simplify(IRNode *root,
         modified = true;
       print("cfg_optimization");
       first_iteration = false;
+      g_fs_iters.fetch_add(1, std::memory_order_relaxed);
       if (modified)
         any_modified = true;
       if (!modified)
         break;
     }
+    if (!any_modified)
+      g_fs_noop.fetch_add(1, std::memory_order_relaxed);
     return any_modified;
   }
   if (config.constant_folding) {
@@ -628,6 +656,8 @@ bool full_simplify(IRNode *root,
   if (die(root))
     any_modified = true;
   print("die");
+  if (!any_modified)
+    g_fs_noop.fetch_add(1, std::memory_order_relaxed);
   return any_modified;
 }
 

@@ -9,6 +9,25 @@
 #include "taichi/program/kernel.h"
 #include "taichi/util/lang_util.h"
 
+#include <atomic>
+
+namespace taichi::lang::irpass {
+namespace {
+std::atomic<uint64_t> g_full_simplify_run{0};
+std::atomic<uint64_t> g_full_simplify_skipped{0};
+}  // namespace
+void get_full_simplify_stats(uint64_t *run, uint64_t *skipped) {
+  if (run) *run = g_full_simplify_run.load(std::memory_order_relaxed);
+  if (skipped) *skipped = g_full_simplify_skipped.load(std::memory_order_relaxed);
+}
+void reset_full_simplify_stats() {
+  g_full_simplify_run.store(0, std::memory_order_relaxed);
+  g_full_simplify_skipped.store(0, std::memory_order_relaxed);
+  reset_fs_inner_stats();
+}
+}  // namespace taichi::lang::irpass
+
+
 namespace taichi::lang {
 
 namespace irpass {
@@ -308,8 +327,10 @@ void offload_to_executable(IRNode *ir,
           ir, config,
           {false, /*autodiff_enabled*/ false, kernel->get_name(), verbose});
       pipeline_dirty = sa_modified;
+      g_full_simplify_run.fetch_add(1, std::memory_order_relaxed);
       print("Simplified before lower access");
     } else {
+      g_full_simplify_skipped.fetch_add(1, std::memory_order_relaxed);
       print("Simplified before lower access (skipped: pipeline clean)");
     }
     if (irpass::lower_access(ir, config, {kernel->no_activate, true}))
@@ -339,8 +360,10 @@ void offload_to_executable(IRNode *ir,
         {lower_global_access, /*autodiff_enabled*/ false, kernel->get_name(),
          verbose});
     pipeline_dirty = s4_modified;
+    g_full_simplify_run.fetch_add(1, std::memory_order_relaxed);
     print("Simplified IV");
   } else {
+    g_full_simplify_skipped.fetch_add(1, std::memory_order_relaxed);
     print("Simplified IV (skipped: pipeline clean)");
   }
 
