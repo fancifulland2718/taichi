@@ -329,6 +329,26 @@ void offload_to_executable(IRNode *ir,
       pipeline_dirty = sa_modified;
       g_full_simplify_run.fetch_add(1, std::memory_order_relaxed);
       print("Simplified before lower access");
+    } else if (config.fused_pass_verify) {
+      // P-Compile-1 phase 2-B fallback: dirty tracking believes the IR is
+      // a simplify fixed-point. Re-run full_simplify and verify it agrees
+      // (returns false). On disagreement, fall back to using the freshly-
+      // simplified IR and emit a warning so the buggy dirty-tracking site
+      // can be located.
+      const bool sa_modified = irpass::full_simplify(
+          ir, config,
+          {false, /*autodiff_enabled*/ false, kernel->get_name(), verbose});
+      if (sa_modified) {
+        TI_WARN(
+            "fused_pass_verify: dirty tracking missed an IR-mutating pass "
+            "before \"Simplified before lower access\" (kernel='{}'); "
+            "falling back to the freshly simplified IR. Please report this "
+            "with reproducer.",
+            kernel->get_name());
+        pipeline_dirty = true;
+      }
+      g_full_simplify_run.fetch_add(1, std::memory_order_relaxed);
+      print("Simplified before lower access (verified)");
     } else {
       g_full_simplify_skipped.fetch_add(1, std::memory_order_relaxed);
       print("Simplified before lower access (skipped: pipeline clean)");
@@ -344,8 +364,13 @@ void offload_to_executable(IRNode *ir,
     irpass::analysis::verify(ir);
 
     irpass::flag_access(ir);
-    // flag_access only touches GlobalPtrStmt::activate metadata; full_simplify
-    // ignores that field, so we deliberately do NOT mark pipeline_dirty here.
+    // flag_access mutates GlobalPtrStmt::activate. whole_kernel_cse (a
+    // full_simplify sub-pass, see whole_kernel_cse.cpp
+    // common_statement_eliminable) consults `activate` when deciding
+    // whether two GlobalPtrStmts are CSE-mergeable, so a flag_access
+    // run can expose new CSE opportunities. Mark the pipeline dirty so
+    // the downstream "Simplified IV" call is not short-circuited away.
+    pipeline_dirty = true;
     print("Access flagged III");
     irpass::analysis::verify(ir);
   }
@@ -362,6 +387,21 @@ void offload_to_executable(IRNode *ir,
     pipeline_dirty = s4_modified;
     g_full_simplify_run.fetch_add(1, std::memory_order_relaxed);
     print("Simplified IV");
+  } else if (config.fused_pass_verify) {
+    const bool s4_modified = irpass::full_simplify(
+        ir, config,
+        {lower_global_access, /*autodiff_enabled*/ false, kernel->get_name(),
+         verbose});
+    if (s4_modified) {
+      TI_WARN(
+          "fused_pass_verify: dirty tracking missed an IR-mutating pass "
+          "before \"Simplified IV\" (kernel='{}'); falling back to the "
+          "freshly simplified IR. Please report this with reproducer.",
+          kernel->get_name());
+      pipeline_dirty = true;
+    }
+    g_full_simplify_run.fetch_add(1, std::memory_order_relaxed);
+    print("Simplified IV (verified)");
   } else {
     g_full_simplify_skipped.fetch_add(1, std::memory_order_relaxed);
     print("Simplified IV (skipped: pipeline clean)");

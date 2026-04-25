@@ -170,6 +170,8 @@ void export_lang(py::module &m) {
       .def_readwrite("llvm_opt_level", &CompileConfig::llvm_opt_level)
       .def_readwrite("compile_tier", &CompileConfig::compile_tier)
       .def_readwrite("use_fused_passes", &CompileConfig::use_fused_passes)
+      .def_readwrite("fused_pass_verify",
+                     &CompileConfig::fused_pass_verify)
       .def_readwrite("print_ir", &CompileConfig::print_ir)
       .def_readwrite("print_preprocessed_ir",
                      &CompileConfig::print_preprocessed_ir)

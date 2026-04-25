@@ -1,6 +1,8 @@
 #include "taichi/codegen/spirv/spirv_codegen.h"
 
+#include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <variant>
 
@@ -2678,45 +2680,80 @@ KernelCodegen::KernelCodegen(const Params &params)
     target_env = SPV_ENV_VULKAN_1_0;
   }
 
-  spirv_opt_ = std::make_unique<spvtools::Optimizer>(target_env);
-  spirv_opt_->SetMessageConsumer(spriv_message_consumer);
-  if (params.spv_opt_level >= 1) {
-    // Level 1 — fast: dead-code / dead-branch elimination only.
-    spirv_opt_->RegisterPass(spvtools::CreateWrapOpKillPass())
-        .RegisterPass(spvtools::CreateDeadBranchElimPass())
-        .RegisterPass(spvtools::CreateAggressiveDCEPass());
-  }
-  if (params.spv_opt_level >= 2) {
-    // Level 2 — standard: add inlining + mem2reg-equivalent local opts.
-    spirv_opt_->RegisterPass(spvtools::CreateInlineExhaustivePass())
-        .RegisterPass(spvtools::CreateEliminateDeadFunctionsPass())
-        .RegisterPass(spvtools::CreatePrivateToLocalPass())
-        .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
-        .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
-        .RegisterPass(spvtools::CreateScalarReplacementPass())
-        .RegisterPass(spvtools::CreateLocalAccessChainConvertPass())
-        .RegisterPass(spvtools::CreateLocalMultiStoreElimPass())
-        .RegisterPass(spvtools::CreateCCPPass());
-  }
-  if (params.spv_opt_level >= 3) {
-    // Level 3 — full: loop unrolling + the remaining cleanup passes
-    // (legacy default behaviour).
-    spirv_opt_->RegisterPass(spvtools::CreateMergeReturnPass())
-        .RegisterPass(spvtools::CreateLoopUnrollPass(true))
-        .RegisterPass(spvtools::CreateRedundancyEliminationPass())
-        .RegisterPass(spvtools::CreateCombineAccessChainsPass())
-        .RegisterPass(spvtools::CreateSimplificationPass())
-        .RegisterPass(spvtools::CreateSSARewritePass())
-        .RegisterPass(spvtools::CreateVectorDCEPass())
-        .RegisterPass(spvtools::CreateDeadInsertElimPass())
-        .RegisterPass(spvtools::CreateIfConversionPass())
-        .RegisterPass(spvtools::CreateCopyPropagateArraysPass())
-        .RegisterPass(spvtools::CreateReduceLoadSizePass())
-        .RegisterPass(spvtools::CreateBlockMergePass());
-  }
-  spirv_opt_options_.set_run_validator(false);
+  // V3 (2026-04-26): cache Optimizer/SpirvTools in a thread_local map keyed
+  // by (target_env, spv_opt_level). The Optimizer's RegisterPass calls and
+  // its internal pass-token vector are reused across kernels in the same
+  // thread, eliminating per-kernel construction/registration overhead.
+  // Thread-locality keeps the cache lock-free even when KernelCompiler is
+  // invoked from a worker pool.
+  struct OptCacheKey {
+    int target_env_int;
+    int spv_opt_level;
+    bool operator==(const OptCacheKey &o) const noexcept {
+      return target_env_int == o.target_env_int &&
+             spv_opt_level == o.spv_opt_level;
+    }
+  };
+  struct OptCacheKeyHash {
+    size_t operator()(const OptCacheKey &k) const noexcept {
+      return (static_cast<size_t>(k.target_env_int) << 4) ^
+             static_cast<size_t>(k.spv_opt_level);
+    }
+  };
+  struct OptCacheEntry {
+    std::unique_ptr<spvtools::Optimizer> opt;
+    std::unique_ptr<spvtools::SpirvTools> tools;
+  };
+  static thread_local std::unordered_map<OptCacheKey, OptCacheEntry,
+                                         OptCacheKeyHash>
+      opt_cache;
 
-  spirv_tools_ = std::make_unique<spvtools::SpirvTools>(target_env);
+  OptCacheKey key{static_cast<int>(target_env), params.spv_opt_level};
+  auto it = opt_cache.find(key);
+  if (it == opt_cache.end()) {
+    OptCacheEntry entry;
+    entry.opt = std::make_unique<spvtools::Optimizer>(target_env);
+    entry.opt->SetMessageConsumer(spriv_message_consumer);
+    if (params.spv_opt_level >= 1) {
+      // Level 1 — fast: dead-code / dead-branch elimination only.
+      entry.opt->RegisterPass(spvtools::CreateWrapOpKillPass())
+          .RegisterPass(spvtools::CreateDeadBranchElimPass())
+          .RegisterPass(spvtools::CreateAggressiveDCEPass());
+    }
+    if (params.spv_opt_level >= 2) {
+      // Level 2 — standard: add inlining + mem2reg-equivalent local opts.
+      entry.opt->RegisterPass(spvtools::CreateInlineExhaustivePass())
+          .RegisterPass(spvtools::CreateEliminateDeadFunctionsPass())
+          .RegisterPass(spvtools::CreatePrivateToLocalPass())
+          .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
+          .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
+          .RegisterPass(spvtools::CreateScalarReplacementPass())
+          .RegisterPass(spvtools::CreateLocalAccessChainConvertPass())
+          .RegisterPass(spvtools::CreateLocalMultiStoreElimPass())
+          .RegisterPass(spvtools::CreateCCPPass());
+    }
+    if (params.spv_opt_level >= 3) {
+      // Level 3 — full: loop unrolling + the remaining cleanup passes
+      // (legacy default behaviour).
+      entry.opt->RegisterPass(spvtools::CreateMergeReturnPass())
+          .RegisterPass(spvtools::CreateLoopUnrollPass(true))
+          .RegisterPass(spvtools::CreateRedundancyEliminationPass())
+          .RegisterPass(spvtools::CreateCombineAccessChainsPass())
+          .RegisterPass(spvtools::CreateSimplificationPass())
+          .RegisterPass(spvtools::CreateSSARewritePass())
+          .RegisterPass(spvtools::CreateVectorDCEPass())
+          .RegisterPass(spvtools::CreateDeadInsertElimPass())
+          .RegisterPass(spvtools::CreateIfConversionPass())
+          .RegisterPass(spvtools::CreateCopyPropagateArraysPass())
+          .RegisterPass(spvtools::CreateReduceLoadSizePass())
+          .RegisterPass(spvtools::CreateBlockMergePass());
+    }
+    entry.tools = std::make_unique<spvtools::SpirvTools>(target_env);
+    it = opt_cache.emplace(key, std::move(entry)).first;
+  }
+  spirv_opt_ = it->second.opt.get();
+  spirv_tools_ = it->second.tools.get();
+  spirv_opt_options_.set_run_validator(false);
 }
 
 void KernelCodegen::run(TaichiKernelAttributes &kernel_attribs,

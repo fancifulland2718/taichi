@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <unordered_map>
 
 #include <spirv/unified1/spirv.hpp>
 #include "taichi/util/lang_util.h"
@@ -646,15 +647,41 @@ class IRBuilder {
   Value rand_w_;  // per-thread local variable
 
   // map from value to its pointer type
-  std::map<std::pair<uint32_t, spv::StorageClass>, SType> pointer_type_tbl_;
-  std::map<std::pair<uint32_t, int>, SType> sampled_image_ptr_tbl_;
-  std::map<std::pair<uint32_t, int>, SType>
+  // P-Compile-V5: hot codegen path lookups; switched from std::map (O(log n))
+  // to std::unordered_map (O(1) amortized) for measurable codegen speedup
+  // on kernels with many constant emissions / pointer-type queries.
+  struct SpirvPairHash {
+    template <class T>
+    static std::size_t hsh(const T &v) noexcept {
+      if constexpr (std::is_enum_v<T>) {
+        using U = std::underlying_type_t<T>;
+        return std::hash<U>{}(static_cast<U>(v));
+      } else {
+        return std::hash<T>{}(v);
+      }
+    }
+    template <class T1, class T2>
+    std::size_t operator()(const std::pair<T1, T2> &p) const noexcept {
+      auto h1 = hsh(p.first);
+      auto h2 = hsh(p.second);
+      return h1 ^ (h2 + 0x9e3779b97f4a7c15ULL + (h1 << 6) + (h1 >> 2));
+    }
+  };
+  std::unordered_map<std::pair<uint32_t, spv::StorageClass>,
+                     SType,
+                     SpirvPairHash>
+      pointer_type_tbl_;
+  std::unordered_map<std::pair<uint32_t, int>, SType, SpirvPairHash>
+      sampled_image_ptr_tbl_;
+  std::unordered_map<std::pair<uint32_t, int>, SType, SpirvPairHash>
       sampled_image_underlying_image_type_;
 
-  std::map<std::pair<BufferFormat, int>, SType> storage_image_ptr_tbl_;
+  std::unordered_map<std::pair<BufferFormat, int>, SType, SpirvPairHash>
+      storage_image_ptr_tbl_;
 
   // map from constant int to its value
-  std::map<std::pair<uint32_t, uint64_t>, Value> const_tbl_;
+  std::unordered_map<std::pair<uint32_t, uint64_t>, Value, SpirvPairHash>
+      const_tbl_;
   // map from raw_name(string) to Value
   std::unordered_map<std::string, Value> value_name_tbl_;
 

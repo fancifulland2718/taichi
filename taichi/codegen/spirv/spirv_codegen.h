@@ -40,8 +40,12 @@ class KernelCodegen {
   Params params_;
   KernelContextAttributes ctx_attribs_;
 
-  std::unique_ptr<spvtools::Optimizer> spirv_opt_{nullptr};
-  std::unique_ptr<spvtools::SpirvTools> spirv_tools_{nullptr};
+  // V3 (2026-04-26): non-owning pointers into a thread_local cache keyed
+  // by (target_env, spv_opt_level). Construction of Optimizer + repeated
+  // RegisterPass() calls happens once per (env, level) per thread instead
+  // of once per kernel. Lifetime managed by static cache in spirv_codegen.cpp.
+  spvtools::Optimizer *spirv_opt_{nullptr};
+  spvtools::SpirvTools *spirv_tools_{nullptr};
   spvtools::OptimizerOptions spirv_opt_options_;
 };
 

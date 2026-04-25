@@ -42,6 +42,15 @@ struct CompileConfig {
   // re-runs the skipped pass and asserts it returns no-modification.
   // Included in the offline-cache key.
   bool use_fused_passes{false};
+  // P-Compile-1 phase 2-B: when use_fused_passes is true, every skip
+  // decision in compile_to_offloads.cpp is double-checked by re-running
+  // the would-be-skipped full_simplify and verifying it returns false
+  // (no IR change). On mismatch the pipeline emits an English warning
+  // and falls back to using the freshly-run (modified) IR, so a stale
+  // dirty-tracking decision can never produce a less-optimized kernel.
+  // Default false (zero overhead). Not part of the offline-cache key
+  // because it is a runtime safety knob, not a codegen toggle.
+  bool fused_pass_verify{false};
   int max_vector_width;
   bool print_preprocessed_ir;
   bool print_ir;

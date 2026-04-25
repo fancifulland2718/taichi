@@ -28,6 +28,41 @@ class Function;
 // IR passes
 namespace irpass {
 
+// ---------------------------------------------------------------------------
+// `bool` return-value contract for IR-mutating passes (P-Compile-1 phase 2-B)
+// ---------------------------------------------------------------------------
+// Every pass below that returns `bool` follows a single, strict contract:
+//
+//   true   <=>  the pass wrote at least one IR Stmt (insert / erase / replace
+//               / mutate field). The IR is no longer bit-identical to its
+//               input.
+//   false  <=>  the IR is bit-identical to the input (no Stmt was added,
+//               removed, replaced, or mutated).
+//
+// This contract is depended on by:
+//   * driver-level dirty tracking in compile_to_offloads.cpp
+//     (`pipeline_dirty`, P-Compile-1 phase 1) — used to skip downstream
+//     `full_simplify` calls when the pipeline is provably clean;
+//   * the `g_full_simplify_run` / `g_full_simplify_skipped` /
+//     `g_fs_entries` / `g_fs_noop` / `g_fs_iters` profiling counters
+//     (P-Compile-1 phase 2-A, exposed via pybind as
+//     `_ti_core.get_full_simplify_stats` / `_ti_core.get_fs_inner_stats`);
+//   * the outer-loop convergence check in `simplify.cpp::full_simplify`
+//     (`if (!modified) break;`);
+//   * the future debug verifier sandwich (`CompileConfig::fused_pass_verify`,
+//     planned for phase 2-B onward).
+//
+// **Any future short-circuit / early-exit path inside these passes MUST
+// preserve the contract**: the returned bool must be bit-identical to what
+// the full path would return. A pass that early-exits with `return false`
+// while skipping work that would have set the bool to `true` is a
+// correctness bug — it lies to driver-level dirty tracking, breaks
+// profiling, and lets downstream passes operate on stale IR. Reordering
+// sub-passes inside a multi-pass driver (such as full_simplify) is only
+// safe if convergence is preserved AND the final returned bool still
+// reflects "did anything change".
+// ---------------------------------------------------------------------------
+
 void re_id(IRNode *root);
 void flag_access(IRNode *root);
 void eliminate_immutable_local_vars(IRNode *root);
