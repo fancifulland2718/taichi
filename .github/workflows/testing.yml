@@ -64,12 +64,16 @@ jobs:
     runs-on: ubuntu-22.04
     env:
       PY: ${{ inputs.python || '3.11' }}
-      # CPU + LLVM only — no CUDA, Vulkan, OpenGL, C-API, or test binaries.
-      # Keeps build time under ~30 min on a GitHub-hosted runner.
+      # CPU + LLVM + Vulkan/OpenGL. We deliberately keep Vulkan/OpenGL on so
+      # the resulting wheel ships GGUI (`ti.ui.Window` etc.). Without
+      # `-DTI_WITH_VULKAN:BOOL=ON` the C++ side bakes
+      # `_ti_core.GGUI_AVAILABLE = False`, and ALL `ti.ui.*` calls raise
+      # `GGUINotAvailableException` at runtime — no Python-side workaround
+      # exists. Build time stays well under the GitHub-hosted runner cap.
       TAICHI_CMAKE_ARGS: >-
         -DTI_WITH_CUDA:BOOL=OFF
-        -DTI_WITH_VULKAN:BOOL=OFF
-        -DTI_WITH_OPENGL:BOOL=OFF
+        -DTI_WITH_VULKAN:BOOL=ON
+        -DTI_WITH_OPENGL:BOOL=ON
         -DTI_WITH_LLVM:BOOL=ON
         -DTI_WITH_C_API:BOOL=OFF
         -DTI_BUILD_TESTS:BOOL=OFF
@@ -88,7 +92,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential ninja-build ccache \
-            libxi-dev libx11-dev libtinfo-dev libxml2-dev
+            libxi-dev libx11-dev libtinfo-dev libxml2-dev \
+            libxrandr-dev libxinerama-dev libxcursor-dev \
+            libxrender-dev libgl-dev
+
+      - name: Install Vulkan SDK
+        # libvulkan-dev gives us the loader + headers needed by
+        # external/Vulkan-Headers / volk to compile GGUI.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev vulkan-tools
 
       - name: Download prebuilt LLVM 20
         run: |
@@ -140,10 +153,13 @@ jobs:
     runs-on: windows-latest
     env:
       PY: ${{ inputs.python || '3.11' }}
+      # Vulkan/OpenGL are ON so the wheel ships GGUI (`ti.ui.Window` etc.).
+      # Toggling Vulkan off here would silently produce a wheel that
+      # raises GGUINotAvailableException at runtime.
       TAICHI_CMAKE_ARGS: >-
         -DTI_WITH_CUDA:BOOL=OFF
-        -DTI_WITH_VULKAN:BOOL=OFF
-        -DTI_WITH_OPENGL:BOOL=OFF
+        -DTI_WITH_VULKAN:BOOL=ON
+        -DTI_WITH_OPENGL:BOOL=ON
         -DTI_WITH_LLVM:BOOL=ON
         -DTI_WITH_C_API:BOOL=OFF
         -DTI_BUILD_TESTS:BOOL=OFF
@@ -168,6 +184,19 @@ jobs:
 
       - name: Install Ninja
         uses: seanmiddleditch/gha-setup-ninja@v5
+
+      - name: Install Vulkan SDK
+        # GGUI needs the Vulkan loader + headers at compile time; without
+        # this step CMake silently falls back to TI_WITH_GGUI=OFF and the
+        # wheel raises GGUINotAvailableException at runtime.
+        shell: pwsh
+        run: |
+          $version = "1.4.304.1"
+          $installer = "$env:TEMP\VulkanSDK.exe"
+          Invoke-WebRequest "https://sdk.lunarg.com/sdk/download/$version/windows/VulkanSDK-$version-Installer.exe" -OutFile $installer
+          Start-Process -FilePath $installer -ArgumentList "--accept-licenses", "--default-answer", "--confirm-command", "install" -Wait
+          "VULKAN_SDK=C:\VulkanSDK\$version" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
+          "PATH=C:\VulkanSDK\$version\Bin;$env:PATH" | Out-File -Append $env:GITHUB_ENV -Encoding utf8
 
       - name: Download prebuilt LLVM 20
         shell: pwsh
