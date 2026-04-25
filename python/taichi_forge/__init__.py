@@ -16,6 +16,17 @@ from taichi_forge.ui import GUI, hex_to_rgb, rgb_to_hex, ui
 # Issue#2223: Do not reorder, or we're busted with partially initialized module
 from taichi_forge import aot  # isort:skip
 
+# Explicit submodule re-binding.
+#
+# `from taichi_forge.lang import *` *does* normally leave the `lang`
+# submodule attribute accessible on the parent package, but it can get
+# accidentally shadowed by names exported from inner modules (the lang
+# subpackage uses a dynamic `__all__ = [s for s in dir() if ...]` which
+# is fragile). We also import these here so that `taichi_forge.lang`,
+# `taichi_forge.lang.impl`, etc. are always reachable as documented —
+# downstream code commonly does `ti.lang.impl.current_cfg()`.
+from taichi_forge import lang  # noqa: E402,F401  pylint: disable=C0411,C0413
+
 
 def __getattr__(attr):
     if attr == "cfg":
