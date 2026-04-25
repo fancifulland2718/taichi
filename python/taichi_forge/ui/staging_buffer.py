@@ -264,6 +264,51 @@ def copy_image_u8_to_rgba8_np(
         dst[i, j] = pack
 
 
+@ti.kernel
+def copy_image_f32_to_rgba8_ti_ndarray(
+    src: ti.types.ndarray(),
+    dst: ti.types.ndarray(),
+    num_components: ti.template(),
+    gray_scale: ti.template(),
+):
+    for I in ti.grouped(src):
+        i, j = I[0], I[1]
+        px = ti.Vector([0, 0, 0, 0xFF], dt=u32)
+        if ti.static(gray_scale):
+            c = 0.0
+            c = src[i, j]
+            c = ops.max(0.0, ops.min(1.0, c))
+            c = c * 255
+            px[0] = px[1] = px[2] = ti.cast(c, u32)
+        else:
+            for k in ti.static(range(num_components)):
+                c = src[i, j][k]
+                c = ops.max(0.0, ops.min(1.0, c))
+                c = c * 255
+                px[k] = ti.cast(c, u32)
+        pack = px[0] << 0 | px[1] << 8 | px[2] << 16 | px[3] << 24
+        dst[i, j] = pack
+
+
+@ti.kernel
+def copy_image_u8_to_rgba8_ti_ndarray(
+    src: ti.types.ndarray(),
+    dst: ti.types.ndarray(),
+    num_components: ti.template(),
+    gray_scale: ti.template(),
+):
+    for I in ti.grouped(src):
+        i, j = I[0], I[1]
+        px = ti.Vector([0, 0, 0, 0xFF], dt=u32)
+        if ti.static(gray_scale):
+            px[0] = px[1] = px[2] = ti.cast(src[i, j], u32)
+        else:
+            for k in ti.static(range(num_components)):
+                px[k] = ti.cast(src[i, j][k], u32)
+        pack = px[0] << 0 | px[1] << 8 | px[2] << 16 | px[3] << 24
+        dst[i, j] = pack
+
+
 # ggui renderer always assumes the input image to be u8 RGBA
 # if the user input is not in this format, a staging ti field is needed
 image_field_cache = {}
@@ -273,7 +318,7 @@ def to_rgba8(image):
     is_texture = isinstance(image, Texture)
     is_grayscale = not hasattr(image, "n") and len(image.shape) == 2
     is_numpy = isinstance(image, np.ndarray)
-    is_non_grayscale_field = (hasattr(image, "n") and image.m == 1) or len(image.shape) == 3
+    is_non_grayscale_field = (hasattr(image, "n") and getattr(image, "m", 1) == 1) or len(image.shape) == 3
 
     if not is_texture and not is_grayscale and not is_numpy and not is_non_grayscale_field:
         raise Exception(
@@ -300,6 +345,8 @@ def to_rgba8(image):
         image_field_cache[staging_key] = staging_img
     else:
         staging_img = image_field_cache[staging_key]
+        
+    is_ti_ndarray = hasattr(image, 'to_numpy') and not hasattr(image, 'snode')
 
     if is_texture:
         copy_texture_to_rgba8(image, staging_img, *image.shape[0:2])
@@ -308,6 +355,13 @@ def to_rgba8(image):
             copy_image_u8_to_rgba8_np(image, staging_img, channels, is_grayscale)
         elif image.dtype == np.float32:
             copy_image_f32_to_rgba8_np(image, staging_img, channels, is_grayscale)
+        else:
+            raise Exception("dtype of input image must either be u8 or f32")
+    elif is_ti_ndarray:
+        if image.dtype == u8:
+            copy_image_u8_to_rgba8_ti_ndarray(image, staging_img, channels, is_grayscale)
+        elif image.dtype == f32:
+            copy_image_f32_to_rgba8_ti_ndarray(image, staging_img, channels, is_grayscale)
         else:
             raise Exception("dtype of input image must either be u8 or f32")
     else:
