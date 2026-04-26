@@ -95,6 +95,7 @@ imgui.ini
 # P2 bench probe/log scratch files
 tests/p2/*.txt
 tests/p2/*.log
+tests/p4
 
 /.llvm20
 /.llvm20_build.log

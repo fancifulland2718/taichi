@@ -3,9 +3,11 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 #include <variant>
 #include <future>
+#include <algorithm>
 
 #include "taichi/codegen/codegen_utils.h"
 #include "taichi/program/program.h"
@@ -2687,25 +2689,47 @@ namespace {
 
 // V3 + V2 (2026-04-26): per-thread cached spvtools::Optimizer/SpirvTools.
 // Each OS thread that hits this helper builds its own Optimizer once per
-// (target_env, spv_opt_level) combination, then reuses it across kernels.
-// Thread-locality lets the parallel SPIR-V codegen path (V2) fan out
-// work to worker threads without violating spvtools' single-instance
-// thread-safety contract.
+// (target_env, spv_opt_level, skip_loop_unroll, disabled_passes_hash)
+// combination, then reuses it across kernels. Thread-locality lets the
+// parallel SPIR-V codegen path (V2) fan out work to worker threads
+// without violating spvtools' single-instance thread-safety contract.
+//
+// B2 (2026-04-26): pass groups
+//   Tier-1 ("\u5fc5\u9700\u6b63\u786e\u6027 / \u901a\u7528\u5165\u95e8", spv_opt_level >= 1):
+//     WrapOpKill, DeadBranchElim, AggressiveDCE
+//   Tier-2 ("\u901a\u7528\u4f18\u5316", spv_opt_level >= 2):
+//     InlineExhaustive, EliminateDeadFunctions, PrivateToLocal,
+//     LocalSingleBlockLoadStoreElim, LocalSingleStoreElim,
+//     ScalarReplacement, LocalAccessChainConvert, LocalMultiStoreElim, CCP
+//   Tier-3 ("\u6fc0\u8fdb\u4f18\u5316", spv_opt_level == 3):
+//     MergeReturn, LoopUnroll (skippable via spirv_skip_loop_unroll),
+//     RedundancyElimination, CombineAccessChains, Simplification,
+//     SSARewrite, VectorDCE, DeadInsertElim, IfConversion,
+//     CopyPropagateArrays, ReduceLoadSize, BlockMerge
+//
+// Users can disable any individual pass by name via
+// CompileConfig::spirv_disabled_passes (e.g. ["LoopUnroll",
+// "AggressiveDCE"]). Disabled passes are not registered, so they cost
+// neither registration nor Run() time.
 struct OptCacheKey {
   int target_env_int;
   int spv_opt_level;
   bool skip_loop_unroll;
+  // B2: stable hash of the sorted disabled_passes list. Empty list \u2192 0.
+  size_t disabled_passes_hash;
   bool operator==(const OptCacheKey &o) const noexcept {
     return target_env_int == o.target_env_int &&
            spv_opt_level == o.spv_opt_level &&
-           skip_loop_unroll == o.skip_loop_unroll;
+           skip_loop_unroll == o.skip_loop_unroll &&
+           disabled_passes_hash == o.disabled_passes_hash;
   }
 };
 struct OptCacheKeyHash {
   size_t operator()(const OptCacheKey &k) const noexcept {
     return (static_cast<size_t>(k.target_env_int) << 5) ^
            (static_cast<size_t>(k.spv_opt_level) << 1) ^
-           static_cast<size_t>(k.skip_loop_unroll ? 1u : 0u);
+           static_cast<size_t>(k.skip_loop_unroll ? 1u : 0u) ^
+           (k.disabled_passes_hash << 3);
   }
 };
 struct OptCacheEntry {
@@ -2713,55 +2737,111 @@ struct OptCacheEntry {
   std::unique_ptr<spvtools::SpirvTools> tools;
 };
 
+// B2: stable hash of a *sorted* disabled-passes vector. Caller is
+// responsible for sorting (we also re-sort defensively here) so cache
+// keys are insensitive to user-supplied ordering.
+size_t hash_disabled_passes(const std::vector<std::string> &passes) {
+  if (passes.empty()) {
+    return 0;
+  }
+  std::vector<std::string> sorted = passes;
+  std::sort(sorted.begin(), sorted.end());
+  size_t h = 1469598103934665603ull;  // FNV offset basis
+  for (const auto &s : sorted) {
+    for (unsigned char c : s) {
+      h ^= c;
+      h *= 1099511628211ull;
+    }
+    h ^= 0xff;  // separator between entries
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
 void get_thread_local_opt(spv_target_env target_env,
                           int spv_opt_level,
                           bool skip_loop_unroll,
+                          const std::vector<std::string> &disabled_passes,
                           spvtools::Optimizer **out_opt,
                           spvtools::SpirvTools **out_tools) {
   static thread_local std::unordered_map<OptCacheKey, OptCacheEntry,
                                          OptCacheKeyHash>
       opt_cache;
+  const size_t dp_hash = hash_disabled_passes(disabled_passes);
   OptCacheKey key{static_cast<int>(target_env), spv_opt_level,
-                  skip_loop_unroll};
+                  skip_loop_unroll, dp_hash};
   auto it = opt_cache.find(key);
   if (it == opt_cache.end()) {
+    // Build a set for O(1) membership tests during pass registration.
+    std::unordered_set<std::string> disabled(disabled_passes.begin(),
+                                             disabled_passes.end());
+    auto enabled = [&disabled](const char *name) {
+      return disabled.find(name) == disabled.end();
+    };
     OptCacheEntry entry;
     entry.opt = std::make_unique<spvtools::Optimizer>(target_env);
     entry.opt->SetMessageConsumer(spriv_message_consumer);
     if (spv_opt_level >= 1) {
-      entry.opt->RegisterPass(spvtools::CreateWrapOpKillPass())
-          .RegisterPass(spvtools::CreateDeadBranchElimPass())
-          .RegisterPass(spvtools::CreateAggressiveDCEPass());
+      // Tier-1 \u2014 \u5fc5\u9700\u6b63\u786e\u6027 / \u901a\u7528\u5165\u95e8
+      if (enabled("WrapOpKill"))
+        entry.opt->RegisterPass(spvtools::CreateWrapOpKillPass());
+      if (enabled("DeadBranchElim"))
+        entry.opt->RegisterPass(spvtools::CreateDeadBranchElimPass());
+      if (enabled("AggressiveDCE"))
+        entry.opt->RegisterPass(spvtools::CreateAggressiveDCEPass());
     }
     if (spv_opt_level >= 2) {
-      entry.opt->RegisterPass(spvtools::CreateInlineExhaustivePass())
-          .RegisterPass(spvtools::CreateEliminateDeadFunctionsPass())
-          .RegisterPass(spvtools::CreatePrivateToLocalPass())
-          .RegisterPass(spvtools::CreateLocalSingleBlockLoadStoreElimPass())
-          .RegisterPass(spvtools::CreateLocalSingleStoreElimPass())
-          .RegisterPass(spvtools::CreateScalarReplacementPass())
-          .RegisterPass(spvtools::CreateLocalAccessChainConvertPass())
-          .RegisterPass(spvtools::CreateLocalMultiStoreElimPass())
-          .RegisterPass(spvtools::CreateCCPPass());
+      // Tier-2 \u2014 \u901a\u7528\u4f18\u5316
+      if (enabled("InlineExhaustive"))
+        entry.opt->RegisterPass(spvtools::CreateInlineExhaustivePass());
+      if (enabled("EliminateDeadFunctions"))
+        entry.opt->RegisterPass(spvtools::CreateEliminateDeadFunctionsPass());
+      if (enabled("PrivateToLocal"))
+        entry.opt->RegisterPass(spvtools::CreatePrivateToLocalPass());
+      if (enabled("LocalSingleBlockLoadStoreElim"))
+        entry.opt->RegisterPass(
+            spvtools::CreateLocalSingleBlockLoadStoreElimPass());
+      if (enabled("LocalSingleStoreElim"))
+        entry.opt->RegisterPass(spvtools::CreateLocalSingleStoreElimPass());
+      if (enabled("ScalarReplacement"))
+        entry.opt->RegisterPass(spvtools::CreateScalarReplacementPass());
+      if (enabled("LocalAccessChainConvert"))
+        entry.opt->RegisterPass(spvtools::CreateLocalAccessChainConvertPass());
+      if (enabled("LocalMultiStoreElim"))
+        entry.opt->RegisterPass(spvtools::CreateLocalMultiStoreElimPass());
+      if (enabled("CCP"))
+        entry.opt->RegisterPass(spvtools::CreateCCPPass());
     }
     if (spv_opt_level >= 3) {
-      entry.opt->RegisterPass(spvtools::CreateMergeReturnPass());
+      // Tier-3 \u2014 \u6fc0\u8fdb\u4f18\u5316
+      if (enabled("MergeReturn"))
+        entry.opt->RegisterPass(spvtools::CreateMergeReturnPass());
       // V6 (2026-04-26): CreateLoopUnrollPass is the most expensive pass
-      // in the level-3 chain. When skip_loop_unroll is true we drop it
-      // entirely and rely on the GPU driver's own loop unrolling.
-      if (!skip_loop_unroll) {
+      // in the level-3 chain. When skip_loop_unroll is true (or the user
+      // explicitly disables "LoopUnroll" via spirv_disabled_passes) we
+      // drop it entirely and rely on the GPU driver's own loop unrolling.
+      if (!skip_loop_unroll && enabled("LoopUnroll"))
         entry.opt->RegisterPass(spvtools::CreateLoopUnrollPass(true));
-      }
-      entry.opt->RegisterPass(spvtools::CreateRedundancyEliminationPass())
-          .RegisterPass(spvtools::CreateCombineAccessChainsPass())
-          .RegisterPass(spvtools::CreateSimplificationPass())
-          .RegisterPass(spvtools::CreateSSARewritePass())
-          .RegisterPass(spvtools::CreateVectorDCEPass())
-          .RegisterPass(spvtools::CreateDeadInsertElimPass())
-          .RegisterPass(spvtools::CreateIfConversionPass())
-          .RegisterPass(spvtools::CreateCopyPropagateArraysPass())
-          .RegisterPass(spvtools::CreateReduceLoadSizePass())
-          .RegisterPass(spvtools::CreateBlockMergePass());
+      if (enabled("RedundancyElimination"))
+        entry.opt->RegisterPass(spvtools::CreateRedundancyEliminationPass());
+      if (enabled("CombineAccessChains"))
+        entry.opt->RegisterPass(spvtools::CreateCombineAccessChainsPass());
+      if (enabled("Simplification"))
+        entry.opt->RegisterPass(spvtools::CreateSimplificationPass());
+      if (enabled("SSARewrite"))
+        entry.opt->RegisterPass(spvtools::CreateSSARewritePass());
+      if (enabled("VectorDCE"))
+        entry.opt->RegisterPass(spvtools::CreateVectorDCEPass());
+      if (enabled("DeadInsertElim"))
+        entry.opt->RegisterPass(spvtools::CreateDeadInsertElimPass());
+      if (enabled("IfConversion"))
+        entry.opt->RegisterPass(spvtools::CreateIfConversionPass());
+      if (enabled("CopyPropagateArrays"))
+        entry.opt->RegisterPass(spvtools::CreateCopyPropagateArraysPass());
+      if (enabled("ReduceLoadSize"))
+        entry.opt->RegisterPass(spvtools::CreateReduceLoadSizePass());
+      if (enabled("BlockMerge"))
+        entry.opt->RegisterPass(spvtools::CreateBlockMergePass());
     }
     entry.tools = std::make_unique<spvtools::SpirvTools>(target_env);
     it = opt_cache.emplace(key, std::move(entry)).first;
@@ -2815,7 +2895,8 @@ void KernelCodegen::run(TaichiKernelAttributes &kernel_attribs,
       spvtools::Optimizer *opt = nullptr;
       spvtools::SpirvTools *tools = nullptr;
       get_thread_local_opt(target_env_, params_.spv_opt_level,
-                           params_.skip_loop_unroll, &opt, &tools);
+                           params_.skip_loop_unroll,
+                           params_.disabled_passes, &opt, &tools);
       bool result = false;
       TI_WARN_IF(
           (result = !opt->Run(optimized_spv.data(), optimized_spv.size(),

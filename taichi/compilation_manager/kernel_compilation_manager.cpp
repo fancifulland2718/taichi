@@ -96,6 +96,19 @@ const CompiledKernelData &KernelCompilationManager::load_or_compile(
     cache_cv_.wait(lock);
   }
 
+  // P-Compile-2-B4: snapshot whether the offline cache metadata advertises
+  // this key, while we still hold the lock. We use this hint to attempt a
+  // disk load (outside the lock) BEFORE falling back to a full compile —
+  // multiple workers can therefore do their respective disk reads in
+  // parallel rather than serializing through `cache_mutex_`.
+  bool disk_metadata_hit = false;
+  if (cache_mode == CacheData::MemAndDiskCache) {
+    auto it = cached_data_.kernels.find(kernel_key);
+    // peek above guarantees `compiled_kernel_data` is null here, so a
+    // metadata entry implies a disk-only candidate.
+    disk_metadata_hit = (it != cached_data_.kernels.end());
+  }
+
   in_progress_keys_.insert(kernel_key);
   // Drop the lock across compile() — the compile step is pure work on
   // kernel_def / compile_config (both const here) plus per-thread LLVM
@@ -103,8 +116,19 @@ const CompiledKernelData &KernelCompilationManager::load_or_compile(
   lock.unlock();
 
   std::unique_ptr<CompiledKernelData> compiled;
+  bool from_disk = false;
   try {
-    compiled = compile_kernel(compile_config, caps, kernel_def);
+    if (disk_metadata_hit) {
+      compiled = load_ckd(kernel_key, compile_config.arch);
+      if (compiled) {
+        from_disk = true;
+        TI_DEBUG("Create kernel '{}' from disk cache (key='{}', unlocked)",
+                 kernel_def.get_name(), kernel_key);
+      }
+    }
+    if (!compiled) {
+      compiled = compile_kernel(compile_config, caps, kernel_def);
+    }
   } catch (...) {
     lock.lock();
     in_progress_keys_.erase(kernel_key);
@@ -113,6 +137,17 @@ const CompiledKernelData &KernelCompilationManager::load_or_compile(
   }
 
   lock.lock();
+  if (from_disk) {
+    // Refresh the metadata entry's `last_used_at` so cache pruning sees a
+    // recent access. The previous (locked) `try_load_cached_kernel_locked`
+    // path used to do this; preserve that behavior under the unlocked
+    // disk-load path.
+    auto it = cached_data_.kernels.find(kernel_key);
+    if (it != cached_data_.kernels.end()) {
+      it->second.last_used_at = std::time(nullptr);
+      updated_data_.push_back(&it->second);
+    }
+  }
   const auto &result = install_compiled_kernel_locked(
       kernel_key, cache_mode, std::move(compiled));
   in_progress_keys_.erase(kernel_key);
@@ -274,15 +309,11 @@ const CompiledKernelData *KernelCompilationManager::try_load_cached_kernel_locke
         TI_DEBUG("Create kernel '{}' from cache (key='{}')",
                  kernel_def.get_name(), kernel_key);
         return k.compiled_kernel_data.get();
-      } else if (auto loaded = load_ckd(kernel_key, arch)) {
-        TI_DEBUG("Create kernel '{}' from cache (key='{}')",
-                 kernel_def.get_name(), kernel_key);
-        TI_ASSERT(loaded->arch() == arch);
-        k.last_used_at = std::time(nullptr);
-        k.compiled_kernel_data = std::move(loaded);
-        updated_data_.push_back(&k);
-        return k.compiled_kernel_data.get();
       }
+      // P-Compile-2-B4: do NOT call `load_ckd` while holding
+      // `cache_mutex_`. Disk I/O is moved out into `load_or_compile`'s
+      // unlocked region; we just signal "not in mem yet" by returning
+      // nullptr, and the caller will probe disk after dropping the lock.
     }
   }
   return nullptr;

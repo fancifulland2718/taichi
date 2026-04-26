@@ -45,6 +45,13 @@ class KernelCodegen {
     // OptCacheKey with this flag to keep cached Optimizer instances
     // separate.
     bool skip_loop_unroll{false};
+    // B2 (2026-04-26): per-kernel SPIR-V optimizer pass disable list.
+    // Sourced from CompileConfig::spirv_disabled_passes; the
+    // thread_local Optimizer cache (OptCacheKey) keys on a stable hash
+    // of this list so disabled-set toggles produce distinct cached
+    // Optimizer instances. Empty list = full pass chain at the chosen
+    // spv_opt_level (legacy behaviour, byte-identical SPIR-V).
+    std::vector<std::string> disabled_passes;
     // V8.b (2026-04-26): when true, the run() per-task fan-out checks
     // Program::in_compile_kernels_worker() and falls back to serial when
     // already inside an outer compile_kernels worker. Mirrors V7's LLVM

@@ -70,6 +70,19 @@ struct CompileConfig {
   // offline-cache key (treated like spirv_parallel_codegen — the user
   // explicitly accepts a different optimizer chain when toggling).
   bool spirv_skip_loop_unroll{false};
+  // B2 (2026-04-26): user-facing fine-grained SPIR-V optimizer pass
+  // disable list. Each entry is a pass name (case-sensitive) matching one
+  // of the spvtools::Create*Pass identifiers used in
+  // spirv_codegen.cpp::get_thread_local_opt — without the "Create" prefix
+  // and without the "Pass" suffix. Examples: "LoopUnroll",
+  // "AggressiveDCE", "InlineExhaustive", "MergeReturn".
+  // Default empty = full pass chain at the chosen spv_opt_level (legacy
+  // behaviour, byte-identical SPIR-V output). Disabled passes are skipped
+  // at Optimizer registration, so they cost neither register nor Run()
+  // time. Different lists produce different SPIR-V bytes and so are
+  // segregated in the offline cache (added to the cache key in
+  // taichi/analysis/offline_cache_util.cpp).
+  std::vector<std::string> spirv_disabled_passes;
   // V7 (2026-04-26): anti double-pool oversubscription in the batched
   // Program::compile_kernels path. The outer ParallelExecutor already
   // saturates `num_compile_threads` worker threads with kernel-level tasks;

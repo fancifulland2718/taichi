@@ -306,11 +306,46 @@ GfxRuntime::~GfxRuntime() {
     uint8_t *cache_data = (uint8_t *)backend_cache_->data();
     size_t cache_size = backend_cache_->size();
     if (cache_data) {
+      // C4 (2026-04-26): atomic write — write to <path>.tmp then rename.
+      // Avoids leaving a half-written rhi_cache.bin on the disk if the
+      // process is killed mid-write, which would cause the next startup
+      // to fail in create_pipeline_cache_unique() with a corrupted blob.
+      // (Periodic in-flight flush and cross-process file locks were
+      // considered and dropped as low-ROI; see compile_doc/优化总规划.md
+      // §7.2 row 4.)
       std::filesystem::path cache_path =
           std::filesystem::path(get_repo_dir()) / "rhi_cache.bin";
-      std::ofstream cache_file(cache_path, std::ios::binary | std::ios::trunc);
-      std::ostreambuf_iterator<char> output_iterator(cache_file);
-      std::copy(cache_data, cache_data + cache_size, output_iterator);
+      std::filesystem::path tmp_path = cache_path;
+      tmp_path += ".tmp";
+      bool wrote_ok = false;
+      {
+        std::ofstream cache_file(tmp_path,
+                                 std::ios::binary | std::ios::trunc);
+        if (cache_file) {
+          cache_file.write(reinterpret_cast<const char *>(cache_data),
+                           static_cast<std::streamsize>(cache_size));
+          cache_file.flush();
+          wrote_ok = static_cast<bool>(cache_file);
+        }
+      }
+      if (wrote_ok) {
+        std::error_code ec;
+        std::filesystem::rename(tmp_path, cache_path, ec);
+        if (ec) {
+          // Fallback: remove dest then rename. Some filesystems on Windows
+          // refuse cross-existing rename without explicit replace.
+          std::filesystem::remove(cache_path, ec);
+          std::filesystem::rename(tmp_path, cache_path, ec);
+          if (ec) {
+            TI_TRACE("Failed to atomically install rhi_cache.bin: {}",
+                     ec.message());
+            std::filesystem::remove(tmp_path, ec);
+          }
+        }
+      } else {
+        std::error_code ec;
+        std::filesystem::remove(tmp_path, ec);
+      }
     }
     backend_cache_.reset();
   }
