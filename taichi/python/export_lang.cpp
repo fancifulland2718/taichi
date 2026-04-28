@@ -208,6 +208,8 @@ void export_lang(py::module &m) {
                      &CompileConfig::cache_loop_invariant_global_vars)
       .def_readwrite("tiered_full_simplify",
                      &CompileConfig::tiered_full_simplify)
+      .def_readwrite("full_simplify_global_iter_cap",
+                     &CompileConfig::full_simplify_global_iter_cap)
       .def_readwrite("auto_real_function",
                      &CompileConfig::auto_real_function)
       .def_readwrite("auto_real_function_threshold_us",

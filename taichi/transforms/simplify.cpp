@@ -579,6 +579,10 @@ bool full_simplify(IRNode *root,
     // global pass) but skips repeated global runs that would observe no
     // candidates beyond what the previous global run already saw.
     if (config.tiered_full_simplify) {
+      // P9.E (2026-04-28): cap the number of global-pass batches per
+      // full_simplify call. See CompileConfig::full_simplify_global_iter_cap.
+      const int global_iter_cap = config.full_simplify_global_iter_cap;
+      int global_iters_done = 0;
       while (true) {
         // local fixed-point
         while (true) {
@@ -613,7 +617,12 @@ bool full_simplify(IRNode *root,
             break;
           }
         }
-        // global pass batch
+        // global pass batch — gated by cap.
+        const bool globals_allowed =
+            (global_iter_cap == 0) || (global_iters_done < global_iter_cap);
+        if (!globals_allowed) {
+          break;
+        }
         bool global_modified = false;
         if (loop_invariant_code_motion(root, config))
           global_modified = true;
@@ -631,6 +640,7 @@ bool full_simplify(IRNode *root,
           global_modified = true;
         print("cfg_optimization");
         g_fs_iters.fetch_add(1, std::memory_order_relaxed);
+        ++global_iters_done;
         if (global_modified) {
           any_modified = true;
         } else {
@@ -641,6 +651,9 @@ bool full_simplify(IRNode *root,
         g_fs_noop.fetch_add(1, std::memory_order_relaxed);
       return any_modified;
     }
+    // P9.E (2026-04-28): same global-iter cap for the un-tiered path.
+    const int global_iter_cap = config.full_simplify_global_iter_cap;
+    int global_iters_done = 0;
     while (true) {
       bool modified = false;
       if (extract_constant(root, config))
@@ -661,8 +674,12 @@ bool full_simplify(IRNode *root,
       if (alg_simp(root, config))
         modified = true;
       print("alg_simp");
-      if (loop_invariant_code_motion(root, config))
-        modified = true;
+      const bool globals_allowed =
+          (global_iter_cap == 0) || (global_iters_done < global_iter_cap);
+      if (globals_allowed) {
+        if (loop_invariant_code_motion(root, config))
+          modified = true;
+      }
       print("loop_invariant_code_motion");
       if (die(root))
         modified = true;
@@ -673,15 +690,17 @@ bool full_simplify(IRNode *root,
       if (die(root))
         modified = true;
       print("die");
-      if (config.opt_level > 0 && whole_kernel_cse(root))
+      if (globals_allowed && config.opt_level > 0 && whole_kernel_cse(root))
         modified = true;
-      if (config.opt_level > 0 && config.cfg_optimization &&
+      if (globals_allowed && config.opt_level > 0 && config.cfg_optimization &&
           cfg_optimization(
               root, args.after_lower_access, args.autodiff_enabled,
               !config.real_matrix_scalarize && !config.force_scalarize_matrix))
         modified = true;
       print("cfg_optimization");
       g_fs_iters.fetch_add(1, std::memory_order_relaxed);
+      if (globals_allowed)
+        ++global_iters_done;
       if (modified)
         any_modified = true;
       if (!modified)

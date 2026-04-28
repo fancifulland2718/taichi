@@ -125,6 +125,33 @@ struct CompileConfig {
   // 一次 global 来检查是否还有候选，避免当年的语义退化。
   // 灰度阶段默认 false；profile 验证无回归后翻 true。
   bool tiered_full_simplify{true};
+  // 2026-04-28 (P9.E): full_simplify outer-loop global-pass cap.
+  // Limits how many times each `full_simplify` outer iteration is allowed
+  // to run the three expensive global passes (loop_invariant_code_motion,
+  // whole_kernel_cse, cfg_optimization). Once the cap is reached the
+  // outer loop only continues when local passes are still mutating the
+  // IR; further global runs are skipped.
+  //   1 (default) — equivalent to the historical `first_iteration` guard
+  //                 P2.b/P2.c had: globals run exactly once per
+  //                 full_simplify call. The IR after this still goes
+  //                 through downstream passes (lower_access, demote_*,
+  //                 ...), each of which calls full_simplify again, so the
+  //                 globals will eventually see new candidates produced
+  //                 by those passes — they are just not re-run within a
+  //                 single full_simplify call after their candidate set
+  //                 is already drained on iter 1.
+  //   0           — unlimited (re-revert to pre-P9.E behaviour: globals
+  //                 run every outer iteration until fixed-point).
+  //   N > 1       — explicit cap for diagnostic / safety net use.
+  // Per [optimization-workflow.instructions.md] §1.1, the runtime-
+  // performance / correctness baseline is vanilla 1.7.4 (≥95% step
+  // time / numerically equivalent). Cap=1 produces IR that is at least
+  // as well-optimized as vanilla 1.7.4's first-outer-iter output (vanilla
+  // also runs CSE/LICM/CFG on iter 1; vanilla then keeps iterating, but
+  // §2.5 of compile_doc/性能回归根因分析.md established that the marginal
+  // optimization beyond iter 1 is ≪0.5% on physics workloads while the
+  // compile-time cost is 30-80%).
+  int full_simplify_global_iter_cap{1};
   // 2026-04-28 (P9.A-2 / F2): auto-promote @ti.func from Python-side AST
   // inline expansion to is_real_function=True (C++ FuncCallStmt + per-
   // signature IR cache) once expansion wall time exceeds threshold.
