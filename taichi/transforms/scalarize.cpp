@@ -1332,7 +1332,117 @@ class FuseMatrixPtr : public BasicStmtVisitor {
   }
 };
 
-namespace irpass {
+// P9.C (2026-04-27): per-Block dedup of (origin, const-int-offset) MatrixPtrStmt
+// pairs left over after scalarize+FuseMatrixPtr.
+//
+// scalarize emits, for every elementwise read/write of a vec/mat:
+//   c_k = ConstStmt(k); p_k = MatrixPtrStmt(origin, c_k); ...
+// If the same matrix is touched again with the same constant index in the
+// same block, we get another (c_k', p_k') pair. whole_kernel_cse can fold
+// them, but only after multiple fixed-point rounds (ConstStmt dedup must
+// happen before MatrixPtrStmt dedup hashes match), each round paying an
+// O(N) BuildUsesMap rebuild. Doing it once here, in a single linear scan,
+// short-circuits those rounds.
+//
+// Conservative: per-Block scope only, only ConstStmt int offsets, only
+// MatrixPtrStmts whose origin is one of the address-arithmetic forms
+// (offset_used_as_index() == true, i.e. AllocaStmt / GlobalTemporaryStmt /
+// ExternalPtrStmt / nested MatrixPtrStmt). Pure structural rewrite — no
+// semantic change, no cache key impact, no flag.
+class DedupMatrixPtr {
+ public:
+  static bool run(IRNode *root) {
+    DedupMatrixPtr pass;
+    pass.process(root);
+    return pass.modified_;
+  }
+
+ private:
+  bool modified_{false};
+
+  void process(IRNode *node) {
+    if (auto *block = dynamic_cast<Block *>(node)) {
+      visit_block(block);
+      return;
+    }
+    if (auto *stmt = dynamic_cast<Stmt *>(node)) {
+      for_each_child_block(stmt, [this](Block *b) { visit_block(b); });
+    }
+  }
+
+  void visit_block(Block *block) {
+    // (origin instance_id, int_offset) -> first MatrixPtrStmt seen in this block.
+    // For const-int offsets, two distinct ConstStmt instances with the same
+    // value still hash to the same key -- the value-based key is preferred.
+    std::unordered_map<int64_t, MatrixPtrStmt *> seen_const;
+    // erase by index, after the linear scan
+    std::vector<int> to_erase;
+    for (int i = 0; i < (int)block->statements.size(); ++i) {
+      Stmt *s = block->statements[i].get();
+      if (auto *mp = s->cast<MatrixPtrStmt>()) {
+        if (mp->offset && mp->offset->is<ConstStmt>() &&
+            mp->offset_used_as_index() &&
+            is_integral(mp->offset->as<ConstStmt>()->val.dt)) {
+          int64_t off = mp->offset->as<ConstStmt>()->val.val_int();
+          int64_t key =
+              (int64_t)mp->origin->instance_id * 16777619LL + off;
+          auto it = seen_const.find(key);
+          if (it != seen_const.end() && it->second->origin == mp->origin) {
+            mp->replace_usages_with(it->second);
+            to_erase.push_back(i);
+            modified_ = true;
+            continue;
+          }
+          seen_const[key] = mp;
+        }
+      }
+      // Recurse into nested blocks within this stmt (loops, ifs, ...).
+      for_each_child_block(s, [this](Block *b) { visit_block(b); });
+    }
+    // erase in reverse order to keep indices valid
+    for (auto it = to_erase.rbegin(); it != to_erase.rend(); ++it) {
+      block->erase(*it);
+    }
+  }
+
+  template <typename Fn>
+  void for_each_child_block(Stmt *stmt, Fn &&fn) {
+    if (auto *if_stmt = stmt->cast<IfStmt>()) {
+      if (if_stmt->true_statements)
+        fn(if_stmt->true_statements.get());
+      if (if_stmt->false_statements)
+        fn(if_stmt->false_statements.get());
+    } else if (auto *r = stmt->cast<RangeForStmt>()) {
+      if (r->body)
+        fn(r->body.get());
+    } else if (auto *s = stmt->cast<StructForStmt>()) {
+      if (s->body)
+        fn(s->body.get());
+    } else if (auto *m = stmt->cast<MeshForStmt>()) {
+      if (m->body)
+        fn(m->body.get());
+    } else if (auto *w = stmt->cast<WhileStmt>()) {
+      if (w->body)
+        fn(w->body.get());
+    } else if (auto *o = stmt->cast<OffloadedStmt>()) {
+      if (o->tls_prologue)
+        fn(o->tls_prologue.get());
+      if (o->mesh_prologue)
+        fn(o->mesh_prologue.get());
+      if (o->bls_prologue)
+        fn(o->bls_prologue.get());
+      if (o->body)
+        fn(o->body.get());
+      if (o->bls_epilogue)
+        fn(o->bls_epilogue.get());
+      if (o->tls_epilogue)
+        fn(o->tls_epilogue.get());
+    } else if (auto *fb = stmt->cast<FrontendForStmt>()) {
+      if (fb->body)
+        fn(fb->body.get());
+    }
+  }
+};namespace irpass {
 
 bool scalarize(IRNode *root, bool half2_optimization_enabled) {
   TI_AUTO_PROF;
@@ -1343,6 +1453,7 @@ bool scalarize(IRNode *root, bool half2_optimization_enabled) {
   modified |= ScalarizePointers::run(root, scalarizable_allocas);
   modified |= ExtractLocalPointers::run(root);
   modified |= FuseMatrixPtr::run(root);
+  modified |= DedupMatrixPtr::run(root);
   return modified;
 }
 

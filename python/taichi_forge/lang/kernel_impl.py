@@ -5,6 +5,7 @@ import operator
 import re
 import sys
 import textwrap
+import time
 import typing
 import types
 import warnings
@@ -218,6 +219,64 @@ class Func:
         self.mapper = TaichiCallableTemplateMapper(self.arguments, self.template_slot_locations)
         self.taichi_functions = {}  # The |Function| class in C++
         self.has_print = False
+        # P9.A-2 (F2) — set to True once auto_real_function promotes this
+        # Func from inline AST expansion to is_real_function=True. Stays True
+        # for the rest of the runtime; we never demote back.
+        self._auto_promoted = False
+
+    def _can_auto_promote(self):
+        """P9.A-2 (F2) — structural eligibility for auto-promotion.
+
+        Conditions (all must hold):
+        - Not already real_function and not pyfunc (pyfunc has dual-scope
+          semantics; do not change its IR shape).
+        - Active backend is LLVM-based (LLVM is the only codegen with a
+          FuncCallStmt visitor).
+        - Caller kernel is not in autodiff (real_function has separate
+          autodiff handling that we do not auto-engage).
+        - All non-template parameters carry an explicit type annotation
+          (extract_arguments enforces this for is_real_function=True at
+          construction; we re-validate here because the original ctor was
+          called with is_real_function=False).
+        """
+        if self.is_real_function or self.pyfunc:
+            return False
+        runtime = impl.get_runtime()
+        if runtime.current_kernel is None:
+            return False
+        if runtime.current_kernel.autodiff_mode != AutodiffMode.NONE:
+            return False
+        if not _ti_core.arch_uses_llvm(impl.default_cfg().arch):
+            return False
+        for kernel_arg in self.arguments:
+            anno = kernel_arg.annotation
+            if isinstance(anno, template):
+                continue
+            if anno is inspect.Parameter.empty:
+                return False
+        return True
+
+    def _should_auto_promote(self):
+        """P9.A-2 (F2) — telemetry-driven trigger.
+
+        Promote once observed inline expansion cost crosses
+        cfg.auto_real_function_threshold_us AND we have at least 2 prior
+        inline expansions. The 2-call lower bound prevents one-off heavy
+        traces from triggering needless C++ codegen for cold paths.
+        """
+        cfg = impl.default_cfg()
+        if not cfg.auto_real_function:
+            return False
+        runtime = impl.get_runtime()
+        stats = runtime._ti_func_expansion_stats.get(self.func_id)
+        if stats is None:
+            return False
+        if stats["call_count"] < 2:
+            return False
+        threshold_ns = int(cfg.auto_real_function_threshold_us) * 1000
+        if stats["cumulative_ns"] < threshold_ns:
+            return False
+        return True
 
     def __call__(self, *args, **kwargs):
         args = _process_args(self, args, kwargs)
@@ -226,6 +285,16 @@ class Func:
             if not self.pyfunc:
                 raise TaichiSyntaxError("Taichi functions cannot be called from Python-scope.")
             return self.func(*args)
+
+        # P9.A-2 (F2) — auto_real_function: one-shot promotion check before
+        # entering the inline path. Once promoted, stays promoted.
+        if not self.is_real_function and not self._auto_promoted:
+            if self._can_auto_promote() and self._should_auto_promote():
+                self._auto_promoted = True
+                self.is_real_function = True
+                stats = impl.get_runtime()._ti_func_expansion_stats.get(self.func_id)
+                if stats is not None:
+                    stats["promoted"] = True
 
         if self.is_real_function:
             if impl.get_runtime().current_kernel.autodiff_mode != AutodiffMode.NONE:
@@ -260,7 +329,33 @@ class Func:
                     f"the innermost function with is_real_function=True so "
                     f"the inliner stops at a C++ call site."
                 )
-            ret = transform_tree(tree, ctx)
+            # P9.A-1 (F1) — measure AST inline expansion wall time.
+            # Active when profile flag is set or auto_real_function is on
+            # (the latter needs the data to drive the F2 heuristic).
+            measure = (
+                runtime._ti_func_expansion_profile
+                or impl.default_cfg().auto_real_function
+            )
+            if measure:
+                t0 = time.perf_counter_ns()
+                ret = transform_tree(tree, ctx)
+                dt_ns = time.perf_counter_ns() - t0
+                stats = runtime._ti_func_expansion_stats.setdefault(
+                    self.func_id,
+                    {
+                        "name": self.func.__name__,
+                        "call_count": 0,
+                        "cumulative_ns": 0,
+                        "max_ns": 0,
+                        "promoted": False,
+                    },
+                )
+                stats["call_count"] += 1
+                stats["cumulative_ns"] += dt_ns
+                if dt_ns > stats["max_ns"]:
+                    stats["max_ns"] = dt_ns
+            else:
+                ret = transform_tree(tree, ctx)
         finally:
             runtime.func_inline_depth -= 1
         if not self.is_real_function:

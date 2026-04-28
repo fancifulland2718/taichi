@@ -77,6 +77,24 @@ void compile_to_offloads(IRNode *ir,
   print("Typechecked");
   irpass::analysis::verify(ir);
 
+  // P9.A-3 (F3): IR-level reverse fallback for auto_real_function-promoted
+  // @ti.func calls. Default budget=0 -> visitor short-circuits (no IR walk
+  // overhead beyond a single accept()); positive budget enables selective
+  // inline-back of small callees so frequent-call hot-paths don't pay a
+  // perma-FuncCallStmt cost. LLVM-only by gate (FuncCallStmt visitor lives
+  // only in codegen_llvm.cpp; non-LLVM auto_real_function is rejected at
+  // F2's _can_auto_promote, so no FuncCallStmt should reach here for them).
+  if (config.auto_real_function_inline_budget != 0 &&
+      arch_uses_llvm(config.arch)) {
+    InliningPass::Args inl_args;
+    inl_args.budget = config.auto_real_function_inline_budget;
+    if (irpass::inlining(ir, config, inl_args)) {
+      irpass::type_check(ir, config);
+      print("Auto-real-function partial inlined back");
+      irpass::analysis::verify(ir);
+    }
+  }
+
   // TODO: strictly enforce bit vectorization for x86 cpu and CUDA now
   //       create a separate CompileConfig flag for the new pass
   if (arch_is_cpu(config.arch) || config.arch == Arch::cuda ||
@@ -224,6 +242,31 @@ void offload_to_executable(IRNode *ir,
   // "modified" return value; passes that don't return bool but don't
   // mutate IR (flag_access — see comment in compile_to_offloads_internal)
   // are intentionally NOT marked dirty.
+  //
+  // RP-1 (2026-04-28) — design rationale for keeping a single bool rather
+  // than a multi-dimensional `PassResult { simplify_dirty, types_dirty,
+  // alias_dirty, cfg_dirty }` struct:
+  //   * Phase 2-B B-1 audit (see §1.1, §7.2 #6) already established that
+  //     `irpass::offload` itself emits BinaryOp/UnaryOp arithmetic on
+  //     vulkan/opengl/gles/metal backends, which produces alg_simp / LICM
+  //     / CSE candidates downstream. The "Simplified III" call site is
+  //     therefore permanently dirty on those backends — multiplying out a
+  //     PassResult struct could not unlock it.
+  //   * The only remaining levers are the two skip sites already wired
+  //     here ("Simplified before lower access" and "Simplified IV"), and
+  //     they only need a single boolean: did anything between this site
+  //     and the previous simplify mutate the IR in a way that produces
+  //     simplify candidates?
+  //   * Each pass below (make_thread_local / make_block_local /
+  //     cache_loop_invariant_global_vars / demote_dense_struct_fors /
+  //     make_cpu_multithreaded_range_for / mesh trio) was audited and
+  //     now returns `bool` describing whether it actually ran a mutating
+  //     branch. When all of them are no-ops on a given kernel, the
+  //     downstream simplify can be skipped.
+  // Adding a new pass here: return a bool from your pass (true when the
+  // IR was actually mutated in a simplify-affecting way), then OR it
+  // into `pipeline_dirty`. Conservative default for unaudited passes is
+  // unconditionally `pipeline_dirty = true;` after the call.
   bool pipeline_dirty = true;
   const bool fused = config.use_fused_passes;
 
@@ -239,15 +282,16 @@ void offload_to_executable(IRNode *ir,
   irpass::analysis::verify(ir);
 
   if (config.cache_loop_invariant_global_vars) {
-    irpass::cache_loop_invariant_global_vars(ir, config);
-    pipeline_dirty = true;
+    if (irpass::cache_loop_invariant_global_vars(ir, config))
+      pipeline_dirty = true;
     print("Cache loop-invariant global vars");
   }
 
   if (config.demote_dense_struct_fors) {
-    irpass::demote_dense_struct_fors(ir);
-    irpass::type_check(ir, config);
-    pipeline_dirty = true;
+    if (irpass::demote_dense_struct_fors(ir)) {
+      irpass::type_check(ir, config);
+      pipeline_dirty = true;
+    }
     print("Dense struct-for demoted");
     irpass::analysis::verify(ir);
   }
@@ -270,18 +314,18 @@ void offload_to_executable(IRNode *ir,
   }
 
   if (make_thread_local) {
-    irpass::make_thread_local(ir, config);
-    pipeline_dirty = true;
+    if (irpass::make_thread_local(ir, config))
+      pipeline_dirty = true;
     print("Make thread local");
   }
 
   if (is_extension_supported(config.arch, Extension::mesh)) {
-    irpass::make_mesh_thread_local(ir, config, {kernel->get_name()});
-    pipeline_dirty = true;
+    if (irpass::make_mesh_thread_local(ir, config, {kernel->get_name()}))
+      pipeline_dirty = true;
     print("Make mesh thread local");
     if (config.make_mesh_block_local && config.arch == Arch::cuda) {
-      irpass::make_mesh_block_local(ir, config, {kernel->get_name()});
-      pipeline_dirty = true;
+      if (irpass::make_mesh_block_local(ir, config, {kernel->get_name()}))
+        pipeline_dirty = true;
       const bool sx_modified = irpass::full_simplify(
           ir, config,
           {false, /*autodiff_enabled*/ false, kernel->get_name(), verbose});
@@ -291,14 +335,14 @@ void offload_to_executable(IRNode *ir,
   }
 
   if (make_block_local) {
-    irpass::make_block_local(ir, config, {kernel->get_name(), verbose});
-    pipeline_dirty = true;
+    if (irpass::make_block_local(ir, config, {kernel->get_name(), verbose}))
+      pipeline_dirty = true;
     print("Make block local");
   }
 
   if (is_extension_supported(config.arch, Extension::mesh)) {
-    irpass::demote_mesh_statements(ir, config, {kernel->get_name()});
-    pipeline_dirty = true;
+    if (irpass::demote_mesh_statements(ir, config, {kernel->get_name()}))
+      pipeline_dirty = true;
     print("Demote mesh statements");
   }
 

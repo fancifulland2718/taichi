@@ -1,4 +1,7 @@
+import atexit
+import json
 import numbers
+import os
 from types import FunctionType, MethodType
 from typing import Any, Iterable, Sequence
 
@@ -347,6 +350,20 @@ class PyTaichi:
         self.func_inline_depth_limit = 0
         # Live counters used by the enforcement hooks; reset per kernel compile.
         self.func_inline_depth = 0
+        # P9.A-1 (F1) — auto-promotion telemetry.
+        # Per-func_id wall-time stats for @ti.func AST inline expansion.
+        # dict: func_id -> {"name": str, "call_count": int,
+        #                   "cumulative_ns": int, "max_ns": int,
+        #                   "promoted": bool}
+        # Populated only when self._ti_func_expansion_profile is True OR
+        # cfg.auto_real_function is True. Default OFF (no measurement
+        # overhead). Used by F2 heuristic and optional offline JSON dump.
+        self._ti_func_expansion_stats: dict = {}
+        # Env flag: TI_FUNC_EXPANSION_PROFILE=1 turns on measurement even
+        # when auto_real_function=False. Useful for offline analysis.
+        self._ti_func_expansion_profile: bool = bool(
+            int(os.environ.get("TI_FUNC_EXPANSION_PROFILE", "0"))
+        )
 
     def initialize_fields_builder(self, builder):
         self.unfinalized_fields_builder[builder] = get_traceback(2)
@@ -517,11 +534,54 @@ def get_runtime():
 def reset():
     global pytaichi
     old_kernels = pytaichi.kernels
+    _dump_func_expansion_stats(pytaichi)
     pytaichi.clear()
     pytaichi = PyTaichi(old_kernels)
     for k in old_kernels:
         k.reset()
     _ti_core.reset_default_compile_config()
+
+
+def _dump_func_expansion_stats(runtime):
+    """P9.A-1 (F1) — dump @ti.func inline expansion telemetry to JSON.
+
+    Triggered on `reset()` (i.e. ti.reset() / ti.init()) and via atexit.
+    Written only when env TI_FUNC_EXPANSION_OUT is set OR profile flag is on.
+    Silently no-ops on errors (telemetry must never break user programs).
+    """
+    try:
+        if not runtime._ti_func_expansion_stats:
+            return
+        out_path = os.environ.get("TI_FUNC_EXPANSION_OUT", "")
+        if not out_path and not runtime._ti_func_expansion_profile:
+            return
+        if not out_path:
+            return  # profile flag alone doesn't auto-dump
+        payload = {
+            "schema_version": 1,
+            "stats": [
+                {
+                    "func_id": fid,
+                    **entry,
+                    # ns -> us for human readability while keeping ns precision.
+                    "cumulative_us": entry["cumulative_ns"] / 1000.0,
+                    "max_us": entry["max_ns"] / 1000.0,
+                }
+                for fid, entry in runtime._ti_func_expansion_stats.items()
+            ],
+        }
+        with open(out_path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, indent=2, sort_keys=True)
+    except Exception:  # pylint: disable=broad-except
+        pass
+
+
+@atexit.register
+def _atexit_dump_func_expansion_stats():
+    try:
+        _dump_func_expansion_stats(pytaichi)
+    except Exception:  # pylint: disable=broad-except
+        pass
 
 
 @taichi_scope

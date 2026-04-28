@@ -653,8 +653,10 @@ void MakeMeshBlockLocal::run(OffloadedStmt *offload,
 
 namespace irpass {
 
-// This pass should happen after offloading but before lower_access
-void make_mesh_block_local(IRNode *root,
+// This pass should happen after offloading but before lower_access.
+// RP-1 (2026-04-28): always reports dirty=true (conservative — mesh
+// extension has no in-tree smoke). Signature kept for driver uniformity.
+bool make_mesh_block_local(IRNode *root,
                            const CompileConfig &config,
                            const MakeMeshBlockLocal::Args &args) {
   TI_AUTO_PROF;
@@ -679,6 +681,7 @@ void make_mesh_block_local(IRNode *root,
   }
 
   type_check(root, config);
+  return true;
 }
 
 }  // namespace irpass

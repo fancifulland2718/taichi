@@ -12,16 +12,14 @@
 pip install taichi-forge
 ```
 
-The **import name is unchanged**:
+The **import name is changed**:
 
 ```python
-import taichi as ti
+import taichi-forge as ti
 ti.init(arch=ti.cuda)
 ```
 
-Every public API from upstream Taichi 1.7.x that we still ship behaves the same way — existing user code runs without modification.
-
-> **Heads up.** `taichi-forge` and the upstream `taichi` distribution install the same top-level Python package (`taichi/`). Pick **one** of them in any given virtual environment; do not install both side by side.
+Every public API from upstream Taichi 1.7.4 that we still ship behaves the same way — existing user code runs without modification.
 
 ---
 

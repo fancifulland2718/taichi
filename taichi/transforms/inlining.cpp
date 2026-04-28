@@ -8,12 +8,14 @@
 
 namespace taichi::lang {
 
-// Inline all functions.
+// Inline all FuncCallStmts. When |budget_| >= 0 a per-callee statement-count
+// cap is applied: callees whose top-level Block stmt count exceeds the
+// budget are left as FuncCallStmt; budget == 0 disables inlining entirely.
 class Inliner : public BasicStmtVisitor {
  public:
   using BasicStmtVisitor::visit;
 
-  explicit Inliner() {
+  explicit Inliner(int budget) : budget_(budget) {
   }
 
   void visit(FuncCallStmt *stmt) override {
@@ -22,6 +24,19 @@ class Inliner : public BasicStmtVisitor {
     TI_ASSERT(func->parameter_list.size() == stmt->args.size());
     TI_ASSERT(func->ir->is<Block>());
     TI_ASSERT(func->rets.size() <= 1);
+    if (budget_ == 0) {
+      return;
+    }
+    if (budget_ > 0) {
+      // Top-level statement count is a cheap, conservative proxy: deeply
+      // nested control flow / matrix expansion bloats the count, which is
+      // the right signal to keep an out-of-line FuncCallStmt.
+      int callee_size =
+          static_cast<int>(func->ir->as<Block>()->statements.size());
+      if (callee_size > budget_) {
+        return;
+      }
+    }
     auto inlined_ir = irpass::analysis::clone(func->ir.get());
     if (!func->parameter_list.empty()) {
       irpass::replace_statements(
@@ -65,8 +80,8 @@ class Inliner : public BasicStmtVisitor {
     }
   }
 
-  static bool run(IRNode *node) {
-    Inliner inliner;
+  static bool run(IRNode *node, int budget) {
+    Inliner inliner(budget);
     bool modified = false;
     while (true) {
       node->accept(&inliner);
@@ -79,6 +94,7 @@ class Inliner : public BasicStmtVisitor {
   }
 
  private:
+  int budget_;
   DelayedIRModifier modifier_;
 };
 
@@ -90,7 +106,7 @@ bool inlining(IRNode *root,
               const CompileConfig &config,
               const InliningPass::Args &args) {
   TI_AUTO_PROF;
-  return Inliner::run(root);
+  return Inliner::run(root, args.budget);
 }
 
 }  // namespace irpass

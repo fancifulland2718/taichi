@@ -142,8 +142,10 @@ void demote_mesh_statements_offload(OffloadedStmt *offload,
   }
 }
 
-// This pass should happen after offloading but before lower_access
-void demote_mesh_statements(IRNode *root,
+// This pass should happen after offloading but before lower_access.
+// RP-1 (2026-04-28): always reports dirty=true (conservative — mesh
+// extension has no in-tree smoke). Signature kept for driver uniformity.
+bool demote_mesh_statements(IRNode *root,
                             const CompileConfig &config,
                             const DemoteMeshStatements::Args &args) {
   TI_AUTO_PROF;
@@ -158,6 +160,7 @@ void demote_mesh_statements(IRNode *root,
                                    args.kernel_name);
   }
   type_check(root, config);
+  return true;
 }
 
 }  // namespace irpass

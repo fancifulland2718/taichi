@@ -88,6 +88,11 @@ static std::vector<std::uint8_t> get_offline_cache_key_of_compile_config(
   serializer(config.experimental_auto_mesh_local);
   serializer(config.auto_mesh_local_default_occupacy);
   serializer(config.real_matrix_scalarize);
+  // P9.A (F2/F3): auto_real_function gating + inline budget influence
+  // FuncCallStmt presence and inliner behavior; both must invalidate cache.
+  serializer(config.auto_real_function);
+  serializer(config.auto_real_function_threshold_us);
+  serializer(config.auto_real_function_inline_budget);
   serializer(config.force_scalarize_matrix);
   serializer(config.half2_vectorization);
   // B2 (2026-04-26): SPIR-V disabled-pass list affects emitted SPIR-V on

@@ -97,7 +97,7 @@ std::vector<std::pair<T *, AtomicOpType>> find_global_reduction_destinations(
   return valid_reduction_values;
 }
 
-void make_thread_local_offload(OffloadedStmt *offload) {
+void make_thread_local_offload(OffloadedStmt *offload, bool *modified) {
   if (offload->task_type != OffloadedTaskType::range_for &&
       offload->task_type != OffloadedTaskType::struct_for)
     return;
@@ -134,6 +134,9 @@ void make_thread_local_offload(OffloadedStmt *offload) {
 
   // TODO: sort thread local storage variables according to dtype_size to
   // reduce buffer fragmentation.
+  if (!valid_reduction_values.empty()) {
+    *modified = true;
+  }
   for (auto dest : valid_reduction_values) {
     auto data_type = dest.first->ret_type.ptr_removed();
     auto dtype_size = data_type_size(data_type);
@@ -217,16 +220,20 @@ void make_thread_local_offload(OffloadedStmt *offload) {
 namespace irpass {
 
 // This pass should happen after offloading but before lower_access
-void make_thread_local(IRNode *root, const CompileConfig &config) {
+bool make_thread_local(IRNode *root, const CompileConfig &config) {
   TI_AUTO_PROF;
+  bool modified = false;
   if (auto root_block = root->cast<Block>()) {
     for (auto &offload : root_block->statements) {
-      make_thread_local_offload(offload->cast<OffloadedStmt>());
+      make_thread_local_offload(offload->cast<OffloadedStmt>(), &modified);
     }
   } else {
-    make_thread_local_offload(root->as<OffloadedStmt>());
+    make_thread_local_offload(root->as<OffloadedStmt>(), &modified);
   }
-  type_check(root, config);
+  if (modified) {
+    type_check(root, config);
+  }
+  return modified;
 }
 
 }  // namespace irpass

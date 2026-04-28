@@ -569,6 +569,78 @@ bool full_simplify(IRNode *root,
     // until the standard fixed-point break (`if (!modified) break;`).
     // The `compile_tier` flag is preserved for future use but no longer
     // gates these passes.
+    //
+    // P9.D (2026-04-27): when `tiered_full_simplify` is on, sub-passes are
+    // partitioned into local (cheap, O(N)) and global (expensive, O(N*log)
+    // or higher) tiers. We run local passes to local-fixpoint, then run
+    // global passes once; if global modifies the IR we go back to local.
+    // This is semantically equivalent to the un-tiered loop (every global
+    // pass still sees a fully simplified IR; every IR change still gets a
+    // global pass) but skips repeated global runs that would observe no
+    // candidates beyond what the previous global run already saw.
+    if (config.tiered_full_simplify) {
+      while (true) {
+        // local fixed-point
+        while (true) {
+          bool local_modified = false;
+          if (extract_constant(root, config))
+            local_modified = true;
+          print("extract_constant");
+          if (unreachable_code_elimination(root))
+            local_modified = true;
+          print("unreachable_code_elimination");
+          if (binary_op_simplify(root, config))
+            local_modified = true;
+          print("binary_op_simplify");
+          if (config.constant_folding && constant_fold(root))
+            local_modified = true;
+          print("constant_fold");
+          if (die(root))
+            local_modified = true;
+          print("die");
+          if (alg_simp(root, config))
+            local_modified = true;
+          print("alg_simp");
+          if (simplify(root, config))
+            local_modified = true;
+          print("simplify");
+          if (die(root))
+            local_modified = true;
+          print("die");
+          if (local_modified) {
+            any_modified = true;
+          } else {
+            break;
+          }
+        }
+        // global pass batch
+        bool global_modified = false;
+        if (loop_invariant_code_motion(root, config))
+          global_modified = true;
+        print("loop_invariant_code_motion");
+        if (die(root))
+          global_modified = true;
+        print("die");
+        if (config.opt_level > 0 && whole_kernel_cse(root))
+          global_modified = true;
+        if (config.opt_level > 0 && config.cfg_optimization &&
+            cfg_optimization(
+                root, args.after_lower_access, args.autodiff_enabled,
+                !config.real_matrix_scalarize &&
+                    !config.force_scalarize_matrix))
+          global_modified = true;
+        print("cfg_optimization");
+        g_fs_iters.fetch_add(1, std::memory_order_relaxed);
+        if (global_modified) {
+          any_modified = true;
+        } else {
+          break;
+        }
+      }
+      if (!any_modified)
+        g_fs_noop.fetch_add(1, std::memory_order_relaxed);
+      return any_modified;
+    }
     while (true) {
       bool modified = false;
       if (extract_constant(root, config))

@@ -193,12 +193,24 @@ class WholeKernelCSE : public BasicStmtVisitor {
 
     // Move common statements at the beginning or the end of both branches
     // outside.
+    // P9.B (2026-04-27): Loop the head/tail hoist so that K consecutive
+    // matching prefix/suffix statements are extracted in a single visit.
+    // Previously only 1 stmt at each end was hoisted per outer fixed-point
+    // iteration, so a K-stmt shared prefix needed K outer iterations (each
+    // rebuilding the def-use map). Physics-simulation pair-wise dispatch
+    // commonly shares 3-10 stmt setup (relative position / mat3 transform /
+    // contact frame) before diverging — looping cuts CSE outer iterations
+    // proportionally on those kernels.
     if (if_stmt->true_statements && if_stmt->false_statements) {
       auto &true_clause = if_stmt->true_statements;
       auto &false_clause = if_stmt->false_statements;
-      if (irpass::analysis::same_statements(
-              true_clause->statements[0].get(),
-              false_clause->statements[0].get())) {
+      // Extend prefix hoist: keep extracting matching head stmts as long as
+      // both clauses still have entries and the leading pair compares equal.
+      while (!true_clause->statements.empty() &&
+             !false_clause->statements.empty() &&
+             irpass::analysis::same_statements(
+                 true_clause->statements[0].get(),
+                 false_clause->statements[0].get())) {
         // Directly modify this because it won't invalidate any iterators.
         auto common_stmt = true_clause->extract(0);
         irpass::replace_all_usages_with(false_clause.get(),
@@ -207,11 +219,15 @@ class WholeKernelCSE : public BasicStmtVisitor {
         modifier_.insert_before(if_stmt, std::move(common_stmt));
         false_clause->erase(0);
       }
-      if (!true_clause->statements.empty() &&
-          !false_clause->statements.empty() &&
-          irpass::analysis::same_statements(
-              true_clause->statements.back().get(),
-              false_clause->statements.back().get())) {
+      // Extend suffix hoist: same idea on the tail. Note insert_after stacks
+      // hoisted stmts in reverse extraction order, but the iteration itself
+      // walks the suffix from outermost-tail inward, so the relative order of
+      // hoisted stmts in the parent block is preserved.
+      while (!true_clause->statements.empty() &&
+             !false_clause->statements.empty() &&
+             irpass::analysis::same_statements(
+                 true_clause->statements.back().get(),
+                 false_clause->statements.back().get())) {
         // Directly modify this because it won't invalidate any iterators.
         auto common_stmt = true_clause->extract((int)true_clause->size() - 1);
         irpass::replace_all_usages_with(false_clause.get(),
@@ -251,6 +267,37 @@ class WholeKernelCSE : public BasicStmtVisitor {
 namespace irpass {
 bool whole_kernel_cse(IRNode *root) {
   TI_AUTO_PROF;
+  // P9.B-2 (2026-04-27): per-OffloadedStmt segmentation.
+  //
+  // When the root is the post-lower_offload kernel block — a Block whose
+  // children are all OffloadedStmts — CSE is provably independent across
+  // offloads (each offload generates a separate launch; their stmts cannot
+  // be operands of each other). Running the pass per-offload turns each
+  // fixed-point iteration's BuildUsesMap rebuild from O(whole-IR) into
+  // O(per-offload), and stops a tiny modification in offload K from
+  // re-triggering an inner iteration that re-walks all other offloads.
+  //
+  // For pre-offload IR, ti.func bodies, or any other shape we keep the
+  // original whole-root behavior — no functional change.
+  if (auto *block = dynamic_cast<Block *>(root)) {
+    if (!block->statements.empty()) {
+      bool all_offloaded = true;
+      for (auto &s : block->statements) {
+        if (!s->is<OffloadedStmt>()) {
+          all_offloaded = false;
+          break;
+        }
+      }
+      if (all_offloaded) {
+        bool modified = false;
+        for (auto &s : block->statements) {
+          if (WholeKernelCSE::run(s.get()))
+            modified = true;
+        }
+        return modified;
+      }
+    }
+  }
   return WholeKernelCSE::run(root);
 }
 }  // namespace irpass

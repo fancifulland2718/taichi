@@ -12,7 +12,8 @@ namespace {
 void make_block_local_offload(OffloadedStmt *offload,
                               const CompileConfig &config,
                               const std::string &kernel_name,
-                              bool verbose) {
+                              bool verbose,
+                              bool *modified) {
   if (offload->task_type != OffloadedStmt::TaskType::struct_for)
     return;
 
@@ -22,6 +23,10 @@ void make_block_local_offload(OffloadedStmt *offload,
   if (!is_bls_applicable) {
     return;
   }
+  // Past this point the pass mutates the offload's bls_prologue / body /
+  // bls_epilogue and inserts arithmetic statements that may produce new
+  // simplify candidates downstream.
+  *modified = true;
 
   /*
       [TensorType TODO #2]
@@ -374,21 +379,25 @@ const PassID MakeBlockLocalPass::id = "MakeBlockLocalPass";
 namespace irpass {
 
 // This pass should happen after offloading but before lower_access
-void make_block_local(IRNode *root,
+bool make_block_local(IRNode *root,
                       const CompileConfig &config,
                       const MakeBlockLocalPass::Args &args) {
   TI_AUTO_PROF;
 
+  bool modified = false;
   if (auto root_block = root->cast<Block>()) {
     for (auto &offload : root_block->statements) {
       make_block_local_offload(offload->cast<OffloadedStmt>(), config,
-                               args.kernel_name, args.verbose);
+                               args.kernel_name, args.verbose, &modified);
     }
   } else {
     make_block_local_offload(root->as<OffloadedStmt>(), config,
-                             args.kernel_name, args.verbose);
+                             args.kernel_name, args.verbose, &modified);
   }
-  type_check(root, config);
+  if (modified) {
+    type_check(root, config);
+  }
+  return modified;
 }
 
 }  // namespace irpass

@@ -109,7 +109,41 @@ struct CompileConfig {
   bool lower_access;
   bool simplify_after_lower_access;
   bool move_loop_invariant_outside_if;
-  bool cache_loop_invariant_global_vars{true};
+  // 2026-04-27 (P-Compile-8 默认值审计): fork-added pass，vanilla 1.7.4 无此项。
+  // 实测 cold compile +5-15%（SNode-heavy kernel），runtime 仅 1-3% 帮助且仅作用于
+  // 反复读取同一全局指针的窄场景。物理仿真主路径不敏感，故默认翻 false 对齐 vanilla。
+  // 用户仍可显式 ti.init(cache_loop_invariant_global_vars=True) 打开。
+  bool cache_loop_invariant_global_vars{false};
+  // 2026-04-27 (P9.D): full_simplify outer fixed-point 改用 local→global
+  // 分级调度：先把 local pass（extract_constant / binary_op_simplify /
+  // constant_fold / die / alg_simp / simplify）跑到本地不动点，再跑一次
+  // 全部 global pass（LICM / whole_kernel_cse / cfg_optimization），如
+  // global 改动了 IR 则回到 local 不动点继续。语义与既有 outer-loop
+  // 等价（每次 global 看到的都是 local 不动点 IR，只多不少候选），但
+  // 砍掉了 "local 还在小改 → 又跑一次大 global" 的浪费。
+  // P2.b/P2.c 的 first_iteration 跳过 global 是错的；本调度始终至少跑
+  // 一次 global 来检查是否还有候选，避免当年的语义退化。
+  // 灰度阶段默认 false；profile 验证无回归后翻 true。
+  bool tiered_full_simplify{true};
+  // 2026-04-28 (P9.A-2 / F2): auto-promote @ti.func from Python-side AST
+  // inline expansion to is_real_function=True (C++ FuncCallStmt + per-
+  // signature IR cache) once expansion wall time exceeds threshold.
+  // LLVM-only (FuncCallStmt visitor exists only in codegen_llvm.cpp).
+  // Default OFF; preserves vanilla 1.7.4 semantics. Cache key includes
+  // both fields so toggling invalidates offline cache cleanly.
+  bool auto_real_function{false};
+  // Cumulative inline-expansion wall time (microseconds) per @ti.func that
+  // triggers promotion. 1 ms ~ "function is being repeatedly traced for
+  // multi-millisecond cost" — see compile_doc/优化总规划.md §P9.A.
+  int auto_real_function_threshold_us{1000};
+  // 2026-04-28 (P9.A-3 / F3): IR-level reverse fallback for auto_real_function.
+  // After F2 promotes a func to FuncCallStmt, the inliner can selectively
+  // inline back small callees so that "small + frequent" funcs do not pay
+  // a perma-call cost. budget = max statement count of a callee for which
+  // inlining is allowed. 0 = disabled (no inline-back, FuncCallStmt
+  // preserved). Default OFF — F3 is plumbed but quiescent until F1
+  // telemetry confirms the real distribution warrants activation.
+  int auto_real_function_inline_budget{0};
   bool demote_dense_struct_fors;
   bool advanced_optimization;
   bool constant_folding;

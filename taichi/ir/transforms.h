@@ -117,20 +117,29 @@ bool check_out_of_bound(IRNode *root,
 // inserted). Callers may use this to skip a subsequent full_simplify pass when
 // no other transformation has run since the previous simplify.
 bool handle_external_ptr_boundary(IRNode *root, const CompileConfig &config);
-void make_thread_local(IRNode *root, const CompileConfig &config);
+// P-Compile-1 phase 2-B / RP-1 (2026-04-28): the following passes return
+// `true` iff the IR was actually mutated in a way that may produce new
+// simplify candidates (alg_simp / whole_kernel_cse / LICM / cfg_optimization
+// /  die). When a pass is a no-op on the current IR, returning `false`
+// lets the driver-level `pipeline_dirty` flag stay clean and skip a
+// downstream full_simplify call site (gated by `use_fused_passes`).
+bool make_thread_local(IRNode *root, const CompileConfig &config);
 std::unique_ptr<ScratchPads> initialize_scratch_pad(OffloadedStmt *root);
-void make_block_local(IRNode *root,
+bool make_block_local(IRNode *root,
                       const CompileConfig &config,
                       const MakeBlockLocalPass::Args &args);
 void make_cpu_multithreaded_range_for(IRNode *root,
                                       const CompileConfig &config);
-void make_mesh_thread_local(IRNode *root,
+// Mesh-extension passes are kept conservative: they always report dirty=true
+// (no simplify-affinity audit was done because mesh smoke is not in CI).
+// The bool return keeps the driver caller uniform.
+bool make_mesh_thread_local(IRNode *root,
                             const CompileConfig &config,
                             const MakeBlockLocalPass::Args &args);
-void make_mesh_block_local(IRNode *root,
+bool make_mesh_block_local(IRNode *root,
                            const CompileConfig &config,
                            const MakeMeshBlockLocal::Args &args);
-void demote_mesh_statements(IRNode *root,
+bool demote_mesh_statements(IRNode *root,
                             const CompileConfig &config,
                             const DemoteMeshStatements::Args &args);
 bool remove_loop_unique(IRNode *root);
@@ -183,7 +192,10 @@ bool replace_and_insert_statements(
 bool replace_statements(IRNode *root,
                         std::function<bool(Stmt *)> filter,
                         std::function<Stmt *(Stmt *)> finder);
-void demote_dense_struct_fors(IRNode *root);
+// Returns true iff at least one struct-for was demoted to a range-for
+// (RP-1, 2026-04-28). Callers may use this to keep `pipeline_dirty` clean
+// when no demotion happened.
+bool demote_dense_struct_fors(IRNode *root);
 void demote_no_access_mesh_fors(IRNode *root);
 bool demote_atomics(IRNode *root, const CompileConfig &config);
 void reverse_segments(IRNode *root);  // for autograd

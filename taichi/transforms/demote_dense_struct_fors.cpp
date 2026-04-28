@@ -111,28 +111,34 @@ void convert_to_range_for(OffloadedStmt *offloaded) {
   offloaded->task_type = TaskType::range_for;
 }
 
-void maybe_convert(OffloadedStmt *stmt) {
+bool maybe_convert(OffloadedStmt *stmt) {
   if ((stmt->task_type == TaskType::struct_for) &&
       stmt->snode->is_path_all_dense) {
     convert_to_range_for(stmt);
+    return true;
   }
+  return false;
 }
 
 }  // namespace
 
 namespace irpass {
 
-void demote_dense_struct_fors(IRNode *root) {
+bool demote_dense_struct_fors(IRNode *root) {
+  bool modified = false;
   if (auto *block = root->cast<Block>()) {
     for (auto &s_ : block->statements) {
       if (auto *s = s_->cast<OffloadedStmt>()) {
-        maybe_convert(s);
+        modified |= maybe_convert(s);
       }
     }
   } else if (auto *s = root->cast<OffloadedStmt>()) {
-    maybe_convert(s);
+    modified |= maybe_convert(s);
   }
-  re_id(root);
+  if (modified) {
+    re_id(root);
+  }
+  return modified;
 }
 
 }  // namespace irpass

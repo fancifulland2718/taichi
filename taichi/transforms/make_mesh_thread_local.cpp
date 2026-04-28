@@ -132,8 +132,10 @@ void make_mesh_thread_local_offload(OffloadedStmt *offload,
   offload->tls_size = std::max(std::size_t(1), tls_offset);
 }
 
-// This pass should happen after offloading but before lower_access
-void make_mesh_thread_local(IRNode *root,
+// This pass should happen after offloading but before lower_access.
+// RP-1 (2026-04-28): always reports dirty=true (conservative — mesh
+// extension has no in-tree smoke). Signature kept for driver uniformity.
+bool make_mesh_thread_local(IRNode *root,
                             const CompileConfig &config,
                             const MakeBlockLocalPass::Args &args) {
   TI_AUTO_PROF;
@@ -163,6 +165,7 @@ void make_mesh_thread_local(IRNode *root,
                                    args.kernel_name);
   }
   type_check(root, config);
+  return true;
 }
 
 }  // namespace irpass
