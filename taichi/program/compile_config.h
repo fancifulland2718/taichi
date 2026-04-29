@@ -70,6 +70,18 @@ struct CompileConfig {
   // offline-cache key (treated like spirv_parallel_codegen — the user
   // explicitly accepts a different optimizer chain when toggling).
   bool spirv_skip_loop_unroll{false};
+  // Phase 1c-D (taichi-forge 0.3.x): opt-in for the experimental sparse SNode
+  // path on the Vulkan backend (bitmasked storage + listgen for depth-1
+  // single/multi-axis bitmasked). Default false matches the vanilla taichi
+  // 1.7.4 behaviour of refusing sparse on Vulkan. When true, Program ctor
+  // calls set_vulkan_sparse_experimental(true) which makes
+  // is_extension_supported(Arch::vulkan, Extension::sparse) return true; the
+  // legacy env var TI_VULKAN_SPARSE=1 is still honoured for backwards
+  // compatibility (see extension.cpp). Not part of the offline-cache key:
+  // the resulting SPIR-V differs structurally only when the user actually
+  // declares sparse SNodes, which already segregates the cache by SNode tree
+  // hash.
+  bool vulkan_sparse_experimental{false};
   // B2 (2026-04-26): user-facing fine-grained SPIR-V optimizer pass
   // disable list. Each entry is a pass name (case-sensitive) matching one
   // of the spvtools::Create*Pass identifiers used in

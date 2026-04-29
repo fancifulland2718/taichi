@@ -567,15 +567,34 @@ class TaskCodegen : public IRVisitor {
         // spirv::Value val = ir_->add(loop_var, ir_->const_i32_zero_);
         ir_->register_value(stmt_name, loop_var);
       } else if (type == OffloadedTaskType::struct_for) {
-        // Phase 1b: single-axis bitmasked at depth-1. The listgen kernel
-        // emits flat cell indices into "ii"; for a 1D bitmasked SNode that
-        // index is exactly the i-coordinate. Multi-axis decoding is deferred.
-        TI_ERROR_IF(stmt->index != 0,
-                    "SPIR-V struct_for over multi-axis bitmasked SNodes is "
-                    "not yet supported. Use a single-axis bitmasked SNode for "
-                    "now (Phase 1b).");
-        spirv::Value loop_var = ir_->query_value("ii");
-        ir_->register_value(stmt_name, loop_var);
+        // Phase 1b/1c: depth-1 bitmasked at root. The listgen kernel emits
+        // flat cell indices into "ii" (u32). For 1D bitmasked the flat index
+        // *is* the per-axis coordinate; for multi-axis bitmasked we decode
+        // using the SNode extractors:
+        //   axis_value = (flat / extractors[index].acc_shape)
+        //                % extractors[index].shape
+        // The result is cast to i32 to match LoopIndexStmt's return type so
+        // downstream arithmetic on the loop index stays well-typed.
+        spirv::Value flat = ir_->query_value("ii");
+        const auto *loop_sn = stmt->loop->as<OffloadedStmt>()->snode;
+        TI_ASSERT(loop_sn != nullptr);
+        const int axis = stmt->index;
+        const int acc_shape = loop_sn->extractors[axis].acc_shape;
+        const int shape = loop_sn->extractors[axis].shape;
+        spirv::Value val = flat;
+        if (acc_shape > 1) {
+          val = ir_->make_value(
+              spv::OpUDiv, ir_->u32_type(), val,
+              ir_->uint_immediate_number(ir_->u32_type(), acc_shape));
+        }
+        if (shape > 0 && shape != 1) {
+          val = ir_->make_value(
+              spv::OpUMod, ir_->u32_type(), val,
+              ir_->uint_immediate_number(ir_->u32_type(), shape));
+        }
+        // Bring back to i32 to match the IR-level type of LoopIndexStmt.
+        val = ir_->cast(ir_->i32_type(), val);
+        ir_->register_value(stmt_name, val);
       } else {
         TI_NOT_IMPLEMENTED;
       }

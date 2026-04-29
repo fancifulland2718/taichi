@@ -23,4 +23,12 @@ enum class Extension {
 
 bool is_extension_supported(Arch arch, Extension ext);
 
+// Phase 1c-D (taichi-forge 0.3.x): toggles the experimental sparse-on-Vulkan
+// path. Sourced from ti.init(vulkan_sparse_experimental=True) /
+// CompileConfig::vulkan_sparse_experimental, with the legacy env var
+// TI_VULKAN_SPARSE=1 retained as a compatible fallback. Once enabled the
+// flag is sticky for the remainder of the process (matches the previous
+// env-var semantics where one ti.init call decided the whole run).
+void set_vulkan_sparse_experimental(bool enabled);
+
 }  // namespace taichi::lang

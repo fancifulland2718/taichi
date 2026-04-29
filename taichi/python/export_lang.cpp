@@ -176,6 +176,8 @@ void export_lang(py::module &m) {
                      &CompileConfig::spirv_parallel_codegen)
       .def_readwrite("spirv_skip_loop_unroll",
                      &CompileConfig::spirv_skip_loop_unroll)
+      .def_readwrite("vulkan_sparse_experimental",
+                     &CompileConfig::vulkan_sparse_experimental)
       .def_readwrite("spirv_disabled_passes",
                      &CompileConfig::spirv_disabled_passes)
       .def_readwrite("compile_dag_scheduler",

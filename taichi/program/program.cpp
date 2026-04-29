@@ -136,6 +136,12 @@ Program::Program(Arch desired_arch) : snode_rw_accessors_bank_(this) {
   // program_impl_ should be set in the if-else branch above
   TI_ASSERT(program_impl_);
 
+  // Phase 1c-D: propagate the user's vulkan_sparse_experimental opt-in to
+  // the process-global extension table BEFORE any is_extension_supported()
+  // query (the very next block already calls it for Extension::assertion).
+  // Sticky once true; OR'd with the legacy TI_VULKAN_SPARSE env var.
+  set_vulkan_sparse_experimental(config.vulkan_sparse_experimental);
+
   Device *compute_device = nullptr;
   compute_device = program_impl_->get_compute_device();
   // Must have handled all the arch fallback logic by this point.
