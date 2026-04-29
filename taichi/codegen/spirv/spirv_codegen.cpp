@@ -579,8 +579,20 @@ class TaskCodegen : public IRVisitor {
         const auto *loop_sn = stmt->loop->as<OffloadedStmt>()->snode;
         TI_ASSERT(loop_sn != nullptr);
         const int axis = stmt->index;
-        const int acc_shape = loop_sn->extractors[axis].acc_shape;
-        const int shape = loop_sn->extractors[axis].shape;
+        // Phase 1d-A: the listgen emits a flat index relative to the entire
+        // path from root down to the loop SNode, so the per-axis shape used
+        // in decoding must be the cumulative `num_elements_from_root` rather
+        // than the leaf SNode's local extractor.shape. For depth-1 layouts
+        // (Phase 1b/1c) the two values are identical, so this remains
+        // backward compatible.
+        const int shape =
+            (int)loop_sn->extractors[axis].num_elements_from_root;
+        int acc_shape = 1;
+        for (int j = taichi_max_num_indices - 1; j > axis; --j) {
+          int64_t s = loop_sn->extractors[j].num_elements_from_root;
+          if (s > 1)
+            acc_shape *= (int)s;
+        }
         spirv::Value val = flat;
         if (acc_shape > 1) {
           val = ir_->make_value(
@@ -2237,64 +2249,94 @@ class TaskCodegen : public IRVisitor {
     task_attribs_.texture_binds = get_texture_binds();
   }
 
-  // Phase 1b (taichi-forge 0.3.x): SPIR-V codegen for OffloadedTaskType::listgen.
-  // Scope: scans a bitmasked SNode's mask word array and writes flat indices
-  // of active cells into the (single, 32 MiB) listgen buffer. Only depth-1
-  // bitmasked SNodes (direct children of root) are supported. Trivial root
-  // listgen (parent == root) emits an empty kernel: the next listgen task
-  // overwrites the buffer anyway, and the runtime zero-fills the buffer
-  // before each listgen dispatch.
+  // Phase 1b/1c/1d (taichi-forge 0.3.x): SPIR-V codegen for
+  // OffloadedTaskType::listgen. Scope:
+  //   * Phase 1b/1c: depth-1 bitmasked (parent == root, child == bitmasked).
+  //   * Phase 1d:   nested SNode paths consisting of dense/bitmasked nodes,
+  //                 e.g. root.dense.bitmasked, root.bitmasked.bitmasked,
+  //                 root.bitmasked.dense, etc.
+  //
+  // A single 32 MiB listgen buffer holds [count, idx0, idx1, ...] of *flat*
+  // global cell indices. The struct_for kernel grid-strides over this list
+  // and consumes the indices via "ii".
+  //
+  // The compiler emits one OffloadedStmt(listgen) per non-root SNode along
+  // the path (root -> leaf->parent). Only the LAST listgen task in the chain
+  // matters: each listgen task overwrites listgen_buffer, and the runtime
+  // zero-fills listgen_buffer before every listgen dispatch
+  // (taichi/runtime/gfx/runtime.cpp). Intermediate listgen tasks therefore
+  // emit a no-op kernel; the final listgen task (whose snode's children are
+  // all places, i.e. the leaf-parent) runs the full ancestor-mask AND scan
+  // and writes the active flat indices.
   void generate_listgen_kernel(OffloadedStmt *stmt) {
-    // |stmt->snode| is the SNode being listgen'd (the child); its parent is
-    // the SNode whose container we scan into. For Phase 1b we only support
-    // depth-1 bitmasked (parent == root, child == bitmasked).
     auto *child_sn = stmt->snode;
-    auto *parent_sn = child_sn->parent;
-    TI_ASSERT(parent_sn != nullptr);
+    TI_ASSERT(child_sn != nullptr);
+    TI_ASSERT(child_sn->parent != nullptr);
 
     task_attribs_.name = task_name_;
     task_attribs_.task_type = OffloadedTaskType::listgen;
 
     ir_->start_function(kernel_function_);
 
-    TI_ERROR_IF(child_sn->type != SNodeType::bitmasked,
-                "SPIR-V listgen for child SNode type '{}' is not implemented "
-                "(Phase 1b supports only bitmasked).",
-                snode_type_name(child_sn->type));
-    TI_ERROR_IF(parent_sn->type != SNodeType::root,
-                "SPIR-V listgen for nested bitmasked is not yet supported "
-                "(Phase 1b). Bitmasked SNodes must be a direct child of root.");
+    // Build path from the topmost non-root ancestor down to child_sn.
+    std::vector<SNode *> path;
+    for (auto *sn = child_sn; sn != nullptr && sn->type != SNodeType::root;
+         sn = sn->parent) {
+      path.push_back(sn);
+    }
+    std::reverse(path.begin(), path.end());
+    TI_ASSERT(!path.empty());
+
+    // Phase 1d only handles dense + bitmasked nodes. Reject anything else
+    // (pointer / dynamic / hash / quant_array) early with a clear message.
+    for (auto *sn : path) {
+      TI_ERROR_IF(sn->type != SNodeType::dense &&
+                      sn->type != SNodeType::bitmasked,
+                  "SPIR-V listgen for SNode type '{}' is not implemented "
+                  "(Phase 1d supports only dense + bitmasked).",
+                  snode_type_name(sn->type));
+    }
 
     const int root_id = snode_to_root_.at(child_sn->id);
     const auto &snode_descs = compiled_structs_[root_id].snode_descriptors;
-    const auto &child_desc = snode_descs.at(child_sn->id);
 
-    const size_t child_byte_offset = child_sn->offset_bytes_in_parent_cell;
-    const size_t child_num_cells = child_sn->num_cells_per_container;
-    const size_t child_cell_stride = child_desc.cell_stride;
-    const size_t mask_area_byte_offset =
-        child_byte_offset + child_cell_stride * child_num_cells;
-    const size_t parent_num_cells = child_num_cells;  // alias used below
+    // Always reference the listgen buffer so its binding is registered. We
+    // need this even for the no-op intermediate kernels so the runtime
+    // zero-fill loop can find it (and so dispatch validation passes).
+    auto listgen_buffer =
+        get_buffer_value(BufferType::ListGen, PrimitiveType::u32);
+    (void)listgen_buffer;
 
-    task_attribs_.advisory_total_num_threads = child_num_cells;
+    // A listgen task lists active elements of `child_sn` at its own depth in
+    // the SNode tree. For Phase 1d we always do the full ancestor-mask AND
+    // scan and emit `child_sn`-flat-global-axis indices, regardless of
+    // whether `child_sn`'s children are places. The struct_for that
+    // ultimately consumes the listgen output binds to the last listgen of
+    // its chain, and the runtime zero-fills listgen_buffer before each
+    // dispatch (taichi/runtime/gfx/runtime.cpp), so prior listgens in the
+    // same chain are simply overwritten.
+
+    // ----- Full scan over path -----
+    const int n = (int)path.size();
+    size_t total_cells = 1;
+    for (auto *sn : path) total_cells *= sn->num_cells_per_container;
+
+    task_attribs_.advisory_total_num_threads = (int)total_cells;
     task_attribs_.advisory_num_threads_per_group =
-        std::min<int>(128, (int)child_num_cells);
+        std::min<int>(128, (int)total_cells);
     if (task_attribs_.advisory_num_threads_per_group == 0) {
       task_attribs_.advisory_num_threads_per_group = 1;
     }
 
     auto root_buffer = get_buffer_value(BufferInfo(BufferType::Root, root_id),
                                         PrimitiveType::u32);
-    auto listgen_buffer =
-        get_buffer_value(BufferType::ListGen, PrimitiveType::u32);
 
     auto u32_t = ir_->u32_type();
 
     auto gid = ir_->cast(u32_t, ir_->get_global_invocation_id(0));
-    auto num_cells_const =
-        ir_->uint_immediate_number(u32_t, parent_num_cells);
+    auto num_cells_const = ir_->uint_immediate_number(u32_t, total_cells);
 
-    // if (gid < parent_num_cells) { ... }
+    // if (gid < total_cells) { ... }
     spirv::Label in_bounds = ir_->new_label();
     spirv::Label after_bounds = ir_->new_label();
     auto in_bounds_cond = ir_->make_value(spv::OpULessThan, ir_->bool_type(),
@@ -2305,56 +2347,188 @@ class TaskCodegen : public IRVisitor {
                    after_bounds);
     ir_->start_label(in_bounds);
 
-    // word_idx = gid >> 5; bit_idx = gid & 31
-    auto word_idx =
-        ir_->make_value(spv::OpShiftRightLogical, u32_t, gid,
-                        ir_->uint_immediate_number(u32_t, 5));
-    auto bit_idx =
-        ir_->make_value(spv::OpBitwiseAnd, u32_t, gid,
-                        ir_->uint_immediate_number(u32_t, 31));
+    // Decode per-level cell index: i_path[k] = (gid / acc[k]) % shape[k]
+    // with acc[n-1] = 1 and acc[k] = acc[k+1] * shape[k+1] (row-major).
+    std::vector<size_t> shape(n), acc(n);
+    for (int k = 0; k < n; ++k) {
+      shape[k] = path[k]->num_cells_per_container;
+    }
+    acc[n - 1] = 1;
+    for (int k = n - 2; k >= 0; --k) acc[k] = acc[k + 1] * shape[k + 1];
 
-    // mask_word_byte_addr = mask_area_byte_offset + word_idx * 4
-    auto word_byte_offset =
-        ir_->make_value(spv::OpShiftLeftLogical, u32_t, word_idx,
-                        ir_->uint_immediate_number(u32_t, 2));
-    auto mask_word_byte_addr = ir_->add(
-        ir_->uint_immediate_number(u32_t, (uint32_t)mask_area_byte_offset),
-        word_byte_offset);
-    auto mask_word_u32_idx =
-        ir_->make_value(spv::OpShiftRightLogical, u32_t, mask_word_byte_addr,
-                        ir_->uint_immediate_number(u32_t, 2));
-    auto mask_word_ptr =
-        ir_->struct_array_access(u32_t, root_buffer, mask_word_u32_idx);
-    auto mask_word = ir_->load_variable(mask_word_ptr, u32_t);
+    std::vector<spirv::Value> i_path(n);
+    for (int k = 0; k < n; ++k) {
+      if (shape[k] == 1) {
+        // Single-cell container -- index is always 0. Forcing the constant
+        // here matters because the mod-by-1 elision would otherwise leak
+        // bits from `gid` into bit-position / word-index math downstream.
+        i_path[k] = ir_->uint_immediate_number(u32_t, 0);
+        continue;
+      }
+      spirv::Value v = gid;
+      if (acc[k] > 1) {
+        v = ir_->make_value(spv::OpUDiv, u32_t, v,
+                            ir_->uint_immediate_number(u32_t, acc[k]));
+      }
+      v = ir_->make_value(spv::OpUMod, u32_t, v,
+                          ir_->uint_immediate_number(u32_t, shape[k]));
+      i_path[k] = v;
+    }
 
-    auto shifted = ir_->make_value(spv::OpShiftRightLogical, u32_t, mask_word,
-                                   bit_idx);
-    auto bit = ir_->make_value(spv::OpBitwiseAnd, u32_t, shifted,
-                               ir_->uint_immediate_number(u32_t, 1));
-    auto active = ir_->make_value(spv::OpUGreaterThan, ir_->bool_type(), bit,
-                                  ir_->uint_immediate_number(u32_t, 0));
+    // Walk path computing the running container address and ANDing every
+    // bitmasked ancestor's active bit.
+    //
+    // addr starts at path[0].mem_offset_in_parent_cell, since root has a
+    // single cell at offset 0 and path[0] is a child of root.
+    //
+    // For each step k:
+    //   * if path[k] is bitmasked, mask_area = addr + cell_stride * num_cells
+    //     and check bit (i_path[k] >> 5) word, (i_path[k] & 31) bit.
+    //   * if k < n-1, advance:
+    //       addr = addr + i_path[k] * cell_stride
+    //                   + path[k+1].mem_offset_in_parent_cell
+    spirv::Value addr = ir_->uint_immediate_number(
+        u32_t,
+        (uint32_t)snode_descs.at(path[0]->id).mem_offset_in_parent_cell);
 
+    spirv::Value active = ir_->uint_immediate_number(u32_t, 1);
+
+    for (int k = 0; k < n; ++k) {
+      const auto &desc_k = snode_descs.at(path[k]->id);
+      if (path[k]->type == SNodeType::bitmasked) {
+        auto mask_area_offset_const = ir_->uint_immediate_number(
+            u32_t,
+            (uint32_t)(desc_k.cell_stride * path[k]->num_cells_per_container));
+        auto mask_area = ir_->add(addr, mask_area_offset_const);
+        auto word_idx = ir_->make_value(
+            spv::OpShiftRightLogical, u32_t, i_path[k],
+            ir_->uint_immediate_number(u32_t, 5));
+        auto word_byte_offset = ir_->make_value(
+            spv::OpShiftLeftLogical, u32_t, word_idx,
+            ir_->uint_immediate_number(u32_t, 2));
+        auto word_byte_addr = ir_->add(mask_area, word_byte_offset);
+        auto word_u32_idx = ir_->make_value(
+            spv::OpShiftRightLogical, u32_t, word_byte_addr,
+            ir_->uint_immediate_number(u32_t, 2));
+        auto word_ptr =
+            ir_->struct_array_access(u32_t, root_buffer, word_u32_idx);
+        auto mask_word = ir_->load_variable(word_ptr, u32_t);
+        auto bit_idx = ir_->make_value(
+            spv::OpBitwiseAnd, u32_t, i_path[k],
+            ir_->uint_immediate_number(u32_t, 31));
+        auto shifted = ir_->make_value(spv::OpShiftRightLogical, u32_t,
+                                       mask_word, bit_idx);
+        auto bit = ir_->make_value(spv::OpBitwiseAnd, u32_t, shifted,
+                                   ir_->uint_immediate_number(u32_t, 1));
+        active = ir_->make_value(spv::OpBitwiseAnd, u32_t, active, bit);
+      }
+
+      if (k < n - 1) {
+        auto cell_stride_v =
+            ir_->uint_immediate_number(u32_t, (uint32_t)desc_k.cell_stride);
+        auto step = ir_->mul(i_path[k], cell_stride_v);
+        addr = ir_->add(addr, step);
+        addr = ir_->add(
+            addr,
+            ir_->uint_immediate_number(
+                u32_t, (uint32_t)snode_descs.at(path[k + 1]->id)
+                           .mem_offset_in_parent_cell));
+      }
+    }
+
+    auto active_cond = ir_->make_value(spv::OpUGreaterThan, ir_->bool_type(),
+                                       active,
+                                       ir_->uint_immediate_number(u32_t, 0));
     spirv::Label active_label = ir_->new_label();
     spirv::Label after_active = ir_->new_label();
     ir_->make_inst(spv::OpSelectionMerge, after_active,
                    spv::SelectionControlMaskNone);
-    ir_->make_inst(spv::OpBranchConditional, active, active_label,
+    ir_->make_inst(spv::OpBranchConditional, active_cond, active_label,
                    after_active);
     ir_->start_label(active_label);
 
-    // slot = atomicAdd(listgen_buffer[0], 1)
+    // Compute the *globally* flat axis index expected by the loop body's
+    // LoopIndexStmt decoder. The decoder uses leaf->num_elements_from_root
+    // per axis, so we must emit:
+    //   flat_global = sum_a global_axis[a] * (prod_{a'>a} num_from_root[a'])
+    // where global_axis[a] = sum_k local_axis_a_k * (prod_{k'>k} shape_a_k')
+    // and local_axis_a_k decomposes i_path[k] within level k's container
+    // using that level's own extractors.
+    //
+    // Important: an axis is "active" for the listgen output iff *any* level
+    // along the path activates it. The leaf SNode's `extractors[a].active`
+    // alone is insufficient for mixed-axis nested layouts (e.g.
+    // `bitmasked(ij, ...).bitmasked(i, ...)` where the leaf does not
+    // activate `j` itself but `j` still carries a non-trivial shape from
+    // the ancestor). Use the path-wide union.
+    bool path_active[taichi_max_num_indices] = {};
+    for (int kk = 0; kk < n; ++kk) {
+      for (int a = 0; a < taichi_max_num_indices; ++a) {
+        if (path[kk]->extractors[a].active) path_active[a] = true;
+      }
+    }
+
+    std::vector<spirv::Value> global_axis(taichi_max_num_indices);
+    for (int a = 0; a < taichi_max_num_indices; ++a) {
+      global_axis[a] = ir_->uint_immediate_number(u32_t, 0);
+    }
+    for (int k = 0; k < n; ++k) {
+      for (int a = 0; a < taichi_max_num_indices; ++a) {
+        if (!path[k]->extractors[a].active) continue;
+        int local_acc = path[k]->extractors[a].acc_shape;
+        int local_shape = path[k]->extractors[a].shape;
+        spirv::Value local = i_path[k];
+        if (local_acc > 1) {
+          local = ir_->make_value(
+              spv::OpUDiv, u32_t, local,
+              ir_->uint_immediate_number(u32_t, local_acc));
+        }
+        if (local_shape > 1) {
+          local = ir_->make_value(
+              spv::OpUMod, u32_t, local,
+              ir_->uint_immediate_number(u32_t, local_shape));
+        }
+        int desc_prod = 1;
+        for (int kk = k + 1; kk < n; ++kk) {
+          if (path[kk]->extractors[a].active)
+            desc_prod *= path[kk]->extractors[a].shape;
+        }
+        if (desc_prod > 1) {
+          local = ir_->mul(
+              local, ir_->uint_immediate_number(u32_t, desc_prod));
+        }
+        global_axis[a] = ir_->add(global_axis[a], local);
+      }
+    }
+    spirv::Value flat_global = ir_->uint_immediate_number(u32_t, 0);
+    for (int a = 0; a < taichi_max_num_indices; ++a) {
+      if (!path_active[a]) continue;
+      int axis_acc = 1;
+      for (int aa = a + 1; aa < taichi_max_num_indices; ++aa) {
+        if (path_active[aa])
+          axis_acc *=
+              (int)child_sn->extractors[aa].num_elements_from_root;
+      }
+      spirv::Value contrib = global_axis[a];
+      if (axis_acc > 1) {
+        contrib = ir_->mul(
+            contrib, ir_->uint_immediate_number(u32_t, axis_acc));
+      }
+      flat_global = ir_->add(flat_global, contrib);
+    }
+
+    // slot = atomicAdd(listgen_buffer[0], 1); listgen_buffer[1 + slot] = flat_global
     auto count_ptr = ir_->struct_array_access(u32_t, listgen_buffer,
                                               ir_->const_i32_zero_);
     auto slot = ir_->make_value(spv::OpAtomicIAdd, u32_t, count_ptr,
                                 /*scope=*/ir_->const_i32_one_,
                                 /*semantics=*/ir_->const_i32_zero_,
                                 ir_->uint_immediate_number(u32_t, 1));
-    // listgen_buffer[1 + slot] = gid
     auto idx_in_buffer =
         ir_->add(slot, ir_->uint_immediate_number(u32_t, 1));
     auto idx_ptr =
         ir_->struct_array_access(u32_t, listgen_buffer, idx_in_buffer);
-    ir_->store_variable(idx_ptr, gid);
+    ir_->store_variable(idx_ptr, flat_global);
 
     ir_->make_inst(spv::OpBranch, after_active);
     ir_->start_label(after_active);
