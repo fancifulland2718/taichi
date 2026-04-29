@@ -144,6 +144,8 @@ class TaskCodegen : public IRVisitor {
       generate_range_for_kernel(task_ir_);
     } else if (task_ir_->task_type == OffloadedTaskType::struct_for) {
       generate_struct_for_kernel(task_ir_);
+    } else if (task_ir_->task_type == OffloadedTaskType::listgen) {
+      generate_listgen_kernel(task_ir_);
     } else {
       TI_ERROR("Unsupported offload type={} on SPIR-V codegen",
                task_ir_->task_name());
@@ -361,6 +363,16 @@ class TaskCodegen : public IRVisitor {
     ir_->register_value(stmt->raw_name(), root_val);
   }
 
+  void visit(ClearListStmt *stmt) override {
+    // No-op on SPIR-V/GFX backend. The runtime fills the listgen buffer with
+    // zeros at dispatch time of the corresponding listgen task
+    // (see taichi/runtime/gfx/runtime.cpp `if (attribs.task_type ==
+    // OffloadedTaskType::listgen) { ... buffer_fill(0) ... }`). The
+    // ClearListStmt thus appears in a serial offload that emits an empty
+    // kernel here.
+    (void)stmt;
+  }
+
   void visit(GetChStmt *stmt) override {
     // TODO: GetChStmt -> GetComponentStmt ?
     const int root = snode_to_root_.at(stmt->input_snode->id);
@@ -553,6 +565,16 @@ class TaskCodegen : public IRVisitor {
         TI_ASSERT(stmt->index == 0);
         spirv::Value loop_var = ir_->query_value("ii");
         // spirv::Value val = ir_->add(loop_var, ir_->const_i32_zero_);
+        ir_->register_value(stmt_name, loop_var);
+      } else if (type == OffloadedTaskType::struct_for) {
+        // Phase 1b: single-axis bitmasked at depth-1. The listgen kernel
+        // emits flat cell indices into "ii"; for a 1D bitmasked SNode that
+        // index is exactly the i-coordinate. Multi-axis decoding is deferred.
+        TI_ERROR_IF(stmt->index != 0,
+                    "SPIR-V struct_for over multi-axis bitmasked SNodes is "
+                    "not yet supported. Use a single-axis bitmasked SNode for "
+                    "now (Phase 1b).");
+        spirv::Value loop_var = ir_->query_value("ii");
         ir_->register_value(stmt_name, loop_var);
       } else {
         TI_NOT_IMPLEMENTED;
@@ -2191,6 +2213,137 @@ class TaskCodegen : public IRVisitor {
 
     ir_->make_inst(spv::OpReturn);       // return;
     ir_->make_inst(spv::OpFunctionEnd);  // } Close kernel
+
+    task_attribs_.buffer_binds = get_buffer_binds();
+    task_attribs_.texture_binds = get_texture_binds();
+  }
+
+  // Phase 1b (taichi-forge 0.3.x): SPIR-V codegen for OffloadedTaskType::listgen.
+  // Scope: scans a bitmasked SNode's mask word array and writes flat indices
+  // of active cells into the (single, 32 MiB) listgen buffer. Only depth-1
+  // bitmasked SNodes (direct children of root) are supported. Trivial root
+  // listgen (parent == root) emits an empty kernel: the next listgen task
+  // overwrites the buffer anyway, and the runtime zero-fills the buffer
+  // before each listgen dispatch.
+  void generate_listgen_kernel(OffloadedStmt *stmt) {
+    // |stmt->snode| is the SNode being listgen'd (the child); its parent is
+    // the SNode whose container we scan into. For Phase 1b we only support
+    // depth-1 bitmasked (parent == root, child == bitmasked).
+    auto *child_sn = stmt->snode;
+    auto *parent_sn = child_sn->parent;
+    TI_ASSERT(parent_sn != nullptr);
+
+    task_attribs_.name = task_name_;
+    task_attribs_.task_type = OffloadedTaskType::listgen;
+
+    ir_->start_function(kernel_function_);
+
+    TI_ERROR_IF(child_sn->type != SNodeType::bitmasked,
+                "SPIR-V listgen for child SNode type '{}' is not implemented "
+                "(Phase 1b supports only bitmasked).",
+                snode_type_name(child_sn->type));
+    TI_ERROR_IF(parent_sn->type != SNodeType::root,
+                "SPIR-V listgen for nested bitmasked is not yet supported "
+                "(Phase 1b). Bitmasked SNodes must be a direct child of root.");
+
+    const int root_id = snode_to_root_.at(child_sn->id);
+    const auto &snode_descs = compiled_structs_[root_id].snode_descriptors;
+    const auto &child_desc = snode_descs.at(child_sn->id);
+
+    const size_t child_byte_offset = child_sn->offset_bytes_in_parent_cell;
+    const size_t child_num_cells = child_sn->num_cells_per_container;
+    const size_t child_cell_stride = child_desc.cell_stride;
+    const size_t mask_area_byte_offset =
+        child_byte_offset + child_cell_stride * child_num_cells;
+    const size_t parent_num_cells = child_num_cells;  // alias used below
+
+    task_attribs_.advisory_total_num_threads = child_num_cells;
+    task_attribs_.advisory_num_threads_per_group =
+        std::min<int>(128, (int)child_num_cells);
+    if (task_attribs_.advisory_num_threads_per_group == 0) {
+      task_attribs_.advisory_num_threads_per_group = 1;
+    }
+
+    auto root_buffer = get_buffer_value(BufferInfo(BufferType::Root, root_id),
+                                        PrimitiveType::u32);
+    auto listgen_buffer =
+        get_buffer_value(BufferType::ListGen, PrimitiveType::u32);
+
+    auto u32_t = ir_->u32_type();
+
+    auto gid = ir_->cast(u32_t, ir_->get_global_invocation_id(0));
+    auto num_cells_const =
+        ir_->uint_immediate_number(u32_t, parent_num_cells);
+
+    // if (gid < parent_num_cells) { ... }
+    spirv::Label in_bounds = ir_->new_label();
+    spirv::Label after_bounds = ir_->new_label();
+    auto in_bounds_cond = ir_->make_value(spv::OpULessThan, ir_->bool_type(),
+                                          gid, num_cells_const);
+    ir_->make_inst(spv::OpSelectionMerge, after_bounds,
+                   spv::SelectionControlMaskNone);
+    ir_->make_inst(spv::OpBranchConditional, in_bounds_cond, in_bounds,
+                   after_bounds);
+    ir_->start_label(in_bounds);
+
+    // word_idx = gid >> 5; bit_idx = gid & 31
+    auto word_idx =
+        ir_->make_value(spv::OpShiftRightLogical, u32_t, gid,
+                        ir_->uint_immediate_number(u32_t, 5));
+    auto bit_idx =
+        ir_->make_value(spv::OpBitwiseAnd, u32_t, gid,
+                        ir_->uint_immediate_number(u32_t, 31));
+
+    // mask_word_byte_addr = mask_area_byte_offset + word_idx * 4
+    auto word_byte_offset =
+        ir_->make_value(spv::OpShiftLeftLogical, u32_t, word_idx,
+                        ir_->uint_immediate_number(u32_t, 2));
+    auto mask_word_byte_addr = ir_->add(
+        ir_->uint_immediate_number(u32_t, (uint32_t)mask_area_byte_offset),
+        word_byte_offset);
+    auto mask_word_u32_idx =
+        ir_->make_value(spv::OpShiftRightLogical, u32_t, mask_word_byte_addr,
+                        ir_->uint_immediate_number(u32_t, 2));
+    auto mask_word_ptr =
+        ir_->struct_array_access(u32_t, root_buffer, mask_word_u32_idx);
+    auto mask_word = ir_->load_variable(mask_word_ptr, u32_t);
+
+    auto shifted = ir_->make_value(spv::OpShiftRightLogical, u32_t, mask_word,
+                                   bit_idx);
+    auto bit = ir_->make_value(spv::OpBitwiseAnd, u32_t, shifted,
+                               ir_->uint_immediate_number(u32_t, 1));
+    auto active = ir_->make_value(spv::OpUGreaterThan, ir_->bool_type(), bit,
+                                  ir_->uint_immediate_number(u32_t, 0));
+
+    spirv::Label active_label = ir_->new_label();
+    spirv::Label after_active = ir_->new_label();
+    ir_->make_inst(spv::OpSelectionMerge, after_active,
+                   spv::SelectionControlMaskNone);
+    ir_->make_inst(spv::OpBranchConditional, active, active_label,
+                   after_active);
+    ir_->start_label(active_label);
+
+    // slot = atomicAdd(listgen_buffer[0], 1)
+    auto count_ptr = ir_->struct_array_access(u32_t, listgen_buffer,
+                                              ir_->const_i32_zero_);
+    auto slot = ir_->make_value(spv::OpAtomicIAdd, u32_t, count_ptr,
+                                /*scope=*/ir_->const_i32_one_,
+                                /*semantics=*/ir_->const_i32_zero_,
+                                ir_->uint_immediate_number(u32_t, 1));
+    // listgen_buffer[1 + slot] = gid
+    auto idx_in_buffer =
+        ir_->add(slot, ir_->uint_immediate_number(u32_t, 1));
+    auto idx_ptr =
+        ir_->struct_array_access(u32_t, listgen_buffer, idx_in_buffer);
+    ir_->store_variable(idx_ptr, gid);
+
+    ir_->make_inst(spv::OpBranch, after_active);
+    ir_->start_label(after_active);
+    ir_->make_inst(spv::OpBranch, after_bounds);
+    ir_->start_label(after_bounds);
+
+    ir_->make_inst(spv::OpReturn);
+    ir_->make_inst(spv::OpFunctionEnd);
 
     task_attribs_.buffer_binds = get_buffer_binds();
     task_attribs_.texture_binds = get_texture_binds();
