@@ -171,9 +171,52 @@ The build is driven entirely by `pyproject.toml` / `scikit-build-core`. On Windo
 
 Taichi Forge uses its own SemVer track starting at **0.1.2**. Fork release numbers do **not** match upstream `taichi` versions.
 
-- `0.1.x` — LLVM 20 + VS 2026 + Python 3.14 + compile-performance improvements. Backends: Linux/Windows x86_64, CUDA, Vulkan, OpenGL, GLES, CPU.
-- `0.2.x` — deeper compile-time upgrades.
-- `0.3.x` — future, potential runtime and architecture changes (e.g. RHI unification, C++20 features).
+- `0.1.x` — LLVM 20 + VS 2026 + Python 3.14 + initial compile-performance improvements. Backends: Linux/Windows x86_64, CUDA, Vulkan, OpenGL, GLES, CPU.
+- `0.2.x` — deeper compile-time, runtime cache, and toolchain modernization. **Current line.**
+- `0.3.x` — planned: additional feature support on top of the 0.2.x stabilization line.
+
+---
+
+## Release notes
+
+### 0.2.4 (current)
+
+This release rolls up the full 0.2.x compile-time, runtime-cache, IR-pass, and dependency-modernization work into a single wheel. All new behaviour is opt-in via `ti.init(...)` / `CompileConfig` knobs (already documented above); defaults remain bit-identical to upstream Taichi 1.7.4.
+
+**Compile-time performance**
+
+- Fused-pass driver: `use_fused_passes` adds a `pipeline_dirty` short-circuit around `full_simplify` so that no-op iterations are skipped. Measured ~48.6% of `full_simplify` invocations are observably no-op on representative workloads.
+- Tiered `full_simplify` (`tiered_full_simplify`, default on): splits the legacy fixed-point loop into a local fixed-point phase plus a single global round per outer iteration, while preserving final IR.
+- DAG-aware scheduler for `ti.compile_kernels` (`compile_dag_scheduler`, default on): balances the inner LLVM thread pool against the outer kernel pool to avoid thread oversubscription on batch warm-up.
+- Single-offload bypass on the LLVM CPU path: removes the prior 0.89× CPU regression introduced by earlier batch-compile work.
+- Per-kernel `opt_level=` override and `compile_tier="fast"|"balanced"|"full"` presets, with isolated cache keys so mixed-tier batches do not poison each other.
+- SPIR-V pipeline gains a per-call `spirv_disabled_passes` allowlist, with cache-key isolation. Disabling `loop-unroll` alone gives ~54% SPIR-V codegen wall-time reduction on the validated Vulkan suite; disabling the three heaviest passes gives ~61%, with byte-identical kernel results.
+- Optional task-level parallel SPIR-V codegen per kernel (`spirv_parallel_codegen`).
+- Auto real-function promotion (`auto_real_function` + `auto_real_function_threshold_us`) and budget-aware inlining fallback in the LLVM-only path; both default off.
+
+**Offline cache and runtime caches**
+
+- Parallel disk-read for offline cache: metadata-hit but ckd-miss path now reads outside the cache mutex and serializes duplicate requests via an in-progress key set. Validated 12-kernel × Vulkan double-process cold start: 290.1 ms (prime) → 83.1 ms (hit), **3.49× faster** with byte-identical per-kernel artifacts.
+- `CompileConfig` key audit + offline-cache schema versioning: unrecognized cache versions now fall back to recompile cleanly instead of crashing.
+- `rhi_cache.bin` now uses atomic write-then-rename to eliminate half-written cache files after abrupt termination.
+
+**IR / passes**
+
+- `pipeline_dirty` is now explicit and OR-combined across the five mutating passes that can dirty the pipeline, removing spurious dirty marks at no-op call sites. Validated across CPU / CUDA / Vulkan smoke matrices with no regression.
+- Defensive `assert` + "type-query forbidden zone" notes on `linking_context_data->llvm_context` to catch accidental cross-context type queries early.
+
+**Toolchain and third-party libraries**
+
+- `spdlog` 1.14.1 → 1.15.3.
+- `Vulkan-Headers` / `volk` / `SPIRV-Headers` / `SPIRV-Tools` aligned to **Vulkan SDK 1.4.341** as a single coordinated bump.
+- `googletest` 1.10.0 → 1.17.0 (test-only, no runtime impact).
+- `glm` 0.9.9.8+187 → **1.0.3**.
+- `imgui` v1.84 (WIP) → **v1.91.9b** (non-docking branch). The Vulkan backend was migrated to the new `ImGui_ImplVulkan_InitInfo` layout (`RenderPass` + `ApiVersion` fields, self-managed font texture, `LoadFunctions(api_version, loader)` signature). GGUI visual-regression suite: **90 / 90 passing** on Vulkan + CUDA backends.
+
+**Compatibility**
+
+- All public Python and C-API surfaces from upstream Taichi 1.7.4 remain unchanged. New configuration knobs are additive; their defaults preserve pre-fork behaviour.
+- Build toolchain: LLVM 20.1.7, MSVC 14.50+ (VS 2026), Python 3.10–3.14 — unchanged from 0.1.x.
 
 ---
 
