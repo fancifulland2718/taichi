@@ -72,3 +72,19 @@ option(TI_VULKAN_DYNAMIC
 if(TI_VULKAN_DYNAMIC)
   target_compile_definitions(spirv_codegen PRIVATE TI_VULKAN_DYNAMIC=1)
 endif()
+
+# G2 (2026-04-30): allow shrinking pointer-pool capacity at materialization
+# time via the TI_VULKAN_POOL_FRACTION env var (default 1.0 = legacy
+# worst-case reservation). When the flag is OFF the env var is ignored and
+# the pool always reserves total_num_cells_from_root cells per pointer
+# SNode, byte-identical to the pre-G2 layout. Combined with G1.b
+# freelist recycling, lower fractions trade memory for the assumption that
+# steady-state activations stay below the worst case; out-of-capacity
+# activations gracefully fall back to slot=0 (silent inactive) per the
+# existing cap_v guard. Default ON because the env var alone defaults to
+# 1.0; users opting in must set TI_VULKAN_POOL_FRACTION explicitly.
+option(TI_VULKAN_POINTER_POOL_FRACTION
+  "Enable TI_VULKAN_POOL_FRACTION env var to shrink pointer-pool capacity" ON)
+if(TI_VULKAN_POINTER_POOL_FRACTION)
+  target_compile_definitions(spirv_codegen PRIVATE TI_VULKAN_POINTER_POOL_FRACTION=1)
+endif()

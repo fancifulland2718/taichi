@@ -1,8 +1,42 @@
 #include "taichi/codegen/spirv/snode_struct_compiler.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 namespace taichi::lang {
 namespace spirv {
 namespace {
+
+#if defined(TI_VULKAN_POINTER_POOL_FRACTION)
+// G2 (2026-04-30): allow shrinking the pool capacity reserved for pointer
+// SNodes via the TI_VULKAN_POOL_FRACTION env var. Default = 1.0 (the legacy
+// behaviour, byte-identical to the OFF path). Lower fractions trade memory
+// for the assumption that the user's working set is far below the
+// worst-case product of nested pointer dimensions; combined with G1.b
+// freelist recycling, deactivated cells return to the pool so steady-state
+// occupancy — not peak — drives the actual demand. Out-of-capacity
+// activations fall back to slot=0 (silent inactive) per the existing
+// cap_v guard in pointer_lookup_or_activate; this is the same safe
+// degradation as `ti.activate` racing past the watermark.
+//
+// Read once on first call and cached. Invalid / unset / out-of-range
+// values (<= 0 or > 1) are treated as 1.0.
+static double get_pool_fraction() {
+  static double cached = []() -> double {
+    const char *env = std::getenv("TI_VULKAN_POOL_FRACTION");
+    if (!env) {
+      return 1.0;
+    }
+    char *end = nullptr;
+    const double v = std::strtod(env, &end);
+    if (end == env || v <= 0.0 || v > 1.0) {
+      return 1.0;
+    }
+    return v;
+  }();
+  return cached;
+}
+#endif
 
 class StructCompiler {
  public:
@@ -29,7 +63,20 @@ class StructCompiler {
       // silently corrupt nested pointer trees (e.g. pointer.pointer.dense)
       // where the same descriptor is re-instantiated under every parent
       // cell.
-      const size_t capacity = desc.total_num_cells_from_root;
+      size_t capacity = desc.total_num_cells_from_root;
+#if defined(TI_VULKAN_POINTER_POOL_FRACTION)
+      // G2: shrink to user-specified fraction of the worst case. Lower
+      // bound by num_cells_per_container so the smallest sane case
+      // (single instance) is never under-provisioned.
+      const double frac = get_pool_fraction();
+      if (frac < 1.0) {
+        const size_t scaled = static_cast<size_t>(
+            static_cast<double>(capacity) * frac + 0.5);
+        const size_t lower_bound =
+            static_cast<size_t>(desc.snode->num_cells_per_container);
+        capacity = std::max<size_t>(scaled, lower_bound);
+      }
+#endif
       const size_t cell_bytes = desc.cell_stride;
       // u32 alignment for atomic ops on the watermark (root_size is already a
       // multiple of 4 because every preceding container size is, but be
