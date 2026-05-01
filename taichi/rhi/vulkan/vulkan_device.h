@@ -599,6 +599,9 @@ class VulkanStream : public Stream {
 
 struct VulkanCapabilities {
   uint32_t vk_api_version{0};
+  // C-2.4.c: VkPhysicalDeviceLimits::maxPerStageDescriptorStorageBuffers,
+  // 0 = not yet probed.
+  uint32_t max_per_stage_descriptor_storage_buffers{0};
   bool physical_device_features2{false};
   bool external_memory{false};
   bool wide_line{false};
@@ -740,6 +743,15 @@ class TI_DLL_EXPORT VulkanDevice : public GraphicsDevice {
   }
   constexpr const VulkanCapabilities &vk_caps() const {
     return vk_caps_;
+  }
+
+  // C-2.4.c: expose maxPerStageDescriptorStorageBuffers via the generic Device
+  // API so backend-agnostic code (e.g. ChunkedDeviceNodeAllocator) can probe
+  // it without dynamic_cast.
+  uint32_t get_max_storage_buffer_descriptors_per_binding()
+      const noexcept override {
+    auto v = vk_caps_.max_per_stage_descriptor_storage_buffers;
+    return v == 0u ? UINT32_MAX : v;
   }
 
   const VkPhysicalDeviceProperties &get_vk_physical_device_props() const {

@@ -522,6 +522,9 @@ void VulkanDeviceCreator::create_logical_device(bool manual_create) {
   // wanted a lower version device).
   uint32_t vk_api_version = physical_device_properties.apiVersion;
   ti_device_->vk_caps().vk_api_version = vk_api_version;
+  // C-2.4.c: cache descriptor-array hard limit for chunked allocator probe.
+  ti_device_->vk_caps().max_per_stage_descriptor_storage_buffers =
+      physical_device_properties.limits.maxPerStageDescriptorStorageBuffers;
   if (vk_api_version >= VK_API_VERSION_1_3) {
     caps.set(DeviceCapability::spirv_version, 0x10500);
   } else if (vk_api_version >= VK_API_VERSION_1_2) {

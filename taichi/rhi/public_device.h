@@ -655,6 +655,18 @@ class RHI_DLL_EXPORT Device {
     return 0;
   }
 
+  // C-2.4.c: maximum number of storage buffer descriptors that may share a
+  // single binding slot (descriptorCount in a VkDescriptorSetLayoutBinding).
+  // Used by ChunkedDeviceNodeAllocator (vulkan_pointer_allocator_kind=chunked
+  // with max_chunks>1) to fail fast when the user-requested chunk count exceeds
+  // the physical device limit. Default UINT32_MAX (= unknown / unlimited) for
+  // backends that don't expose this information; Vulkan overrides it with
+  // VkPhysicalDeviceLimits::maxPerStageDescriptorStorageBuffers.
+  virtual uint32_t get_max_storage_buffer_descriptors_per_binding()
+      const noexcept {
+    return UINT32_MAX;
+  }
+
   /**
    * Create a Pipeline Cache, which acclerates backend API's pipeline creation.
    * @params[out] out_cache The created pipeline cache.

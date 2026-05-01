@@ -168,6 +168,27 @@ ChunkedDeviceNodeAllocator::ChunkedDeviceNodeAllocator(const Params &p) {
   // meta + chunk[0] 的 pool_data），chunk[k>0] 是 cell-only buffer，由
   // SPIR-V chunked descriptor array 经二步 OpAccessChain 寻址。
   if (p.max_chunks > 1u) {
+    // C-2.4.c (2026-05): probe descriptor-array hard limit before any
+    // physical chunk allocation. Vulkan core only guarantees
+    // maxPerStageDescriptorStorageBuffers >= 4, so users who set
+    // vulkan_pointer_max_chunks=N too aggressively must hit a clean
+    // TI_ERROR rather than a late vkCreateDescriptorSetLayout failure or
+    // device-lost. Backends that don't expose this limit (default
+    // implementation in public_device.h) return UINT32_MAX and skip the
+    // check.
+    const uint32_t descriptor_cap =
+        p.device->get_max_storage_buffer_descriptors_per_binding();
+    TI_TRACE(
+        "ChunkedDeviceNodeAllocator: snode_id={} max_chunks={} "
+        "descriptor_cap={} (UINT32_MAX={})",
+        p.snode_id, p.max_chunks, descriptor_cap, UINT32_MAX);
+    TI_ERROR_IF(
+        p.max_chunks > descriptor_cap,
+        "ChunkedDeviceNodeAllocator: vulkan_pointer_max_chunks={} exceeds "
+        "device limit maxPerStageDescriptorStorageBuffers={} (snode_id={}). "
+        "Lower max_chunks or run on a device with a larger descriptor "
+        "limit.",
+        p.max_chunks, descriptor_cap, p.snode_id);
     TI_ASSERT_INFO(
         p.chunk_log2_capacity < 32u,
         "ChunkedDeviceNodeAllocator: chunk_log2_capacity={} out of range "
