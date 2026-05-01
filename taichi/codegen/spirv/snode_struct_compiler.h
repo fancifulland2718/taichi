@@ -31,42 +31,12 @@ struct SNodeDescriptor {
   // starts at a fixed offset in its parent cell's memory.
   size_t mem_offset_in_parent_cell = 0;
 
-  // Phase 2b (vulkan_sparse_experimental, pointer SNode only):
-  // For pointer SNodes, the slot array lives at the regular SNode container
-  // position in the parent cell (size = 4 * num_cells_per_container, each u32
-  // slot stores 0 = inactive, otherwise (pool_index + 1)). The actual child
-  // cells live in a per-pointer-SNode pool appended to the end of the root
-  // buffer; the bump watermark is a single u32 also appended at the end.
-  // These three fields are only meaningful when snode->type == pointer; for
-  // all other SNode types they remain zero.
-  size_t pointer_pool_offset_in_root = 0;
-  size_t pointer_watermark_offset_in_root = 0;
-  size_t pointer_pool_capacity = 0;
-  // G1.b (vulkan_sparse_experimental, pointer SNode only,
-  // gated by TI_VULKAN_POINTER_FREELIST at codegen time):
-  //   freelist_head:  u32 sentinel; 0 = empty, otherwise (pool_index + 1).
-  //   freelist_links: u32[pool_capacity]; per-pool-slot "next" pointer in
-  //                   the same encoding (0 = tail, otherwise pool_index+1).
-  // Both are zero-initialized by GfxRuntime::add_root_buffer (every root
-  // buffer is memset(0) on construction). Layout is stable across
-  // alloc/deactivate; activate either pops freelist (if non-empty) or
-  // bumps watermark; deactivate pushes onto freelist.
-  size_t pointer_freelist_head_offset_in_root = 0;
-  size_t pointer_freelist_links_offset_in_root = 0;
-
-  // G10-P2 (2026-04-30, vulkan_sparse_experimental, pointer SNode only,
-  // gated by TI_VULKAN_POINTER_AMBIENT_ZONE at codegen time):
-  // A single zero-initialized cell-sized region appended after the pool
-  // data. When `pointer_lookup_or_activate(do_activate=false)` finds the
-  // slot to be 0 (inactive cell), the returned cell_byte_offset is this
-  // ambient zone instead of `pool[0]`. This matches LLVM's
-  // `ambient_val_addr` semantics (inactive sparse reads return zero) and
-  // fixes the user-reported "inactive read returns garbage" issue. The
-  // zone is sized = cell_stride bytes and never written by any kernel
-  // (do_activate=true OOC fallback still routes to pool[0] to preserve
-  // the documented silent-loss behavior). Zero-init is provided by
-  // GfxRuntime::add_root_buffer's memset(0) on root buffer creation.
-  size_t pointer_ambient_offset_in_root = 0;
+  // 路线 B B-4（2026-05）：pointer SNode 元数据已完全迁到
+  // `CompiledSNodeStructs.pointer_contracts`（SpirvAllocatorContract POD），
+  // SNodeDescriptor 不再存 pointer_pool_offset / pointer_watermark_offset /
+  // pointer_pool_capacity / pointer_freelist_* / pointer_ambient_offset 字段。
+  // codegen 端通过 contract 读全部 pointer 元信息；layout pass 直接 emplace
+  // 到 result.pointer_contracts。
 
   // G4 (vulkan_sparse_experimental, dynamic SNode only,
   // gated by TI_VULKAN_DYNAMIC at codegen time):

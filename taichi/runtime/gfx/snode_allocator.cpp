@@ -33,11 +33,11 @@ BumpOnlyDeviceNodeAllocator::BumpOnlyDeviceNodeAllocator(const Params &p)
   TI_ASSERT(p.cell_payload_bytes > 0);
   // watermark 与 pool_data 必须 4-byte 对齐（vkCmdFillBuffer 要求；
   // 同时 SPIR-V u32 atomic 也要求 4B 对齐）。
-  TI_ASSERT(p.watermark_offset_in_root % 4 == 0);
-  TI_ASSERT(p.pool_data_offset_in_root % 4 == 0);
+  TI_ASSERT(p.watermark_offset % 4 == 0);
+  TI_ASSERT(p.pool_data_offset % 4 == 0);
   TI_ASSERT(p.cell_payload_bytes % 4 == 0);
   // watermark 占 4 字节，必须严格在 pool_data 之前不重叠
-  TI_ASSERT(p.pool_data_offset_in_root >= p.watermark_offset_in_root + 4);
+  TI_ASSERT(p.pool_data_offset >= p.watermark_offset + 4);
 
   // B-3.b (2026-05): 可选申请独立 pool DeviceAllocation。B-3.b 阶段
   // codegen 仍读 root_buffer，该 buffer 只被 runtime 注入 descriptor set
@@ -92,32 +92,31 @@ void BumpOnlyDeviceNodeAllocator::clear_all(CommandList *cmd) {
   TI_ASSERT(cmd != nullptr);
   // 1) watermark 置 0（4 字节）
   cmd->buffer_fill(params_.root_buffer_alloc.get_ptr(
-                       params_.watermark_offset_in_root),
+                       params_.watermark_offset),
                    /*size=*/4, /*data=*/0u);
   // 2) pool 数据区清零（pool_capacity * cell_payload_bytes）
   //    data=0 是 buffer_fill 的快路径（参见 public_device.h:399 注释）。
   const std::size_t pool_bytes =
       params_.pool_capacity * params_.cell_payload_bytes;
   cmd->buffer_fill(params_.root_buffer_alloc.get_ptr(
-                       params_.pool_data_offset_in_root),
+                       params_.pool_data_offset),
                    pool_bytes, /*data=*/0u);
   // 注意：调用方负责前后 memory barrier；本接口只发射两条 fill。
 }
 
 SpirvAllocatorContract BumpOnlyDeviceNodeAllocator::spirv_contract() const {
   SpirvAllocatorContract c;
-  c.watermark_offset_in_root = params_.watermark_offset_in_root;
-  c.pool_data_offset_in_root = params_.pool_data_offset_in_root;
+  c.watermark_offset = params_.watermark_offset;
+  c.pool_data_offset = params_.pool_data_offset;
   c.pool_capacity = static_cast<uint32_t>(params_.pool_capacity);
   c.cell_stride_bytes = static_cast<uint32_t>(params_.cell_payload_bytes);
   c.snode_id = params_.snode_id;
-  // 路线 B B-1：透传 freelist / ambient zone 元数据。当前由 SNode struct
-  // compiler 直接用 SNodeDescriptor 的现存字段填入，行为字节等价。
+  // 路线 B B-1：透传 freelist / ambient zone 元数据。
   c.has_freelist = params_.has_freelist;
-  c.freelist_head_offset_in_root = params_.freelist_head_offset_in_root;
-  c.freelist_links_offset_in_root = params_.freelist_links_offset_in_root;
+  c.freelist_head_offset = params_.freelist_head_offset;
+  c.freelist_links_offset = params_.freelist_links_offset;
   c.has_ambient_zone = params_.has_ambient_zone;
-  c.ambient_offset_in_root = params_.ambient_offset_in_root;
+  c.ambient_offset = params_.ambient_offset;
   // B-2.b：透传 alloc 协议 / pool_fraction 给 codegen / 调试日志。
   c.alloc_protocol = params_.alloc_protocol;
   c.pool_fraction = params_.pool_fraction;

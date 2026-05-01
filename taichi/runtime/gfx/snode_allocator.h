@@ -98,18 +98,17 @@ class BumpOnlyDeviceNodeAllocator final : public DeviceNodeAllocator {
     // 「池容量」必须等于 SNode 的 num_cells_per_container（worst case 100%）
     std::size_t pool_capacity{0};
     std::size_t cell_payload_bytes{0};
-    // 池在 root_buffer 内的起始偏移（host 侧由 SNodeTree struct compiler 填）
-    // —— 把池放在 root_buffer 子区间以保持 codegen 端只看 root_buffer
-    uint32_t watermark_offset_in_root{0};
-    uint32_t pool_data_offset_in_root{0};
+    // 池在 base buffer 内的起始偏移（host 侧由 SNodeTree struct compiler 填）。
+    // base buffer = root_buffer（OFF）或独立 NodeAllocatorPool buffer（ON, B-3.c-2）。
+    uint32_t watermark_offset{0};
+    uint32_t pool_data_offset{0};
     // 路线 B B-1：把现有 4 个编译宏的状态作为 contract 字段透传给 codegen，
-    // 当前阶段（B-1）值由 snode_struct_compiler 直接抄自 SNodeDescriptor 现存
-    // 字段（行为字节等价）；B-2 阶段才会改为运行时可调。
+    // B-4 阶段同步去掉 _in_root 后缀。
     bool has_freelist{false};
-    uint32_t freelist_head_offset_in_root{0};
-    uint32_t freelist_links_offset_in_root{0};
+    uint32_t freelist_head_offset{0};
+    uint32_t freelist_links_offset{0};
     bool has_ambient_zone{false};
-    uint32_t ambient_offset_in_root{0};
+    uint32_t ambient_offset{0};
     // B-2.b：把 G1.a alloc 协议与池容量比例下放到运行时；默认 CasMarker / 1.0
     // 与历史编译宏 ON 路径字节等价。
     ::taichi::lang::spirv::SpirvAllocatorContract::AllocProtocol

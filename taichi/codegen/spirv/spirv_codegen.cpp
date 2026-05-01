@@ -588,9 +588,9 @@ class TaskCodegen : public IRVisitor {
                                           bool do_activate) {
     const auto &snode_descs = compiled_structs_[root_id].snode_descriptors;
     const auto &desc = snode_descs.at(sn->id);
-    // 路线 B B-1：通过 SpirvAllocatorContract 间接读 pointer SNode 的池
-    // 元数据；当前阶段值与 desc.pointer_* 字节等价（snode_struct_compiler
-    // 直接抄入），后续阶段将由 GfxRuntime 端 allocator 提供。
+    // 路线 B B-1/B-4：通过 SpirvAllocatorContract 间接读 pointer SNode 的池
+    // 元数据。SNodeDescriptor 不再存 pointer_* 字段（B-4 已删除），contract
+    // 是 pool/watermark/freelist/ambient 的唯一来源。
     const auto &contract =
         compiled_structs_[root_id].pointer_contracts.at(sn->id);
 
@@ -673,7 +673,7 @@ class TaskCodegen : public IRVisitor {
       // ---- winner ----
       ir_->start_label(winner_label);
       auto wm_word_idx = ir_->uint_immediate_number(
-          u32_t, contract.watermark_offset_in_root / 4u);
+          u32_t, contract.watermark_offset / 4u);
       auto wm_ptr =
           ir_->struct_array_access(u32_t, pool_meta_buffer, wm_word_idx);
       // Outputs of the winner block, joined into the alloc_done OpPhi:
@@ -709,11 +709,11 @@ class TaskCodegen : public IRVisitor {
         // snode_struct_compiler still drives contract.has_freelist for
         // now, so behavior is byte-equivalent.
         auto fhead_word_idx = ir_->uint_immediate_number(
-            u32_t, contract.freelist_head_offset_in_root / 4u);
+            u32_t, contract.freelist_head_offset / 4u);
         auto fhead_ptr =
             ir_->struct_array_access(u32_t, pool_meta_buffer, fhead_word_idx);
         auto flinks_word_base = ir_->uint_immediate_number(
-            u32_t, contract.freelist_links_offset_in_root / 4u);
+            u32_t, contract.freelist_links_offset / 4u);
 
         spirv::Label fl_head_lbl = ir_->new_label();
         spirv::Label fl_body_lbl = ir_->new_label();
@@ -875,7 +875,7 @@ class TaskCodegen : public IRVisitor {
       // alloc path
       ir_->start_label(alloc_label);
       auto wm_word_idx = ir_->uint_immediate_number(
-          u32_t, contract.watermark_offset_in_root / 4u);
+          u32_t, contract.watermark_offset / 4u);
       auto wm_ptr =
           ir_->struct_array_access(u32_t, pool_meta_buffer, wm_word_idx);
       auto old_wm = ir_->make_value(spv::OpAtomicIAdd, u32_t, wm_ptr,
@@ -927,13 +927,13 @@ class TaskCodegen : public IRVisitor {
     auto cell_stride_v =
         ir_->uint_immediate_number(u32_t, contract.cell_stride_bytes);
     auto pool_offset_v = ir_->uint_immediate_number(
-        u32_t, contract.pool_data_offset_in_root);
+        u32_t, contract.pool_data_offset);
     auto cell_byte_offset = ir_->add(
         pool_offset_v, ir_->mul(effective_slot, cell_stride_v));
     // G10-P2 (2026-04-30 → B-2.a 2026-05): for inactive reads
     // (do_activate=false), route the byte offset to the per-pointer-SNode
     // ambient zone instead of pool[0]. The ambient zone is cell_stride
-    // bytes of zero-initialized memory at contract.ambient_offset_in_root,
+    // bytes of zero-initialized memory at contract.ambient_offset,
     // never written by any kernel; this matches LLVM's ambient_val_addr
     // semantics so that x[inactive_idx] reads as 0. do_activate=true keeps
     // the pool[0] fallback for OOC writes (silent loss, documented).
@@ -944,7 +944,7 @@ class TaskCodegen : public IRVisitor {
     // will make the gate fully runtime via CompileConfig.
     if (contract.has_ambient_zone && !do_activate) {
       auto ambient_offset_v = ir_->uint_immediate_number(
-          u32_t, contract.ambient_offset_in_root);
+          u32_t, contract.ambient_offset);
       cell_byte_offset = ir_->make_value(
           spv::OpSelect, u32_t, is_zero, ambient_offset_v, cell_byte_offset);
     }
@@ -1024,11 +1024,11 @@ class TaskCodegen : public IRVisitor {
       auto zero_v = ir_->uint_immediate_number(u32_t, 0);
       auto busy_v = ir_->uint_immediate_number(u32_t, 0xFFFFFFFFu);
       auto fhead_word_idx = ir_->uint_immediate_number(
-          u32_t, contract.freelist_head_offset_in_root / 4u);
+          u32_t, contract.freelist_head_offset / 4u);
       auto fhead_ptr =
           ir_->struct_array_access(u32_t, pool_meta_buffer, fhead_word_idx);
       auto flinks_word_base = ir_->uint_immediate_number(
-          u32_t, contract.freelist_links_offset_in_root / 4u);
+          u32_t, contract.freelist_links_offset / 4u);
 
       // Atomically claim and clear the slot.
       auto old_slot = ir_->make_value(
@@ -3353,7 +3353,7 @@ class TaskCodegen : public IRVisitor {
           const auto &contract_k =
               compiled_structs_[root_id].pointer_contracts.at(path[k]->id);
           auto pool_offset_v = ir_->uint_immediate_number(
-              u32_t, contract_k.pool_data_offset_in_root);
+              u32_t, contract_k.pool_data_offset);
           auto step = ir_->mul(pointer_effective_slot, cell_stride_v);
           addr = ir_->add(pool_offset_v, step);
           addr = ir_->add(

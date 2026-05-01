@@ -77,10 +77,11 @@ class StructCompiler {
       // NodeAllocatorPool buffer 中；root_size 不再含池数据。`cursor`
       // 是该 pointer SNode 的池 footprint 的统一游标：indep=ON 时从 0
       // 起算（即"offset_in_pool"），OFF 时与 root_size 对齐共享游标
-      // （即"offset_in_root"，旧行为）。pointer_*_offset_in_root 字段的
-      // 实际语义因此分裂："binding_id>=0" 时它表示池内偏移；OFF 时它
-      // 仍是 root buffer 内绝对偏移。codegen 通过 container_buffer_value
-      // / pool_meta_buffer 选择正确 base buffer。
+      // （即"offset_in_root"，旧行为）。codegen 通过 container_buffer_value
+      // 决定具体寻址哪个 base buffer。
+      // B-4（2026-05）：layout 直接写入 SpirvAllocatorContract，移除
+      // SNodeDescriptor 的 6 个 pointer_* 中转字段，contract 字段名也
+      // 同步去掉 _in_root 后缀（语义随 pool_buffer_binding_id 决定）。
       const bool indep_pool = policy_.independent_pool;
       size_t cursor;
       if (indep_pool) {
@@ -89,20 +90,29 @@ class StructCompiler {
         result.root_size = (result.root_size + 3u) & ~size_t(3);
         cursor = result.root_size;
       }
-      desc.pointer_watermark_offset_in_root = cursor;
+      SpirvAllocatorContract c;
+      c.snode_id = desc.snode->id;
+      c.cell_stride_bytes = static_cast<uint32_t>(cell_bytes);
+      c.pool_capacity = static_cast<uint32_t>(capacity);
+      c.alloc_protocol =
+          policy_.cas_marker
+              ? SpirvAllocatorContract::AllocProtocol::CasMarker
+              : SpirvAllocatorContract::AllocProtocol::Legacy;
+      c.pool_fraction = resolve_pool_fraction(policy_.pool_fraction);
+      c.watermark_offset = static_cast<uint32_t>(cursor);
       cursor += 4;
       // B-2.b: 原 #if TI_VULKAN_POINTER_FREELIST 布局下放为运行时 policy_.freelist。
       if (policy_.freelist) {
         // G1.b: freelist_head + freelist_links[capacity]。零初始化由
         // 池 buffer 在 SNodeTreeManager 中通过 buffer_fill(0) 提供。
-        desc.pointer_freelist_head_offset_in_root = cursor;
+        c.has_freelist = true;
+        c.freelist_head_offset = static_cast<uint32_t>(cursor);
         cursor += 4;
-        desc.pointer_freelist_links_offset_in_root = cursor;
+        c.freelist_links_offset = static_cast<uint32_t>(cursor);
         cursor += 4 * capacity;
       }
       cursor = (cursor + 3u) & ~size_t(3);
-      desc.pointer_pool_offset_in_root = cursor;
-      desc.pointer_pool_capacity = capacity;
+      c.pool_data_offset = static_cast<uint32_t>(cursor);
       cursor += cell_bytes * capacity;
       // B-2.b: 原 #if TI_VULKAN_POINTER_AMBIENT_ZONE 下放为运行时 policy_.ambient_zone。
       if (policy_.ambient_zone) {
@@ -112,68 +122,25 @@ class StructCompiler {
         // 写入；零初始化由池 buffer 的 fill(0) 或 root buffer 的 memset(0)
         // 提供（按 indep_pool 决定）。
         cursor = (cursor + 3u) & ~size_t(3);
-        desc.pointer_ambient_offset_in_root = cursor;
+        c.has_ambient_zone = true;
+        c.ambient_offset = static_cast<uint32_t>(cursor);
         cursor += cell_bytes;
       }
       cursor = (cursor + 3u) & ~size_t(3);
       if (indep_pool) {
         // 独立池：池整体 footprint = cursor；root_size 不动。
+        // contract 偏移以独立 buffer 内 offset 0 为基准；binding_id = sid。
+        c.pool_buffer_binding_id = desc.snode->id;
         result.pool_buffer_sizes[desc.snode->id] = cursor;
       } else {
         // OFF 默认：池整体仍追加在 root buffer 末尾，老行为字节等价。
+        // contract 偏移以 root buffer 内 offset 0 为基准；binding_id = -1。
         result.root_size = cursor;
       }
+      result.pointer_contracts.emplace(desc.snode->id, c);
     }
 
     result.snode_descriptors = std::move(snode_descriptors_);
-    // 路线 B B-1（2026-04-30）：把每个 pointer SNode 的 pointer_* 字段
-    // 投影成 SpirvAllocatorContract 存入 result.pointer_contracts。codegen
-    // 通过 contract 读偏移而非直接访问 SNodeDescriptor，为后续把池迁出
-    // root_buffer 留接口。本步骤值字节等价。
-    for (const auto &[sid, desc] : result.snode_descriptors) {
-      if (desc.snode == nullptr || desc.snode->type != SNodeType::pointer) {
-        continue;
-      }
-      SpirvAllocatorContract c;
-      c.snode_id = sid;
-      c.watermark_offset_in_root =
-          static_cast<uint32_t>(desc.pointer_watermark_offset_in_root);
-      c.pool_data_offset_in_root =
-          static_cast<uint32_t>(desc.pointer_pool_offset_in_root);
-      c.pool_capacity = static_cast<uint32_t>(desc.pointer_pool_capacity);
-      c.cell_stride_bytes = static_cast<uint32_t>(desc.cell_stride);
-      // B-2.b: contract 上的 has_freelist / has_ambient_zone 现从 policy 读，
-      // 与 layout 路径同源；alloc_protocol 与 pool_fraction 同样下放。
-      if (policy_.freelist) {
-        c.has_freelist = true;
-        c.freelist_head_offset_in_root = static_cast<uint32_t>(
-            desc.pointer_freelist_head_offset_in_root);
-        c.freelist_links_offset_in_root = static_cast<uint32_t>(
-            desc.pointer_freelist_links_offset_in_root);
-      }
-      if (policy_.ambient_zone) {
-        c.has_ambient_zone = true;
-        c.ambient_offset_in_root =
-            static_cast<uint32_t>(desc.pointer_ambient_offset_in_root);
-      }
-      c.alloc_protocol =
-          policy_.cas_marker
-              ? SpirvAllocatorContract::AllocProtocol::CasMarker
-              : SpirvAllocatorContract::AllocProtocol::Legacy;
-      c.pool_fraction =
-          resolve_pool_fraction(policy_.pool_fraction);
-      result.pointer_contracts.emplace(sid, c);
-    }
-    // B-3.c-1（2026-05）：独立池 ON 时为所有 pointer SNode 设
-    // pool_buffer_binding_id = sid（不再限制为单 pointer）。嵌套 / 多 pointer
-    // 场景下每个 pointer 有各自独立 DeviceAllocation，各自为其 watermark/
-    // freelist 元数据提供 base buffer（B-3.c-1 仅迁元数据，pool_data +
-    // ambient 仍在 root_buffer，cell 寻址语义不变）。
-    if (policy_.independent_pool) {
-      for (auto &kv : result.pointer_contracts) {
-        kv.second.pool_buffer_binding_id = kv.second.snode_id;
-      }
-    }
     /*
     result.type_factory = new tinyir::Block;
     result.root_type = construct(*result.type_factory, &root);

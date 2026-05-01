@@ -9,8 +9,12 @@
 // allocator 切换实现（bump-only / freelist / chunked / sparse-binding）时
 // codegen 不动，仅替换 contract 字段含义和 GfxRuntime 端构造逻辑。
 //
-// 当前实现的语义（与 §9.2 BumpOnlyDeviceNodeAllocator 字节等价）：
-//   - watermark 与所有 offset 都是 root_buffer 内的字节偏移
+// 当前实现的语义：
+//   - 所有 offset 都是该 contract 所属 base buffer 内的字节偏移：
+//     * pool_buffer_binding_id == -1（OFF 默认）→ base buffer = root_buffer
+//     * pool_buffer_binding_id >= 0（B-3.c-2 ON）→ base buffer =
+//       NodeAllocatorPool[pool_buffer_binding_id]，且整个池（含 watermark /
+//       freelist / pool_data / ambient）从该 buffer 内 offset 0 起算
 //   - has_freelist=false / has_ambient_zone=false 时对应 offset 字段未定义
 //   - pool_capacity = num_cells（编译期常量）
 //
@@ -25,10 +29,10 @@ namespace taichi::lang {
 namespace spirv {
 
 struct SpirvAllocatorContract {
-  // u32 atomic 计数器在 root_buffer 内的字节偏移（4B 对齐）
-  uint32_t watermark_offset_in_root{0};
+  // u32 atomic 计数器在 base buffer 内的字节偏移（4B 对齐）
+  uint32_t watermark_offset{0};
   // pool 数据起始字节偏移（cell payload 数组开头，4B 对齐）
-  uint32_t pool_data_offset_in_root{0};
+  uint32_t pool_data_offset{0};
   // 池容量（cell 数）—— worst-case = SNode 的 total_num_cells_from_root
   uint32_t pool_capacity{0};
   // 单 cell payload 字节数（含子 SNode container 全部内容）
@@ -36,12 +40,12 @@ struct SpirvAllocatorContract {
 
   // G1.b freelist：has_freelist=true 时下面两个 offset 有效
   bool has_freelist{false};
-  uint32_t freelist_head_offset_in_root{0};
-  uint32_t freelist_links_offset_in_root{0};
+  uint32_t freelist_head_offset{0};
+  uint32_t freelist_links_offset{0};
 
-  // G10-P2 ambient zone：has_ambient_zone=true 时 ambient_offset_in_root 有效
+  // G10-P2 ambient zone：has_ambient_zone=true 时 ambient_offset 有效
   bool has_ambient_zone{false};
-  uint32_t ambient_offset_in_root{0};
+  uint32_t ambient_offset{0};
 
   // 该 contract 服务的 SNode id，仅供调试 / runtime error 信息使用
   int32_t snode_id{-1};
@@ -60,11 +64,11 @@ struct SpirvAllocatorContract {
   // 1.0 = 100% 容量（vanilla 1.7.4 等价）；(0,1) 区间收缩；其余值视为 1.0。
   double pool_fraction{1.0};
 
-  // 路线 B B-3.b（2026-05）：> 0 表示该 pointer SNode 的池数据已迁出 root_buffer，
-  // 走独立的 NodeAllocatorPool descriptor（root_id[0] = pool_buffer_binding_id）；
-  // -1（默认）= 池仍寄居 root_buffer 子区间（B-1/B-2 行为）。B-3.b 只做 plumbing：
-  // 即便此值 >= 0，codegen 仍读 root_buffer 上的偏移（offset 字段不变）；独立
-  // buffer 是 dead allocation，待 B-3.c 把 codegen 切到独立 buffer 寻址。
+  // 路线 B B-3.c-2（2026-05）：>= 0 表示该 pointer SNode 的池整体（watermark /
+  // freelist / pool_data / ambient）已迁出 root_buffer，落在独立的
+  // NodeAllocatorPool buffer 中，binding 序号 = root_id[0] = pool_buffer_binding_id；
+  // 偏移字段以该 buffer 内 offset 0 为基准。-1（默认）= 池仍寄居 root_buffer
+  // 子区间，偏移字段以 root_buffer 内 offset 0 为基准（B-1/B-2/B-3.b 行为）。
   int32_t pool_buffer_binding_id{-1};
 };
 
