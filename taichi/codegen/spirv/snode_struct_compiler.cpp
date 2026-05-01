@@ -10,21 +10,23 @@ namespace {
 
 // B-2.b（2026-05）：运行时 pool_fraction 读取仅下放到主路径 if-分支，不再
 // 从 TI_VULKAN_POOL_FRACTION 环境变量读取。环境变量仍是全局 fallback：
-// 未传入 policy.pool_fraction（1.0）且环境变量合法时，该环境变量被应用。
-// 优先列表：policy.pool_fraction (不为 1.0) > env > 1.0。
+// 未传入 policy.pool_fraction（-1.0 哨兵）且环境变量合法时，该环境变量被应用。
+// C-1.b（2026-05）：仅当 policy_value 在 (0, 1) 严格开区间时启用 fraction
+// 缩放分支；其它（哨兵 / 1.0 / 越界）一律返回 -1.0 表示 "未启用"。
+// 调用方根据返回值是否 in (0, 1) 决定是否走 L2/L3 缩放路径。
 static double resolve_pool_fraction(double policy_value) {
-  if (policy_value > 0.0 && policy_value <= 1.0 && policy_value < 1.0) {
+  if (policy_value > 0.0 && policy_value < 1.0) {
     return policy_value;
   }
   static double cached_env = []() -> double {
     const char *env = std::getenv("TI_VULKAN_POOL_FRACTION");
     if (!env) {
-      return 1.0;
+      return -1.0;
     }
     char *end = nullptr;
     const double v = std::strtod(env, &end);
-    if (end == env || v <= 0.0 || v > 1.0) {
-      return 1.0;
+    if (end == env || v <= 0.0 || v >= 1.0) {
+      return -1.0;
     }
     return v;
   }();
@@ -60,17 +62,93 @@ class StructCompiler {
       // where the same descriptor is re-instantiated under every parent
       // cell.
       size_t capacity = desc.total_num_cells_from_root;
-      // B-2.b: 原 #if TI_VULKAN_POINTER_POOL_FRACTION 分支下放为运行时
-      // policy_.pool_fraction；resolve_pool_fraction 会优先读 policy，其次
-      // fall back 到环境变量 TI_VULKAN_POOL_FRACTION。
-      const double frac = resolve_pool_fraction(policy_.pool_fraction);
-      if (frac < 1.0) {
-        const size_t scaled = static_cast<size_t>(
-            static_cast<double>(capacity) * frac + 0.5);
-        const size_t lower_bound =
-            static_cast<size_t>(desc.snode->num_cells_per_container);
-        capacity = std::max<size_t>(scaled, lower_bound);
+      const size_t worst_capacity = capacity;
+      const size_t lower_bound =
+          static_cast<size_t>(desc.snode->num_cells_per_container);
+      // C-1 (2026-05): 4 级 fallback —— L1 vk_max_active_hint > L2 policy
+      // pool_fraction > L3 env > L4 worst-case。L1 = per-SNode JIT-time 用户
+      // 精确意图；L2/L3 是全局比例缩放；L4 是路线 B 之前的 worst-case。
+      // L1 命中时绕过 fraction 完全独立决议；hint 异常值（< 下界 / > 上限）
+      // 抬回有效区间并 TI_WARN 一次。
+      bool used_hint = false;
+      if (desc.snode->vk_max_active_hint > 0) {
+        size_t requested =
+            static_cast<size_t>(desc.snode->vk_max_active_hint);
+        if (requested < lower_bound) {
+          TI_WARN(
+              "vk_max_active={} on SNode {} is below container lower bound "
+              "{}; clamping up. Pointer pool capacity is at least one full "
+              "container.",
+              requested, desc.snode->get_node_type_name_hinted(),
+              lower_bound);
+          requested = lower_bound;
+        }
+        if (requested > worst_capacity) {
+          // C-1.b (2026-05): hint > worst_case is no longer clamped down.
+          // worst_case is just a worst-case estimate; the user knows their
+          // domain. Honor the request and let hardware OOM happen naturally
+          // if vkAllocateMemory cannot serve the buffer (consistent with
+          // CPU/CUDA "allocate-on-demand" semantics).
+          TI_WARN(
+              "vk_max_active={} on SNode {} exceeds worst-case capacity {}; "
+              "honoring user request. Physical buffer will be sized to fit "
+              "{} cells; if vkAllocateMemory cannot satisfy this request the "
+              "runtime will surface a hardware OOM (matches CPU/CUDA).",
+              requested, desc.snode->get_node_type_name_hinted(),
+              worst_capacity, requested);
+        }
+        capacity = requested;
+        used_hint = true;
       }
+      const char *capacity_source = "L4_worst_case";
+      if (used_hint) {
+        capacity_source = "L1_vk_max_active_hint";
+      } else {
+        // B-2.b: 原 #if TI_VULKAN_POINTER_POOL_FRACTION 分支下放为运行时
+        // policy_.pool_fraction；resolve_pool_fraction 会优先读 policy，其次
+        // fall back 到环境变量 TI_VULKAN_POOL_FRACTION。C-1.b: resolve 现在
+        // 返回 -1.0 表示 "未启用"（默认情形 / 1.0 显式 / 越界），仅 (0,1) 严
+        // 格开区间才启用缩放。
+        const double frac = resolve_pool_fraction(policy_.pool_fraction);
+        if (frac > 0.0 && frac < 1.0) {
+          const size_t scaled = static_cast<size_t>(
+              static_cast<double>(capacity) * frac + 0.5);
+          const size_t new_capacity = std::max<size_t>(scaled, lower_bound);
+          if (new_capacity != capacity) {
+            capacity = new_capacity;
+            // L2 (CompileConfig) and L3 (env) collapse to the same code
+            // path because resolve_pool_fraction picks env only when the
+            // policy field is at the sentinel default.
+            capacity_source = (policy_.pool_fraction > 0.0 &&
+                               policy_.pool_fraction < 1.0)
+                                  ? "L2_pool_fraction"
+                                  : "L3_env_TI_VULKAN_POOL_FRACTION";
+          }
+        } else if (worst_capacity > 1024) {
+          // C-1.b (2026-05): silent worst-case fallback is unfriendly when
+          // the SNode shape implies a large physical footprint. Surface
+          // one TI_WARN so users notice and can opt into vk_max_active.
+          // Threshold 1024 cells matches typical small-grid demos that we
+          // do NOT want to spam a warning for.
+          TI_WARN(
+              "pointer SNode {} defaults to worst-case capacity {} cells "
+              "(physical buffer ~ {} bytes). If actual peak activation is "
+              "much smaller, set vk_max_active=<expected_peak> on the "
+              "pointer() call to reduce VRAM footprint.",
+              desc.snode->get_node_type_name_hinted(), worst_capacity,
+              worst_capacity * desc.cell_stride);
+        }
+      }
+      // C-1 (2026-05): single-line decision trace for end users debugging
+      // pool sizing. Kept at TI_INFO so it does not clutter normal output;
+      // user can flip TI_LOG_LEVEL=info to surface it. Reports tier that
+      // won, final capacity, worst-case, lower bound and (if used) the raw
+      // hint, so a one-liner identifies which fallback level applied.
+      TI_INFO(
+          "[C-1] pointer SNode {} pool capacity decided: {} cells (source="
+          "{}, worst_case={}, lower_bound={}, raw_hint={})",
+          desc.snode->get_node_type_name_hinted(), capacity, capacity_source,
+          worst_capacity, lower_bound, desc.snode->vk_max_active_hint);
       const size_t cell_bytes = desc.cell_stride;
       // B-3.c-2（2026-05）：在独立池开启时，pointer 池**整体**（元数据 +
       // pool_data + ambient）迁出 root_buffer，落在每个 pointer 自己的

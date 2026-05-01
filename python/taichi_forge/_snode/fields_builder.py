@@ -78,13 +78,14 @@ class FieldsBuilder:
         self,
         indices: Union[Sequence[_Axis], _Axis],
         dimensions: Union[Sequence[int], int],
+        vk_max_active: Optional[int] = None,
     ):
         """Same as :func:`taichi_forge.lang.snode.SNode.pointer`"""
         if not _ti_core.is_extension_supported(impl.current_cfg().arch, _ti_core.Extension.sparse):
             raise TaichiRuntimeError("Pointer SNode is not supported on this backend.")
         self._check_not_finalized()
         self.empty = False
-        return self.root.pointer(indices, dimensions)
+        return self.root.pointer(indices, dimensions, vk_max_active=vk_max_active)
 
     def _hash(self, indices, dimensions):
         """Same as :func:`taichi_forge.lang.snode.SNode.hash`"""

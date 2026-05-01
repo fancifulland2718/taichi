@@ -162,6 +162,9 @@ static void get_offline_cache_key_of_snode_impl(
   serializer(snode->depth);
   serializer(snode->name);
   serializer(snode->num_cells_per_container);
+  // C-1 (2026-05): per-pointer-SNode 池容量 hint 影响 SPIR-V layout 偏移，
+  // 必须纳入 cache key。-1 默认值哈希稳定，旧 SNodeTree 不受影响。
+  serializer(snode->vk_max_active_hint);
   serializer(snode->chunk_size);
   serializer(snode->cell_size_bytes);
   serializer(snode->offset_bytes_in_parent_cell);

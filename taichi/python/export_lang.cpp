@@ -588,6 +588,19 @@ void export_lang(py::module &m) {
                                const std::vector<int> &,
                                const DebugInfo &))(&SNode::pointer),
            py::return_value_policy::reference)
+      // C-1 (2026-05): pointer + per-SNode pool capacity hint。后端在
+      // SNodeTree finalize 时读取 vk_max_active_hint 决议池容量，绕过 worst-
+      // case 与全局 fraction（详见 SNode_Vulkan_规划.md §11.1）。
+      .def(
+          "pointer_with_hint",
+          [](SNode &self, const std::vector<Axis> &axes,
+             const std::vector<int> &sizes, int64_t vk_max_active,
+             const DebugInfo &dbg_info) -> SNode & {
+            SNode &child = self.pointer(axes, sizes, dbg_info);
+            child.vk_max_active_hint = vk_max_active;
+            return child;
+          },
+          py::return_value_policy::reference)
       .def("hash",
            (SNode & (SNode::*)(const std::vector<Axis> &,
                                const std::vector<int> &,

@@ -139,7 +139,12 @@ struct CompileConfig {
   bool vulkan_pointer_freelist{true};
   bool vulkan_pointer_ambient_zone{true};
   bool vulkan_pointer_cas_marker{true};
-  double vulkan_pointer_pool_fraction{1.0};
+  // C-1.b (2026-05)：默认值由 1.0 改为 -1.0 哨兵（"未设置"）。
+  // 仅当 (0, 1) 严格开区间内显式赋值时启用 fraction 缩放；其它
+  // (含 -1.0 默认 / 1.0 / 越界值) 一律走 worst-case，与 LLVM 后端
+  // "按需分配，不预先估算" 的语义对齐。fraction 仅作为 *显式* 全局
+  // 缩放工具存在；per-SNode 精确容量请用 vk_max_active。
+  double vulkan_pointer_pool_fraction{-1.0};
   // B-3.b (2026-05): 当 SNodeTree 内恰好 1 个 pointer SNode 时，把该 pointer 的
   // pool 元数据切到独立 NodeAllocatorPool descriptor binding（B-3.b 仅做 plumbing：
   // 申请独立 DeviceAllocation + 注册 input_buffer，codegen 仍读 root_buffer 子区

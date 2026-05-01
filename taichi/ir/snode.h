@@ -95,6 +95,11 @@ class SNode {
   // See https://docs.taichi-lang.org/docs/internal for terms
   // like cell and container.
   int64 num_cells_per_container{1};
+  // C-1 (2026-05): per-pointer-SNode 用户在 DSL 显式给出的池容量上界。
+  // -1 = 未提供，layout pass 走 fraction / worst-case 的旧路径。
+  // 仅 SNodeType::pointer 读；其他类型忽略。仅 vulkan/gfx 路径生效，
+  // LLVM 后端忽略（自有 chunk-list 按需分配）。
+  int64 vk_max_active_hint{-1};
   int chunk_size{0};
   std::size_t cell_size_bytes{0};
   std::size_t offset_bytes_in_parent_cell{0};

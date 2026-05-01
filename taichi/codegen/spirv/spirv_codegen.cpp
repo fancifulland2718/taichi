@@ -768,12 +768,14 @@ class TaskCodegen : public IRVisitor {
                                       /*scope=*/ir_->const_i32_one_,
                                       /*semantics=*/ir_->const_i32_zero_,
                                       ir_->uint_immediate_number(u32_t, 1));
-        auto in_cap = ir_->make_value(spv::OpULessThan, ir_->bool_type(),
-                                      old_wm, cap_v);
-        auto new_slot_raw =
+        // C-1.b (2026-05): no in_cap clamp here. OOC writes (old_wm >= cap)
+        // produce new_slot >= cap+1, leading to OOB pool_data access. The
+        // SSBO range check in the driver surfaces this as device-lost
+        // (matches CPU/CUDA assert(slot < cap) semantics; honest hardware
+        // OOM rather than silent fallback to slot 0).
+        (void)cap_v;
+        auto new_slot_bump =
             ir_->add(old_wm, ir_->uint_immediate_number(u32_t, 1));
-        auto new_slot_bump = ir_->make_value(spv::OpSelect, u32_t, in_cap,
-                                             new_slot_raw, zero_v);
         ir_->make_inst(spv::OpBranch, publish_lbl);
 
         // fl_merge: freelist pop succeeded; new_slot = fhead_cur (the
@@ -801,14 +803,9 @@ class TaskCodegen : public IRVisitor {
                                       /*scope=*/ir_->const_i32_one_,
                                       /*semantics=*/ir_->const_i32_zero_,
                                       ir_->uint_immediate_number(u32_t, 1));
-        auto in_cap = ir_->make_value(spv::OpULessThan, ir_->bool_type(),
-                                      old_wm, cap_v);
-        auto new_slot_raw =
-            ir_->add(old_wm, ir_->uint_immediate_number(u32_t, 1));
-        // new_slot = in_cap ? old_wm + 1 : 0  (0 = OOC -> falls back to
-        // inactive)
-        new_slot = ir_->make_value(spv::OpSelect, u32_t, in_cap,
-                                   new_slot_raw, zero_v);
+        // C-1.b (2026-05): no OOC clamp; see bump_lbl branch above.
+        (void)cap_v;
+        new_slot = ir_->add(old_wm, ir_->uint_immediate_number(u32_t, 1));
         // Publish the resolved slot. Loser's spin will see this on its
         // next atomicLoad iteration and exit.
         ir_->make_inst(spv::OpAtomicStore, slot_ptr,
@@ -884,12 +881,9 @@ class TaskCodegen : public IRVisitor {
                                     ir_->uint_immediate_number(u32_t, 1));
       auto cap_v = ir_->uint_immediate_number(
           u32_t, contract.pool_capacity);
-      auto in_cap = ir_->make_value(spv::OpULessThan, ir_->bool_type(),
-                                    old_wm, cap_v);
-      auto new_slot_raw = ir_->add(old_wm, ir_->uint_immediate_number(u32_t, 1));
-      auto new_slot = ir_->make_value(spv::OpSelect, u32_t, in_cap,
-                                      new_slot_raw,
-                                      ir_->uint_immediate_number(u32_t, 0));
+      // C-1.b (2026-05): no OOC clamp; see CasMarker branch comment.
+      (void)cap_v;
+      auto new_slot = ir_->add(old_wm, ir_->uint_immediate_number(u32_t, 1));
       auto cas_old = ir_->make_value(
           spv::OpAtomicCompareExchange, u32_t, slot_ptr,
           /*scope=*/ir_->const_i32_one_,

@@ -1,4 +1,5 @@
 import numbers
+import warnings
 
 from taichi_forge._lib import core as _ti_core
 from taichi_forge.lang import expr, impl, matrix
@@ -37,12 +38,21 @@ class SNode:
             dimensions = [dimensions] * len(axes)
         return SNode(self.ptr.dense(axes, dimensions, _ti_core.DebugInfo(get_traceback())))
 
-    def pointer(self, axes, dimensions):
+    def pointer(self, axes, dimensions, vk_max_active=None):
         """Adds a pointer SNode as a child component of `self`.
 
         Args:
             axes (List[Axis]): Axes to activate.
             dimensions (Union[List[int], int]): Shape of each axis.
+            vk_max_active (Optional[int]): Vulkan-only hint for the maximum
+                number of cells expected to be activated under this pointer
+                SNode. When provided, the Vulkan backend uses this value
+                directly as the pointer pool capacity, bypassing the
+                worst-case ``total_num_cells_from_root`` and any global
+                ``vulkan_pointer_pool_fraction`` setting. Other backends
+                ignore this hint. If the value is below the per-container
+                lower bound or above the worst-case upper bound, it is
+                clamped (with a warning).
 
         Returns:
             The added :class:`~taichi_forge.lang.SNode` instance.
@@ -51,7 +61,30 @@ class SNode:
             raise TaichiRuntimeError("Pointer SNode is not supported on this backend.")
         if isinstance(dimensions, numbers.Number):
             dimensions = [dimensions] * len(axes)
-        return SNode(self.ptr.pointer(axes, dimensions, _ti_core.DebugInfo(get_traceback())))
+        dbg = _ti_core.DebugInfo(get_traceback())
+        if vk_max_active is None:
+            return SNode(self.ptr.pointer(axes, dimensions, dbg))
+        if not isinstance(vk_max_active, numbers.Integral) or vk_max_active <= 0:
+            raise TaichiRuntimeError(
+                f"vk_max_active must be a positive integer, got {vk_max_active!r}."
+            )
+        # C-1 (2026-05): warn early if user pinned vk_max_active on a backend
+        # that does not honor it (LLVM cpu/cuda allocate on demand and ignore
+        # the hint entirely). This catches the common pitfall of "I set
+        # vk_max_active=1024 but my CPU run still allocates worst-case" /
+        # "switching arch from vulkan to cuda silently changed memory
+        # behavior".
+        cur_arch = impl.current_cfg().arch
+        if cur_arch != _ti_core.vulkan:
+            warnings.warn(
+                f"vk_max_active={vk_max_active} is set on a non-Vulkan backend "
+                f"(arch={cur_arch}); the hint will be ignored. The Vulkan "
+                "backend is the only consumer of this kwarg; LLVM backends "
+                "allocate sparse pointer storage on demand and do not need "
+                "(or honor) a static capacity hint.",
+                stacklevel=2,
+            )
+        return SNode(self.ptr.pointer_with_hint(axes, dimensions, int(vk_max_active), dbg))
 
     @staticmethod
     def _hash(axes, dimensions):
