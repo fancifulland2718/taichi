@@ -12,6 +12,9 @@
 #include "taichi/program/snode_expr_utils.h"
 #include "taichi/program/program_impl.h"
 #include "taichi/program/kernel_launcher.h"
+#if defined(TI_WITH_VULKAN_POINTER)
+#include "taichi/runtime/gfx/snode_allocator.h"
+#endif
 
 namespace taichi::lang {
 namespace gfx {
@@ -153,6 +156,17 @@ class TI_DLL_EXPORT GfxRuntime {
   std::unique_ptr<PipelineCache> backend_cache_{nullptr};
 
   std::vector<std::unique_ptr<DeviceAllocationGuard>> root_buffers_;
+#if defined(TI_WITH_VULKAN_POINTER)
+  // 路线 B B-1（2026-04-30）：每棵 SNode tree 上每个 pointer SNode 对应
+  // 一个 DeviceNodeAllocator。outer key = root_id（与 root_buffers_ 同步），
+  // 内层 map key = SNode id。当前阶段池仍寄居 root_buffer 子区间，allocator
+  // 只是「字节等价的间接层」；B-3 阶段池将迁出 root_buffer。
+  // 注：用 unordered_map 作外层是为了规避 MSVC 上 vector 增长时对不含
+  // noexcept move 的 map 的硬性 copy 需求。
+  std::unordered_map<int,
+                     std::unordered_map<int, std::unique_ptr<DeviceNodeAllocator>>>
+      node_allocators_;
+#endif
   std::unique_ptr<DeviceAllocationGuard> global_tmps_buffer_;
   // FIXME: Support proper multiple lists
   std::unique_ptr<DeviceAllocationGuard> listgen_buffer_;

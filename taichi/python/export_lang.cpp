@@ -184,6 +184,14 @@ void export_lang(py::module &m) {
                      &CompileConfig::spirv_disabled_passes)
       .def_readwrite("compile_dag_scheduler",
                      &CompileConfig::compile_dag_scheduler)
+      .def_readwrite("vulkan_pointer_freelist",
+                     &CompileConfig::vulkan_pointer_freelist)
+      .def_readwrite("vulkan_pointer_ambient_zone",
+                     &CompileConfig::vulkan_pointer_ambient_zone)
+      .def_readwrite("vulkan_pointer_cas_marker",
+                     &CompileConfig::vulkan_pointer_cas_marker)
+      .def_readwrite("vulkan_pointer_pool_fraction",
+                     &CompileConfig::vulkan_pointer_pool_fraction)
       .def_readwrite("print_ir", &CompileConfig::print_ir)
       .def_readwrite("print_preprocessed_ir",
                      &CompileConfig::print_preprocessed_ir)

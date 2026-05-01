@@ -6,6 +6,7 @@
 #include "taichi/ir/snode.h"
 
 #include "spirv_types.h"
+#include "spirv_allocator_contract.h"
 
 namespace taichi::lang {
 namespace spirv {
@@ -94,12 +95,32 @@ struct CompiledSNodeStructs {
   // Map from SNode ID to its descriptor.
   SNodeDescriptorsMap snode_descriptors;
 
+  // 路线 B B-1（2026-04-30）：pointer SNode → allocator contract。
+  // 由 snode_struct_compiler 在生成 layout 后从 SNodeDescriptor.pointer_*
+  // 字段直接抄入；codegen 端通过 contract 而非 SNodeDescriptor 读 pointer
+  // 元数据，为 B-2/B-3 阶段池迁移到独立 buffer / 运行时可调容量做准备。
+  // key = SNode id（仅 type==pointer 的 SNode 入表）。
+  std::unordered_map<int, SpirvAllocatorContract> pointer_contracts;
+
   // TODO: Use the new type compiler
   // tinyir::Block *type_factory;
   // const tinyir::Type *root_type;
 };
 
-CompiledSNodeStructs compile_snode_structs(SNode &root);
+// B-2.b（2026-05）：路线 B 阶段把 4 个 CMake 宏（TI_VULKAN_POINTER_*）下放为
+// CompileConfig 可调的运行时字段。此 POD 在 SNode struct 编译实际生产
+// pointer SNode layout 与 SpirvAllocatorContract 时读取。默认值与 CMake-ON 路径
+// 字节等价，以保留 AOT / 历史调用者未传入 policy 时的行为。
+struct PointerLayoutPolicy {
+  bool freelist{true};       // G1.b
+  bool ambient_zone{true};   // G10-P2
+  bool cas_marker{true};     // G1.a
+  double pool_fraction{1.0}; // G2
+};
+
+CompiledSNodeStructs compile_snode_structs(
+    SNode &root,
+    const PointerLayoutPolicy &policy = {});
 
 }  // namespace spirv
 }  // namespace taichi::lang

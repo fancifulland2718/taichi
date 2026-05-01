@@ -13,18 +13,29 @@ GfxProgramImpl::GfxProgramImpl(CompileConfig &config) : ProgramImpl(config) {
 }
 
 void GfxProgramImpl::compile_snode_tree_types(SNodeTree *tree) {
+  // B-2.b: build pointer SNode allocator policy from CompileConfig.
+  spirv::PointerLayoutPolicy policy;
+  policy.freelist = config->vulkan_pointer_freelist;
+  policy.ambient_zone = config->vulkan_pointer_ambient_zone;
+  policy.cas_marker = config->vulkan_pointer_cas_marker;
+  policy.pool_fraction = config->vulkan_pointer_pool_fraction;
   if (runtime_) {
-    snode_tree_mgr_->materialize_snode_tree(tree);
+    snode_tree_mgr_->materialize_snode_tree(tree, policy);
   } else {
     gfx::CompiledSNodeStructs compiled_structs =
-        gfx::compile_snode_structs(*tree->root());
+        gfx::compile_snode_structs(*tree->root(), policy);
     aot_compiled_snode_structs_.push_back(compiled_structs);
   }
 }
 
 void GfxProgramImpl::materialize_snode_tree(SNodeTree *tree,
                                             uint64 *result_buffer) {
-  snode_tree_mgr_->materialize_snode_tree(tree);
+  spirv::PointerLayoutPolicy policy;
+  policy.freelist = config->vulkan_pointer_freelist;
+  policy.ambient_zone = config->vulkan_pointer_ambient_zone;
+  policy.cas_marker = config->vulkan_pointer_cas_marker;
+  policy.pool_fraction = config->vulkan_pointer_pool_fraction;
+  snode_tree_mgr_->materialize_snode_tree(tree, policy);
 }
 
 std::unique_ptr<AotModuleBuilder> GfxProgramImpl::make_aot_module_builder(

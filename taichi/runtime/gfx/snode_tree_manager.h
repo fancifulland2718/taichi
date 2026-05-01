@@ -26,7 +26,9 @@ class SNodeTreeManager {
     return compiled_snode_structs_;
   }
 
-  void materialize_snode_tree(SNodeTree *tree);
+  void materialize_snode_tree(
+      SNodeTree *tree,
+      const taichi::lang::spirv::PointerLayoutPolicy &policy = {});
 
   void destroy_snode_tree(SNodeTree *snode_tree);
 

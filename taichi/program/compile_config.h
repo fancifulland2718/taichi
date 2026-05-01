@@ -126,6 +126,20 @@ struct CompileConfig {
   // the offline-cache key (pure scheduling toggle — emitted bytecode is
   // byte-identical between OFF and ON).
   bool compile_dag_scheduler{true};
+  // B-2.b (2026-05): runtime gating for the four pointer-SNode allocator
+  // strategy macros that B-1 / B-2.a baked into the contract POD. Default
+  // values mirror the legacy CMake-ON state so behaviour is byte-equivalent
+  // when the user does not set the kwargs. Opt-out toggles let the user
+  // recover vanilla 1.7.4 / earlier-fork behaviour without rebuilding.
+  //   - vulkan_pointer_freelist: G1.b 自由链表回收（true=ON，layout 预留 head/links）
+  //   - vulkan_pointer_ambient_zone: G10-P2 inactive read 路由零页（true=ON）
+  //   - vulkan_pointer_cas_marker: G1.a CAS-marker-first alloc 协议（true=ON）
+  //   - vulkan_pointer_pool_fraction: 池容量收缩比例 (0,1]，1.0=不收缩
+  // 各字段语义详见 compile_doc/SNode_Vulkan_规划.md §10.4.2。
+  bool vulkan_pointer_freelist{true};
+  bool vulkan_pointer_ambient_zone{true};
+  bool vulkan_pointer_cas_marker{true};
+  double vulkan_pointer_pool_fraction{1.0};
   int max_vector_width;
   bool print_preprocessed_ir;
   bool print_ir;

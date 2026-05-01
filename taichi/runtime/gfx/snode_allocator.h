@@ -32,6 +32,7 @@
 #include <memory>
 
 #include "taichi/rhi/device.h"
+#include "taichi/codegen/spirv/spirv_allocator_contract.h"
 
 namespace taichi::lang {
 
@@ -39,35 +40,10 @@ class CommandList;  // taichi/rhi/public_device.h
 
 namespace gfx {
 
-// -----------------------------------------------------------------------------
-// SpirvAllocatorContract —— codegen 端唯一可见的 allocator 视图
-// -----------------------------------------------------------------------------
-//
-// codegen 通过这个 POD 拿到「在 root_buffer 内 emit 对该 SNode allocator 的
-// SPIR-V atomic 调用所需要的全部信息」。换实现（bump → freelist）时，
-// 这个 struct 的字段含义可能扩展（例如加 freelist_head_offset），
-// codegen 仍只发射「一处 atomic 调用」，路径不动。
-//
-// 当前 2a (bump-only) 语义：
-//   activate 槽 = OpAtomicIAdd(root_buf[watermark_offset_in_root], 1)
-//                 if (slot >= pool_capacity) → 抛 runtime error 路径
-//                 else → return pool_data_offset_in_root + slot * cell_stride_bytes
-//   clear_all  = host 侧 vkCmdFillBuffer 把 [watermark_offset_in_root, +4) 置 0
-//                                       + [pool_data_offset_in_root, +pool_capacity*cell_stride_bytes) 置 0
-//
-struct SpirvAllocatorContract {
-  // u32 atomic 计数器在 root_buffer 内的字节偏移（SPIR-V binding=0 的 buffer）
-  uint32_t watermark_offset_in_root{0};
-  // pool 数据起始字节偏移（cell payload 数组的开头）
-  uint32_t pool_data_offset_in_root{0};
-  // 池容量（cell 数）—— 编译期常量，等于该 SNode 的 num_cells_per_container
-  // worst-case 池占用 = 100%（见 workload 分析）
-  uint32_t pool_capacity{0};
-  // 单 cell payload 字节数（含子 SNode container 全部内容）
-  uint32_t cell_stride_bytes{0};
-  // 该 allocator 服务的 SNode id，仅供调试 / runtime error 信息使用
-  int32_t snode_id{-1};
-};
+// 路线 B B-1（2026-04-30）：SpirvAllocatorContract 已迁移到 codegen 层
+// （taichi/codegen/spirv/spirv_allocator_contract.h）以便 codegen 与 runtime
+// 共用同一份定义。本文件复用 spirv:: 命名空间下的同名 POD。
+using ::taichi::lang::spirv::SpirvAllocatorContract;
 
 // -----------------------------------------------------------------------------
 // DeviceNodeAllocator —— 抽象基类
@@ -126,6 +102,20 @@ class BumpOnlyDeviceNodeAllocator final : public DeviceNodeAllocator {
     // —— 把池放在 root_buffer 子区间以保持 codegen 端只看 root_buffer
     uint32_t watermark_offset_in_root{0};
     uint32_t pool_data_offset_in_root{0};
+    // 路线 B B-1：把现有 4 个编译宏的状态作为 contract 字段透传给 codegen，
+    // 当前阶段（B-1）值由 snode_struct_compiler 直接抄自 SNodeDescriptor 现存
+    // 字段（行为字节等价）；B-2 阶段才会改为运行时可调。
+    bool has_freelist{false};
+    uint32_t freelist_head_offset_in_root{0};
+    uint32_t freelist_links_offset_in_root{0};
+    bool has_ambient_zone{false};
+    uint32_t ambient_offset_in_root{0};
+    // B-2.b：把 G1.a alloc 协议与池容量比例下放到运行时；默认 CasMarker / 1.0
+    // 与历史编译宏 ON 路径字节等价。
+    ::taichi::lang::spirv::SpirvAllocatorContract::AllocProtocol
+        alloc_protocol{::taichi::lang::spirv::SpirvAllocatorContract::
+                           AllocProtocol::CasMarker};
+    double pool_fraction{1.0};
     DeviceAllocation root_buffer_alloc;
   };
 

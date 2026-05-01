@@ -104,6 +104,18 @@ static std::vector<std::uint8_t> get_offline_cache_key_of_compile_config(
     std::sort(sorted_disabled.begin(), sorted_disabled.end());
     serializer(sorted_disabled);
   }
+  // B-2.b (2026-05): the 4 vulkan_pointer_* runtime fields drive both
+  // root-buffer layout and pointer-SNode SPIR-V codegen. They MUST be
+  // part of the cache key, otherwise toggling vulkan_pointer_ambient_zone
+  // / _freelist / _cas_marker / _pool_fraction silently reuses kernels
+  // compiled under the previous flag value. Default values (True/True/
+  // True/1.0) hash deterministically so legacy users see no invalidation.
+  if (config.arch == Arch::vulkan) {
+    serializer(config.vulkan_pointer_freelist);
+    serializer(config.vulkan_pointer_ambient_zone);
+    serializer(config.vulkan_pointer_cas_marker);
+    serializer(config.vulkan_pointer_pool_fraction);
+  }
   serializer.finalize();
 
   return serializer.data;

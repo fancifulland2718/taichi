@@ -550,6 +550,11 @@ class TaskCodegen : public IRVisitor {
                                           bool do_activate) {
     const auto &snode_descs = compiled_structs_[root_id].snode_descriptors;
     const auto &desc = snode_descs.at(sn->id);
+    // 路线 B B-1：通过 SpirvAllocatorContract 间接读 pointer SNode 的池
+    // 元数据；当前阶段值与 desc.pointer_* 字节等价（snode_struct_compiler
+    // 直接抄入），后续阶段将由 GfxRuntime 端 allocator 提供。
+    const auto &contract =
+        compiled_structs_[root_id].pointer_contracts.at(sn->id);
 
     auto u32_t = ir_->u32_type();
     auto root_buffer = get_buffer_value(BufferInfo(BufferType::Root, root_id),
@@ -561,7 +566,12 @@ class TaskCodegen : public IRVisitor {
 
     spirv::Value final_slot;
     if (do_activate) {
-#if defined(TI_VULKAN_POINTER_CAS_MARKER)
+      // B-2.b（2026-05）：原 #if TI_VULKAN_POINTER_CAS_MARKER 下放为运行时
+      // contract.alloc_protocol 分支，与 layout 路径同源于 CompileConfig
+      // 上的 vulkan_pointer_cas_marker。CasMarker 路径与原宏-ON 路径字节等价；
+      // Legacy 路径与原宏-OFF (vanilla 1.7.4 atomicIAdd-first) 字节等价。
+      if (contract.alloc_protocol ==
+          SpirvAllocatorContract::AllocProtocol::CasMarker) {
       // ----------------------------------------------------------------
       // G1.a: race-correct alloc protocol (CAS-marker-first).
       //
@@ -590,7 +600,7 @@ class TaskCodegen : public IRVisitor {
       auto busy_v = ir_->uint_immediate_number(u32_t, 0xFFFFFFFFu);
       auto zero_v = ir_->uint_immediate_number(u32_t, 0);
       auto cap_v = ir_->uint_immediate_number(
-          u32_t, (uint32_t)desc.pointer_pool_capacity);
+          u32_t, contract.pool_capacity);
 
       // Step 1: stake a claim with BUSY marker.
       auto cas_marker = ir_->make_value(
@@ -612,136 +622,150 @@ class TaskCodegen : public IRVisitor {
       // ---- winner ----
       ir_->start_label(winner_label);
       auto wm_word_idx = ir_->uint_immediate_number(
-          u32_t, (uint32_t)(desc.pointer_watermark_offset_in_root / 4));
+          u32_t, contract.watermark_offset_in_root / 4u);
       auto wm_ptr =
           ir_->struct_array_access(u32_t, root_buffer, wm_word_idx);
-#if defined(TI_VULKAN_POINTER_FREELIST)
-      // G1.b: try to pop a recycled slot off the freelist before bumping
-      // the watermark. The freelist is a singly-linked stack rooted at
-      // freelist_head (offset known at codegen time). Encoding: 0 = empty,
-      // otherwise (pool_index + 1) — same as a slot value, so a successful
-      // pop yields a directly-usable new_slot.
-      //
-      //   loop:
-      //     head = atomicLoad(free_head)
-      //     if head == 0: goto bump_path
-      //     next = atomicLoad(freelist_links[head - 1])
-      //     cas  = atomicCAS(free_head, head, next)
-      //     if cas == head: new_slot_pop = head; goto publish_path
-      //     // ABA-safe under our "no concurrent push+pop" constraint;
-      //     // we just retry on contention from another popping thread.
-      //
-      // bump_path: same as the no-freelist code below — atomicIAdd watermark
-      // and capacity-clamp. publish_path stores new_slot to slot_ptr (this
-      // also releases waiters out of the spin loop).
-      auto fhead_word_idx = ir_->uint_immediate_number(
-          u32_t,
-          (uint32_t)(desc.pointer_freelist_head_offset_in_root / 4));
-      auto fhead_ptr =
-          ir_->struct_array_access(u32_t, root_buffer, fhead_word_idx);
-      auto flinks_word_base = ir_->uint_immediate_number(
-          u32_t,
-          (uint32_t)(desc.pointer_freelist_links_offset_in_root / 4));
+      // Outputs of the winner block, joined into the alloc_done OpPhi:
+      //   new_slot                  -- the slot value to publish
+      //   winner_terminator_label   -- block whose terminator branches to
+      //                                alloc_done (predecessor for OpPhi)
+      // Both branches below (freelist-pop-then-bump vs direct bump) must
+      // assign to these two variables before falling through.
+      spirv::Value new_slot;
+      spirv::Label winner_terminator_label;
+      if (contract.has_freelist) {
+        // G1.b (2026-04-30 → B-2.a 2026-05): try to pop a recycled slot
+        // off the freelist before bumping the watermark. The freelist is a
+        // singly-linked stack rooted at freelist_head (offset known at
+        // codegen time). Encoding: 0 = empty, otherwise (pool_index + 1)
+        // — same as a slot value, so a successful pop yields a directly-
+        // usable new_slot.
+        //
+        //   loop:
+        //     head = atomicLoad(free_head)
+        //     if head == 0: goto bump_path
+        //     next = atomicLoad(freelist_links[head - 1])
+        //     cas  = atomicCAS(free_head, head, next)
+        //     if cas == head: new_slot_pop = head; goto publish_path
+        //     // ABA-safe under our "no concurrent push+pop" constraint;
+        //     // we just retry on contention from another popping thread.
+        //
+        // bump_path: same as the no-freelist code below — atomicIAdd
+        // watermark and capacity-clamp. publish_path stores new_slot to
+        // slot_ptr (this also releases waiters out of the spin loop).
+        // Gating moved from `#if TI_VULKAN_POINTER_FREELIST` to runtime
+        // `contract.has_freelist` (B-2.a); layout-side `#if` in
+        // snode_struct_compiler still drives contract.has_freelist for
+        // now, so behavior is byte-equivalent.
+        auto fhead_word_idx = ir_->uint_immediate_number(
+            u32_t, contract.freelist_head_offset_in_root / 4u);
+        auto fhead_ptr =
+            ir_->struct_array_access(u32_t, root_buffer, fhead_word_idx);
+        auto flinks_word_base = ir_->uint_immediate_number(
+            u32_t, contract.freelist_links_offset_in_root / 4u);
 
-      spirv::Label fl_head_lbl = ir_->new_label();
-      spirv::Label fl_body_lbl = ir_->new_label();
-      spirv::Label fl_continue_lbl = ir_->new_label();
-      spirv::Label fl_merge_lbl = ir_->new_label();
-      spirv::Label bump_lbl = ir_->new_label();
-      spirv::Label publish_lbl = ir_->new_label();
+        spirv::Label fl_head_lbl = ir_->new_label();
+        spirv::Label fl_body_lbl = ir_->new_label();
+        spirv::Label fl_continue_lbl = ir_->new_label();
+        spirv::Label fl_merge_lbl = ir_->new_label();
+        spirv::Label bump_lbl = ir_->new_label();
+        spirv::Label publish_lbl = ir_->new_label();
 
-      ir_->make_inst(spv::OpBranch, fl_head_lbl);
+        ir_->make_inst(spv::OpBranch, fl_head_lbl);
 
-      // fl_head: load free_head, decide empty/non-empty.
-      ir_->start_label(fl_head_lbl);
-      auto fhead_cur =
-          ir_->make_value(spv::OpAtomicLoad, u32_t, fhead_ptr,
-                          /*scope=*/ir_->const_i32_one_,
-                          /*semantics=*/ir_->const_i32_zero_);
-      auto fhead_empty = ir_->make_value(spv::OpIEqual, ir_->bool_type(),
-                                         fhead_cur, zero_v);
-      ir_->make_inst(spv::OpLoopMerge, fl_merge_lbl, fl_continue_lbl,
-                     spv::LoopControlMaskNone);
-      ir_->make_inst(spv::OpBranchConditional, fhead_empty, bump_lbl,
-                     fl_body_lbl);
+        // fl_head: load free_head, decide empty/non-empty.
+        ir_->start_label(fl_head_lbl);
+        auto fhead_cur =
+            ir_->make_value(spv::OpAtomicLoad, u32_t, fhead_ptr,
+                            /*scope=*/ir_->const_i32_one_,
+                            /*semantics=*/ir_->const_i32_zero_);
+        auto fhead_empty = ir_->make_value(spv::OpIEqual, ir_->bool_type(),
+                                           fhead_cur, zero_v);
+        ir_->make_inst(spv::OpLoopMerge, fl_merge_lbl, fl_continue_lbl,
+                       spv::LoopControlMaskNone);
+        ir_->make_inst(spv::OpBranchConditional, fhead_empty, bump_lbl,
+                       fl_body_lbl);
 
-      // fl_body: try to CAS free_head from head to next.
-      ir_->start_label(fl_body_lbl);
-      auto fhead_node =
-          ir_->sub(fhead_cur, ir_->uint_immediate_number(u32_t, 1));
-      auto link_word_idx = ir_->add(flinks_word_base, fhead_node);
-      auto link_ptr =
-          ir_->struct_array_access(u32_t, root_buffer, link_word_idx);
-      auto fhead_next =
-          ir_->make_value(spv::OpAtomicLoad, u32_t, link_ptr,
-                          /*scope=*/ir_->const_i32_one_,
-                          /*semantics=*/ir_->const_i32_zero_);
-      auto fhead_cas = ir_->make_value(
-          spv::OpAtomicCompareExchange, u32_t, fhead_ptr,
-          /*scope=*/ir_->const_i32_one_,
-          /*semantics_eq=*/ir_->const_i32_zero_,
-          /*semantics_uneq=*/ir_->const_i32_zero_, fhead_next, fhead_cur);
-      auto fl_won = ir_->make_value(spv::OpIEqual, ir_->bool_type(),
-                                    fhead_cas, fhead_cur);
-      ir_->make_inst(spv::OpBranchConditional, fl_won, fl_merge_lbl,
-                     fl_continue_lbl);
+        // fl_body: try to CAS free_head from head to next.
+        ir_->start_label(fl_body_lbl);
+        auto fhead_node =
+            ir_->sub(fhead_cur, ir_->uint_immediate_number(u32_t, 1));
+        auto link_word_idx = ir_->add(flinks_word_base, fhead_node);
+        auto link_ptr =
+            ir_->struct_array_access(u32_t, root_buffer, link_word_idx);
+        auto fhead_next =
+            ir_->make_value(spv::OpAtomicLoad, u32_t, link_ptr,
+                            /*scope=*/ir_->const_i32_one_,
+                            /*semantics=*/ir_->const_i32_zero_);
+        auto fhead_cas = ir_->make_value(
+            spv::OpAtomicCompareExchange, u32_t, fhead_ptr,
+            /*scope=*/ir_->const_i32_one_,
+            /*semantics_eq=*/ir_->const_i32_zero_,
+            /*semantics_uneq=*/ir_->const_i32_zero_, fhead_next, fhead_cur);
+        auto fl_won = ir_->make_value(spv::OpIEqual, ir_->bool_type(),
+                                      fhead_cas, fhead_cur);
+        ir_->make_inst(spv::OpBranchConditional, fl_won, fl_merge_lbl,
+                       fl_continue_lbl);
 
-      // fl_continue: lost the head CAS to another popper, retry.
-      ir_->start_label(fl_continue_lbl);
-      ir_->make_inst(spv::OpBranch, fl_head_lbl);
+        // fl_continue: lost the head CAS to another popper, retry.
+        ir_->start_label(fl_continue_lbl);
+        ir_->make_inst(spv::OpBranch, fl_head_lbl);
 
-      // bump_path: freelist empty, fall back to watermark bump.
-      ir_->start_label(bump_lbl);
-      auto old_wm = ir_->make_value(spv::OpAtomicIAdd, u32_t, wm_ptr,
-                                    /*scope=*/ir_->const_i32_one_,
-                                    /*semantics=*/ir_->const_i32_zero_,
-                                    ir_->uint_immediate_number(u32_t, 1));
-      auto in_cap = ir_->make_value(spv::OpULessThan, ir_->bool_type(),
-                                    old_wm, cap_v);
-      auto new_slot_raw =
-          ir_->add(old_wm, ir_->uint_immediate_number(u32_t, 1));
-      auto new_slot_bump = ir_->make_value(spv::OpSelect, u32_t, in_cap,
-                                           new_slot_raw, zero_v);
-      ir_->make_inst(spv::OpBranch, publish_lbl);
+        // bump_path: freelist empty, fall back to watermark bump.
+        ir_->start_label(bump_lbl);
+        auto old_wm = ir_->make_value(spv::OpAtomicIAdd, u32_t, wm_ptr,
+                                      /*scope=*/ir_->const_i32_one_,
+                                      /*semantics=*/ir_->const_i32_zero_,
+                                      ir_->uint_immediate_number(u32_t, 1));
+        auto in_cap = ir_->make_value(spv::OpULessThan, ir_->bool_type(),
+                                      old_wm, cap_v);
+        auto new_slot_raw =
+            ir_->add(old_wm, ir_->uint_immediate_number(u32_t, 1));
+        auto new_slot_bump = ir_->make_value(spv::OpSelect, u32_t, in_cap,
+                                             new_slot_raw, zero_v);
+        ir_->make_inst(spv::OpBranch, publish_lbl);
 
-      // fl_merge: freelist pop succeeded; new_slot = fhead_cur (the popped
-      // head value, still in slot-value encoding).
-      ir_->start_label(fl_merge_lbl);
-      ir_->make_inst(spv::OpBranch, publish_lbl);
+        // fl_merge: freelist pop succeeded; new_slot = fhead_cur (the
+        // popped head value, still in slot-value encoding).
+        ir_->start_label(fl_merge_lbl);
+        ir_->make_inst(spv::OpBranch, publish_lbl);
 
-      // publish: phi(new_slot_bump from bump_lbl, fhead_cur from fl_merge).
-      ir_->start_label(publish_lbl);
-      auto new_slot = ir_->make_value(spv::OpPhi, u32_t, new_slot_bump,
-                                      bump_lbl, fhead_cur, fl_merge_lbl);
-      // Publish the resolved slot. Loser's spin will see this on its next
-      // atomicLoad iteration and exit.
-      ir_->make_inst(spv::OpAtomicStore, slot_ptr,
-                     /*scope=*/ir_->const_i32_one_,
-                     /*semantics=*/ir_->const_i32_zero_, new_slot);
-      ir_->make_inst(spv::OpBranch, alloc_done_label);
-      // For OpPhi at alloc_done_label: winner block's terminator is in
-      // publish_lbl, so the predecessor passed to phi must be publish_lbl.
-      spirv::Label winner_terminator_label = publish_lbl;
-#else
-      auto old_wm = ir_->make_value(spv::OpAtomicIAdd, u32_t, wm_ptr,
-                                    /*scope=*/ir_->const_i32_one_,
-                                    /*semantics=*/ir_->const_i32_zero_,
-                                    ir_->uint_immediate_number(u32_t, 1));
-      auto in_cap = ir_->make_value(spv::OpULessThan, ir_->bool_type(),
-                                    old_wm, cap_v);
-      auto new_slot_raw =
-          ir_->add(old_wm, ir_->uint_immediate_number(u32_t, 1));
-      // new_slot = in_cap ? old_wm + 1 : 0  (0 = OOC -> falls back to inactive)
-      auto new_slot = ir_->make_value(spv::OpSelect, u32_t, in_cap,
-                                      new_slot_raw, zero_v);
-      // Publish the resolved slot. Loser's spin will see this on its next
-      // atomicLoad iteration and exit.
-      ir_->make_inst(spv::OpAtomicStore, slot_ptr,
-                     /*scope=*/ir_->const_i32_one_,
-                     /*semantics=*/ir_->const_i32_zero_, new_slot);
-      ir_->make_inst(spv::OpBranch, alloc_done_label);
-      spirv::Label winner_terminator_label = winner_label;
-#endif
+        // publish: phi(new_slot_bump from bump_lbl, fhead_cur from
+        // fl_merge).
+        ir_->start_label(publish_lbl);
+        new_slot = ir_->make_value(spv::OpPhi, u32_t, new_slot_bump,
+                                   bump_lbl, fhead_cur, fl_merge_lbl);
+        // Publish the resolved slot. Loser's spin will see this on its
+        // next atomicLoad iteration and exit.
+        ir_->make_inst(spv::OpAtomicStore, slot_ptr,
+                       /*scope=*/ir_->const_i32_one_,
+                       /*semantics=*/ir_->const_i32_zero_, new_slot);
+        ir_->make_inst(spv::OpBranch, alloc_done_label);
+        // For OpPhi at alloc_done_label: winner block's terminator is in
+        // publish_lbl, so the predecessor passed to phi must be
+        // publish_lbl.
+        winner_terminator_label = publish_lbl;
+      } else {
+        auto old_wm = ir_->make_value(spv::OpAtomicIAdd, u32_t, wm_ptr,
+                                      /*scope=*/ir_->const_i32_one_,
+                                      /*semantics=*/ir_->const_i32_zero_,
+                                      ir_->uint_immediate_number(u32_t, 1));
+        auto in_cap = ir_->make_value(spv::OpULessThan, ir_->bool_type(),
+                                      old_wm, cap_v);
+        auto new_slot_raw =
+            ir_->add(old_wm, ir_->uint_immediate_number(u32_t, 1));
+        // new_slot = in_cap ? old_wm + 1 : 0  (0 = OOC -> falls back to
+        // inactive)
+        new_slot = ir_->make_value(spv::OpSelect, u32_t, in_cap,
+                                   new_slot_raw, zero_v);
+        // Publish the resolved slot. Loser's spin will see this on its
+        // next atomicLoad iteration and exit.
+        ir_->make_inst(spv::OpAtomicStore, slot_ptr,
+                       /*scope=*/ir_->const_i32_one_,
+                       /*semantics=*/ir_->const_i32_zero_, new_slot);
+        ir_->make_inst(spv::OpBranch, alloc_done_label);
+        winner_terminator_label = winner_label;
+      }
 
       // ---- waiter ----
       // Either cas_marker == BUSY (someone resolving) or cas_marker >= 1
@@ -779,7 +803,7 @@ class TaskCodegen : public IRVisitor {
       final_slot = ir_->make_value(spv::OpPhi, u32_t, new_slot,
                                    winner_terminator_label, spin_cur,
                                    spin_merge);
-#else
+      } else {  // contract.alloc_protocol == Legacy
       // ---- legacy atomicIAdd-first protocol (race-inflates watermark) ----
       // Read current slot non-atomically. The CAS below is the source of
       // truth for "who allocated"; a stale 0-read just sends us through
@@ -800,7 +824,7 @@ class TaskCodegen : public IRVisitor {
       // alloc path
       ir_->start_label(alloc_label);
       auto wm_word_idx = ir_->uint_immediate_number(
-          u32_t, (uint32_t)(desc.pointer_watermark_offset_in_root / 4));
+          u32_t, contract.watermark_offset_in_root / 4u);
       auto wm_ptr =
           ir_->struct_array_access(u32_t, root_buffer, wm_word_idx);
       auto old_wm = ir_->make_value(spv::OpAtomicIAdd, u32_t, wm_ptr,
@@ -808,7 +832,7 @@ class TaskCodegen : public IRVisitor {
                                     /*semantics=*/ir_->const_i32_zero_,
                                     ir_->uint_immediate_number(u32_t, 1));
       auto cap_v = ir_->uint_immediate_number(
-          u32_t, (uint32_t)desc.pointer_pool_capacity);
+          u32_t, contract.pool_capacity);
       auto in_cap = ir_->make_value(spv::OpULessThan, ir_->bool_type(),
                                     old_wm, cap_v);
       auto new_slot_raw = ir_->add(old_wm, ir_->uint_immediate_number(u32_t, 1));
@@ -835,7 +859,7 @@ class TaskCodegen : public IRVisitor {
       // Phi(alloc_slot from alloc_label, cur_slot from use_label)
       final_slot = ir_->make_value(spv::OpPhi, u32_t, alloc_slot, alloc_label,
                                    cur_slot, use_label);
-#endif
+      }
     } else {
       final_slot = ir_->load_variable(slot_ptr, u32_t);
     }
@@ -850,27 +874,29 @@ class TaskCodegen : public IRVisitor {
         ir_->uint_immediate_number(u32_t, 0), slot_minus_one);
 
     auto cell_stride_v =
-        ir_->uint_immediate_number(u32_t, (uint32_t)desc.cell_stride);
+        ir_->uint_immediate_number(u32_t, contract.cell_stride_bytes);
     auto pool_offset_v = ir_->uint_immediate_number(
-        u32_t, (uint32_t)desc.pointer_pool_offset_in_root);
+        u32_t, contract.pool_data_offset_in_root);
     auto cell_byte_offset = ir_->add(
         pool_offset_v, ir_->mul(effective_slot, cell_stride_v));
-#if defined(TI_VULKAN_POINTER_AMBIENT_ZONE)
-    // G10-P2 (2026-04-30): for inactive reads (do_activate=false), route
-    // the byte offset to the per-pointer-SNode ambient zone instead of
-    // pool[0]. The ambient zone is cell_stride bytes of zero-initialized
-    // memory at desc.pointer_ambient_offset_in_root, never written by
-    // any kernel; this matches LLVM's ambient_val_addr semantics so that
-    // x[inactive_idx] reads as 0 (was: garbage = whatever pool[0]
-    // happens to contain at that moment). do_activate=true keeps the
-    // legacy pool[0] fallback for OOC writes (silent loss, documented).
-    if (!do_activate) {
+    // G10-P2 (2026-04-30 → B-2.a 2026-05): for inactive reads
+    // (do_activate=false), route the byte offset to the per-pointer-SNode
+    // ambient zone instead of pool[0]. The ambient zone is cell_stride
+    // bytes of zero-initialized memory at contract.ambient_offset_in_root,
+    // never written by any kernel; this matches LLVM's ambient_val_addr
+    // semantics so that x[inactive_idx] reads as 0. do_activate=true keeps
+    // the pool[0] fallback for OOC writes (silent loss, documented).
+    // Gating moved from compile-time `#if TI_VULKAN_POINTER_AMBIENT_ZONE`
+    // to runtime `contract.has_ambient_zone` (B-2.a). Layout is still
+    // gated by the same compile-time macro in snode_struct_compiler, so
+    // contract.has_ambient_zone == (macro defined) at this stage; B-2.b
+    // will make the gate fully runtime via CompileConfig.
+    if (contract.has_ambient_zone && !do_activate) {
       auto ambient_offset_v = ir_->uint_immediate_number(
-          u32_t, (uint32_t)desc.pointer_ambient_offset_in_root);
+          u32_t, contract.ambient_offset_in_root);
       cell_byte_offset = ir_->make_value(
           spv::OpSelect, u32_t, is_zero, ambient_offset_v, cell_byte_offset);
     }
-#endif
     return cell_byte_offset;
   }
 
@@ -897,112 +923,116 @@ class TaskCodegen : public IRVisitor {
                           spirv::Value index_u32) {
     const auto &snode_descs = compiled_structs_[root_id].snode_descriptors;
     const auto &desc = snode_descs.at(sn->id);
+    // 路线 B B-1：见 pointer_lookup_or_activate 同名注释。
+    const auto &contract =
+        compiled_structs_[root_id].pointer_contracts.at(sn->id);
     auto u32_t = ir_->u32_type();
     auto root_buffer = get_buffer_value(BufferInfo(BufferType::Root, root_id),
                                         PrimitiveType::u32);
     auto idx_u32 = ir_->cast(u32_t, index_u32);
     auto slot_ptr =
         pointer_slot_ptr(root_buffer, parent_byte_offset, idx_u32);
-#if defined(TI_VULKAN_POINTER_FREELIST)
-    // G1.b: push the slot onto the freelist before clearing it, so a later
-    // activate can recycle the pool cell instead of consuming a fresh
-    // watermark slot. The freelist is a singly-linked stack rooted at
-    // freelist_head; both head and freelist_links[i] use slot-value
-    // encoding (0 = empty/tail, otherwise pool_index+1).
-    //
-    //   old_slot = atomicExchange(slot, 0)
-    //   if old_slot != 0 and old_slot != BUSY:
-    //     loop:
-    //       head = atomicLoad(free_head)
-    //       atomicStore(freelist_links[old_slot - 1], head)
-    //       cas  = atomicCAS(free_head, head, old_slot)
-    //       if cas == head: done
-    //
-    // Constraints (documented in §4.6.4):
-    //   - deactivate and activate MUST NOT race on the same root buffer
-    //     within a single dispatch (ABA on free_head is unprotected).
-    //   - BUSY (0xFFFFFFFFu) means another invocation is mid-allocation;
-    //     we leave it alone (do not exchange to 0) and skip the push, so
-    //     that activate's spin loop converges normally.
-    //
-    // SPIR-V structured-control-flow note: the outer Selection (skip if
-    // 0/BUSY) and the inner Loop must use DISTINCT merge blocks. We use
-    // deact_done_lbl as the Selection merge and loop_done_lbl as the Loop
-    // merge; loop_done_lbl branches into deact_done_lbl.
-    auto zero_v = ir_->uint_immediate_number(u32_t, 0);
-    auto busy_v = ir_->uint_immediate_number(u32_t, 0xFFFFFFFFu);
-    auto fhead_word_idx = ir_->uint_immediate_number(
-        u32_t,
-        (uint32_t)(desc.pointer_freelist_head_offset_in_root / 4));
-    auto fhead_ptr =
-        ir_->struct_array_access(u32_t, root_buffer, fhead_word_idx);
-    auto flinks_word_base = ir_->uint_immediate_number(
-        u32_t,
-        (uint32_t)(desc.pointer_freelist_links_offset_in_root / 4));
+    if (contract.has_freelist) {
+      // G1.b (2026-04-30 → B-2.a 2026-05): push the slot onto the freelist
+      // before clearing it, so a later activate can recycle the pool cell
+      // instead of consuming a fresh watermark slot. The freelist is a
+      // singly-linked stack rooted at freelist_head; both head and
+      // freelist_links[i] use slot-value encoding (0 = empty/tail,
+      // otherwise pool_index+1).
+      //
+      //   old_slot = atomicExchange(slot, 0)
+      //   if old_slot != 0 and old_slot != BUSY:
+      //     loop:
+      //       head = atomicLoad(free_head)
+      //       atomicStore(freelist_links[old_slot - 1], head)
+      //       cas  = atomicCAS(free_head, head, old_slot)
+      //       if cas == head: done
+      //
+      // Constraints (documented in §4.6.4):
+      //   - deactivate and activate MUST NOT race on the same root buffer
+      //     within a single dispatch (ABA on free_head is unprotected).
+      //   - BUSY (0xFFFFFFFFu) means another invocation is mid-allocation;
+      //     we leave it alone (do not exchange to 0) and skip the push, so
+      //     that activate's spin loop converges normally.
+      //
+      // SPIR-V structured-control-flow note: the outer Selection (skip if
+      // 0/BUSY) and the inner Loop must use DISTINCT merge blocks. We use
+      // deact_done_lbl as the Selection merge and loop_done_lbl as the
+      // Loop merge; loop_done_lbl branches into deact_done_lbl. Gating
+      // moved from `#if TI_VULKAN_POINTER_FREELIST` to runtime
+      // `contract.has_freelist` (B-2.a).
+      auto zero_v = ir_->uint_immediate_number(u32_t, 0);
+      auto busy_v = ir_->uint_immediate_number(u32_t, 0xFFFFFFFFu);
+      auto fhead_word_idx = ir_->uint_immediate_number(
+          u32_t, contract.freelist_head_offset_in_root / 4u);
+      auto fhead_ptr =
+          ir_->struct_array_access(u32_t, root_buffer, fhead_word_idx);
+      auto flinks_word_base = ir_->uint_immediate_number(
+          u32_t, contract.freelist_links_offset_in_root / 4u);
 
-    // Atomically claim and clear the slot.
-    auto old_slot = ir_->make_value(
-        spv::OpAtomicExchange, u32_t, slot_ptr,
-        /*scope=*/ir_->const_i32_one_,
-        /*semantics=*/ir_->const_i32_zero_, zero_v);
-    auto re_zero = ir_->make_value(spv::OpIEqual, ir_->bool_type(), old_slot,
-                                   zero_v);
-    auto re_busy = ir_->make_value(spv::OpIEqual, ir_->bool_type(), old_slot,
-                                   busy_v);
-    auto re_skip =
-        ir_->make_value(spv::OpLogicalOr, ir_->bool_type(), re_zero, re_busy);
+      // Atomically claim and clear the slot.
+      auto old_slot = ir_->make_value(
+          spv::OpAtomicExchange, u32_t, slot_ptr,
+          /*scope=*/ir_->const_i32_one_,
+          /*semantics=*/ir_->const_i32_zero_, zero_v);
+      auto re_zero = ir_->make_value(spv::OpIEqual, ir_->bool_type(),
+                                     old_slot, zero_v);
+      auto re_busy = ir_->make_value(spv::OpIEqual, ir_->bool_type(),
+                                     old_slot, busy_v);
+      auto re_skip = ir_->make_value(spv::OpLogicalOr, ir_->bool_type(),
+                                     re_zero, re_busy);
 
-    spirv::Label push_loop_head = ir_->new_label();
-    spirv::Label push_loop_body = ir_->new_label();
-    spirv::Label push_loop_continue = ir_->new_label();
-    spirv::Label loop_done_lbl = ir_->new_label();
-    spirv::Label deact_done_lbl = ir_->new_label();
+      spirv::Label push_loop_head = ir_->new_label();
+      spirv::Label push_loop_body = ir_->new_label();
+      spirv::Label push_loop_continue = ir_->new_label();
+      spirv::Label loop_done_lbl = ir_->new_label();
+      spirv::Label deact_done_lbl = ir_->new_label();
 
-    ir_->make_inst(spv::OpSelectionMerge, deact_done_lbl,
-                   spv::SelectionControlMaskNone);
-    ir_->make_inst(spv::OpBranchConditional, re_skip, deact_done_lbl,
-                   push_loop_head);
+      ir_->make_inst(spv::OpSelectionMerge, deact_done_lbl,
+                     spv::SelectionControlMaskNone);
+      ir_->make_inst(spv::OpBranchConditional, re_skip, deact_done_lbl,
+                     push_loop_head);
 
-    // push loop: CAS free_head from head to old_slot until success.
-    ir_->start_label(push_loop_head);
-    auto head_cur =
-        ir_->make_value(spv::OpAtomicLoad, u32_t, fhead_ptr,
-                        /*scope=*/ir_->const_i32_one_,
-                        /*semantics=*/ir_->const_i32_zero_);
-    ir_->make_inst(spv::OpLoopMerge, loop_done_lbl, push_loop_continue,
-                   spv::LoopControlMaskNone);
-    ir_->make_inst(spv::OpBranch, push_loop_body);
+      // push loop: CAS free_head from head to old_slot until success.
+      ir_->start_label(push_loop_head);
+      auto head_cur =
+          ir_->make_value(spv::OpAtomicLoad, u32_t, fhead_ptr,
+                          /*scope=*/ir_->const_i32_one_,
+                          /*semantics=*/ir_->const_i32_zero_);
+      ir_->make_inst(spv::OpLoopMerge, loop_done_lbl, push_loop_continue,
+                     spv::LoopControlMaskNone);
+      ir_->make_inst(spv::OpBranch, push_loop_body);
 
-    ir_->start_label(push_loop_body);
-    auto old_node =
-        ir_->sub(old_slot, ir_->uint_immediate_number(u32_t, 1));
-    auto link_word_idx = ir_->add(flinks_word_base, old_node);
-    auto link_ptr =
-        ir_->struct_array_access(u32_t, root_buffer, link_word_idx);
-    // Stage links[old_node] = head before the CAS publishes the new head.
-    ir_->make_inst(spv::OpAtomicStore, link_ptr,
-                   /*scope=*/ir_->const_i32_one_,
-                   /*semantics=*/ir_->const_i32_zero_, head_cur);
-    auto head_cas = ir_->make_value(
-        spv::OpAtomicCompareExchange, u32_t, fhead_ptr,
-        /*scope=*/ir_->const_i32_one_,
-        /*semantics_eq=*/ir_->const_i32_zero_,
-        /*semantics_uneq=*/ir_->const_i32_zero_, old_slot, head_cur);
-    auto pushed = ir_->make_value(spv::OpIEqual, ir_->bool_type(), head_cas,
-                                  head_cur);
-    ir_->make_inst(spv::OpBranchConditional, pushed, loop_done_lbl,
-                   push_loop_continue);
+      ir_->start_label(push_loop_body);
+      auto old_node =
+          ir_->sub(old_slot, ir_->uint_immediate_number(u32_t, 1));
+      auto link_word_idx = ir_->add(flinks_word_base, old_node);
+      auto link_ptr =
+          ir_->struct_array_access(u32_t, root_buffer, link_word_idx);
+      // Stage links[old_node] = head before the CAS publishes the new head.
+      ir_->make_inst(spv::OpAtomicStore, link_ptr,
+                     /*scope=*/ir_->const_i32_one_,
+                     /*semantics=*/ir_->const_i32_zero_, head_cur);
+      auto head_cas = ir_->make_value(
+          spv::OpAtomicCompareExchange, u32_t, fhead_ptr,
+          /*scope=*/ir_->const_i32_one_,
+          /*semantics_eq=*/ir_->const_i32_zero_,
+          /*semantics_uneq=*/ir_->const_i32_zero_, old_slot, head_cur);
+      auto pushed = ir_->make_value(spv::OpIEqual, ir_->bool_type(), head_cas,
+                                    head_cur);
+      ir_->make_inst(spv::OpBranchConditional, pushed, loop_done_lbl,
+                     push_loop_continue);
 
-    ir_->start_label(push_loop_continue);
-    ir_->make_inst(spv::OpBranch, push_loop_head);
+      ir_->start_label(push_loop_continue);
+      ir_->make_inst(spv::OpBranch, push_loop_head);
 
-    ir_->start_label(loop_done_lbl);
-    ir_->make_inst(spv::OpBranch, deact_done_lbl);
+      ir_->start_label(loop_done_lbl);
+      ir_->make_inst(spv::OpBranch, deact_done_lbl);
 
-    ir_->start_label(deact_done_lbl);
-#else
-    ir_->store_variable(slot_ptr, ir_->uint_immediate_number(u32_t, 0));
-#endif
+      ir_->start_label(deact_done_lbl);
+    } else {
+      ir_->store_variable(slot_ptr, ir_->uint_immediate_number(u32_t, 0));
+    }
   }
 
   void visit(SNodeOpStmt *stmt) override {
@@ -3236,8 +3266,11 @@ class TaskCodegen : public IRVisitor {
           // The pointer SNode has a single child whose mem_offset is 0 in
           // the pool entry, so we add path[k+1].mem_offset for symmetry
           // with the dense path (in practice this is 0 today).
+          // 路线 B B-1：通过 contract 读取 pool 偏移。
+          const auto &contract_k =
+              compiled_structs_[root_id].pointer_contracts.at(path[k]->id);
           auto pool_offset_v = ir_->uint_immediate_number(
-              u32_t, (uint32_t)desc_k.pointer_pool_offset_in_root);
+              u32_t, contract_k.pool_data_offset_in_root);
           auto step = ir_->mul(pointer_effective_slot, cell_stride_v);
           addr = ir_->add(pool_offset_v, step);
           addr = ir_->add(

@@ -8,22 +8,15 @@ namespace taichi::lang {
 namespace spirv {
 namespace {
 
-#if defined(TI_VULKAN_POINTER_POOL_FRACTION)
-// G2 (2026-04-30): allow shrinking the pool capacity reserved for pointer
-// SNodes via the TI_VULKAN_POOL_FRACTION env var. Default = 1.0 (the legacy
-// behaviour, byte-identical to the OFF path). Lower fractions trade memory
-// for the assumption that the user's working set is far below the
-// worst-case product of nested pointer dimensions; combined with G1.b
-// freelist recycling, deactivated cells return to the pool so steady-state
-// occupancy — not peak — drives the actual demand. Out-of-capacity
-// activations fall back to slot=0 (silent inactive) per the existing
-// cap_v guard in pointer_lookup_or_activate; this is the same safe
-// degradation as `ti.activate` racing past the watermark.
-//
-// Read once on first call and cached. Invalid / unset / out-of-range
-// values (<= 0 or > 1) are treated as 1.0.
-static double get_pool_fraction() {
-  static double cached = []() -> double {
+// B-2.b（2026-05）：运行时 pool_fraction 读取仅下放到主路径 if-分支，不再
+// 从 TI_VULKAN_POOL_FRACTION 环境变量读取。环境变量仍是全局 fallback：
+// 未传入 policy.pool_fraction（1.0）且环境变量合法时，该环境变量被应用。
+// 优先列表：policy.pool_fraction (不为 1.0) > env > 1.0。
+static double resolve_pool_fraction(double policy_value) {
+  if (policy_value > 0.0 && policy_value <= 1.0 && policy_value < 1.0) {
+    return policy_value;
+  }
+  static double cached_env = []() -> double {
     const char *env = std::getenv("TI_VULKAN_POOL_FRACTION");
     if (!env) {
       return 1.0;
@@ -35,12 +28,14 @@ static double get_pool_fraction() {
     }
     return v;
   }();
-  return cached;
+  return cached_env;
 }
-#endif
 
 class StructCompiler {
  public:
+  explicit StructCompiler(const PointerLayoutPolicy &policy)
+      : policy_(policy) {}
+
   CompiledSNodeStructs run(SNode &root) {
     TI_ASSERT(root.type == SNodeType::root);
 
@@ -65,11 +60,10 @@ class StructCompiler {
       // where the same descriptor is re-instantiated under every parent
       // cell.
       size_t capacity = desc.total_num_cells_from_root;
-#if defined(TI_VULKAN_POINTER_POOL_FRACTION)
-      // G2: shrink to user-specified fraction of the worst case. Lower
-      // bound by num_cells_per_container so the smallest sane case
-      // (single instance) is never under-provisioned.
-      const double frac = get_pool_fraction();
+      // B-2.b: 原 #if TI_VULKAN_POINTER_POOL_FRACTION 分支下放为运行时
+      // policy_.pool_fraction；resolve_pool_fraction 会优先读 policy，其次
+      // fall back 到环境变量 TI_VULKAN_POOL_FRACTION。
+      const double frac = resolve_pool_fraction(policy_.pool_fraction);
       if (frac < 1.0) {
         const size_t scaled = static_cast<size_t>(
             static_cast<double>(capacity) * frac + 0.5);
@@ -77,7 +71,6 @@ class StructCompiler {
             static_cast<size_t>(desc.snode->num_cells_per_container);
         capacity = std::max<size_t>(scaled, lower_bound);
       }
-#endif
       const size_t cell_bytes = desc.cell_stride;
       // u32 alignment for atomic ops on the watermark (root_size is already a
       // multiple of 4 because every preceding container size is, but be
@@ -85,16 +78,18 @@ class StructCompiler {
       result.root_size = (result.root_size + 3u) & ~size_t(3);
       desc.pointer_watermark_offset_in_root = result.root_size;
       result.root_size += 4;
-#if defined(TI_VULKAN_POINTER_FREELIST)
-      // G1.b: insert freelist header + links between watermark and the
-      // pool data region. freelist_head is a single u32 sentinel; the
-      // links table is u32[capacity]. Both zero-initialized by the
-      // root buffer memset on construction (= empty freelist).
-      desc.pointer_freelist_head_offset_in_root = result.root_size;
-      result.root_size += 4;
-      desc.pointer_freelist_links_offset_in_root = result.root_size;
-      result.root_size += 4 * capacity;
-#endif
+      // B-2.b: 原 #if TI_VULKAN_POINTER_FREELIST 布局下放为运行时 policy_.freelist。
+      // OFF 时不预留 head/links，contract.has_freelist=false，codegen 也不走 freelist 路径。
+      if (policy_.freelist) {
+        // G1.b: insert freelist header + links between watermark and the
+        // pool data region. freelist_head is a single u32 sentinel; the
+        // links table is u32[capacity]. Both zero-initialized by the
+        // root buffer memset on construction (= empty freelist).
+        desc.pointer_freelist_head_offset_in_root = result.root_size;
+        result.root_size += 4;
+        desc.pointer_freelist_links_offset_in_root = result.root_size;
+        result.root_size += 4 * capacity;
+      }
       // Pool data starts on a 4-byte boundary; cell_bytes itself is a
       // multiple of 4 in practice (smallest primitive is 4-byte i32/f32),
       // but keep the rounding for defensiveness.
@@ -102,20 +97,59 @@ class StructCompiler {
       desc.pointer_pool_offset_in_root = result.root_size;
       desc.pointer_pool_capacity = capacity;
       result.root_size += cell_bytes * capacity;
-#if defined(TI_VULKAN_POINTER_AMBIENT_ZONE)
-      // G10-P2: append a zero-initialized cell-sized ambient zone.
-      // pointer_lookup_or_activate(do_activate=false) returns this offset
-      // when slot==0, so inactive reads always observe zero (matches
-      // LLVM ambient_val_addr semantics). Never written by any kernel.
-      // Root buffer is memset(0) by GfxRuntime::add_root_buffer, so no
-      // additional init is required.
-      result.root_size = (result.root_size + 3u) & ~size_t(3);
-      desc.pointer_ambient_offset_in_root = result.root_size;
-      result.root_size += cell_bytes;
-#endif
+      // B-2.b: 原 #if TI_VULKAN_POINTER_AMBIENT_ZONE 下放为运行时 policy_.ambient_zone。
+      if (policy_.ambient_zone) {
+        // G10-P2: append a zero-initialized cell-sized ambient zone.
+        // pointer_lookup_or_activate(do_activate=false) returns this offset
+        // when slot==0, so inactive reads always observe zero (matches
+        // LLVM ambient_val_addr semantics). Never written by any kernel.
+        // Root buffer is memset(0) by GfxRuntime::add_root_buffer, so no
+        // additional init is required.
+        result.root_size = (result.root_size + 3u) & ~size_t(3);
+        desc.pointer_ambient_offset_in_root = result.root_size;
+        result.root_size += cell_bytes;
+      }
     }
 
     result.snode_descriptors = std::move(snode_descriptors_);
+    // 路线 B B-1（2026-04-30）：把每个 pointer SNode 的 pointer_* 字段
+    // 投影成 SpirvAllocatorContract 存入 result.pointer_contracts。codegen
+    // 通过 contract 读偏移而非直接访问 SNodeDescriptor，为后续把池迁出
+    // root_buffer 留接口。本步骤值字节等价。
+    for (const auto &[sid, desc] : result.snode_descriptors) {
+      if (desc.snode == nullptr || desc.snode->type != SNodeType::pointer) {
+        continue;
+      }
+      SpirvAllocatorContract c;
+      c.snode_id = sid;
+      c.watermark_offset_in_root =
+          static_cast<uint32_t>(desc.pointer_watermark_offset_in_root);
+      c.pool_data_offset_in_root =
+          static_cast<uint32_t>(desc.pointer_pool_offset_in_root);
+      c.pool_capacity = static_cast<uint32_t>(desc.pointer_pool_capacity);
+      c.cell_stride_bytes = static_cast<uint32_t>(desc.cell_stride);
+      // B-2.b: contract 上的 has_freelist / has_ambient_zone 现从 policy 读，
+      // 与 layout 路径同源；alloc_protocol 与 pool_fraction 同样下放。
+      if (policy_.freelist) {
+        c.has_freelist = true;
+        c.freelist_head_offset_in_root = static_cast<uint32_t>(
+            desc.pointer_freelist_head_offset_in_root);
+        c.freelist_links_offset_in_root = static_cast<uint32_t>(
+            desc.pointer_freelist_links_offset_in_root);
+      }
+      if (policy_.ambient_zone) {
+        c.has_ambient_zone = true;
+        c.ambient_offset_in_root =
+            static_cast<uint32_t>(desc.pointer_ambient_offset_in_root);
+      }
+      c.alloc_protocol =
+          policy_.cas_marker
+              ? SpirvAllocatorContract::AllocProtocol::CasMarker
+              : SpirvAllocatorContract::AllocProtocol::Legacy;
+      c.pool_fraction =
+          resolve_pool_fraction(policy_.pool_fraction);
+      result.pointer_contracts.emplace(sid, c);
+    }
     /*
     result.type_factory = new tinyir::Block;
     result.root_type = construct(*result.type_factory, &root);
@@ -319,12 +353,15 @@ class StructCompiler {
   }
 
   SNodeDescriptorsMap snode_descriptors_;
+  PointerLayoutPolicy policy_;
 };
 
 }  // namespace
 
-CompiledSNodeStructs compile_snode_structs(SNode &root) {
-  StructCompiler compiler;
+CompiledSNodeStructs compile_snode_structs(
+    SNode &root,
+    const PointerLayoutPolicy &policy) {
+  StructCompiler compiler(policy);
   return compiler.run(root);
 }
 

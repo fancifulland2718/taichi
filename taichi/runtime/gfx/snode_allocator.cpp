@@ -72,6 +72,16 @@ SpirvAllocatorContract BumpOnlyDeviceNodeAllocator::spirv_contract() const {
   c.pool_capacity = static_cast<uint32_t>(params_.pool_capacity);
   c.cell_stride_bytes = static_cast<uint32_t>(params_.cell_payload_bytes);
   c.snode_id = params_.snode_id;
+  // 路线 B B-1：透传 freelist / ambient zone 元数据。当前由 SNode struct
+  // compiler 直接用 SNodeDescriptor 的现存字段填入，行为字节等价。
+  c.has_freelist = params_.has_freelist;
+  c.freelist_head_offset_in_root = params_.freelist_head_offset_in_root;
+  c.freelist_links_offset_in_root = params_.freelist_links_offset_in_root;
+  c.has_ambient_zone = params_.has_ambient_zone;
+  c.ambient_offset_in_root = params_.ambient_offset_in_root;
+  // B-2.b：透传 alloc 协议 / pool_fraction 给 codegen / 调试日志。
+  c.alloc_protocol = params_.alloc_protocol;
+  c.pool_fraction = params_.pool_fraction;
   return c;
 }
 

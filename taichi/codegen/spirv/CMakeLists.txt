@@ -28,36 +28,16 @@ target_link_libraries(spirv_codegen PRIVATE taichi_util)
 # https://github.com/KhronosGroup/SPIRV-Tools/issues/1569#issuecomment-390250792
 target_link_libraries(spirv_codegen PRIVATE SPIRV-Tools-opt ${SPIRV_TOOLS})
 
-# G1.a (2026-04-30): pointer-SNode alloc protocol fix.
-# Default ON: race-correct CAS-marker-first protocol replaces the older
-# atomicIAdd-first protocol. The old protocol over-consumes pool watermark
-# under concurrent activation of the same slot (see
-# compile_doc/SNode_Vulkan_规划.md §4.6.3).
-# Default OFF would only be used as an emergency fallback if the structured
-# spin loop misbehaves on a specific Vulkan driver / GPU family.
-option(TI_VULKAN_POINTER_CAS_MARKER
-  "Use CAS-marker-first protocol for pointer-SNode allocation on Vulkan (race-correct)" ON)
-if(TI_VULKAN_POINTER_CAS_MARKER)
-  target_compile_definitions(spirv_codegen PRIVATE TI_VULKAN_POINTER_CAS_MARKER=1)
-endif()
-
-# G1.b (2026-04-30): pointer-SNode freelist + recycle on deactivate.
-# Default ON: alloc tries freelist pop before bumping the watermark, and
-# deactivate pushes the released slot onto the freelist. Eliminates the
-# pool-monotonic-growth issue (§4.4 R3) and shrinks effective working set
-# under repeated activate/deactivate cycles.
-# Constraint: deactivate and activate MUST NOT run concurrently in the same
-# kernel (ABA on free_head is not protected); typical usage is per-frame
-# deactivate_all on host followed by per-frame activate, which is naturally
-# separated. See compile_doc/SNode_Vulkan_规划.md §4.6.4.
-option(TI_VULKAN_POINTER_FREELIST
-  "Enable freelist + recycle for pointer-SNode on Vulkan (requires CAS-marker)" ON)
-if(TI_VULKAN_POINTER_FREELIST)
-  if(NOT TI_VULKAN_POINTER_CAS_MARKER)
-    message(FATAL_ERROR "TI_VULKAN_POINTER_FREELIST requires TI_VULKAN_POINTER_CAS_MARKER=ON")
-  endif()
-  target_compile_definitions(spirv_codegen PRIVATE TI_VULKAN_POINTER_FREELIST=1)
-endif()
+# B-2.b (2026-05): the four pointer-SNode policy macros below have been
+# promoted to runtime fields on `CompileConfig` (vulkan_pointer_freelist /
+# _ambient_zone / _cas_marker / _pool_fraction). Defaults (true/true/true/
+# 1.0) match the legacy CMake-ON behavior, so the build no longer carries
+# any compile-time switch for them. Override at runtime via ti.init kwargs.
+# Removed:
+#   - TI_VULKAN_POINTER_CAS_MARKER  (G1.a, was default ON)
+#   - TI_VULKAN_POINTER_FREELIST    (G1.b, was default ON)
+#   - TI_VULKAN_POINTER_POOL_FRACTION (G2,  was default ON)
+#   - TI_VULKAN_POINTER_AMBIENT_ZONE  (G10-P2, was default ON)
 
 # G4 (2026-04-30): dynamic SNode support on Vulkan.
 # Default ON: enables ti.append / ti.length / ti.deactivate / struct_for on
@@ -73,35 +53,6 @@ if(TI_VULKAN_DYNAMIC)
   target_compile_definitions(spirv_codegen PRIVATE TI_VULKAN_DYNAMIC=1)
 endif()
 
-# G2 (2026-04-30): allow shrinking pointer-pool capacity at materialization
-# time via the TI_VULKAN_POOL_FRACTION env var (default 1.0 = legacy
-# worst-case reservation). When the flag is OFF the env var is ignored and
-# the pool always reserves total_num_cells_from_root cells per pointer
-# SNode, byte-identical to the pre-G2 layout. Combined with G1.b
-# freelist recycling, lower fractions trade memory for the assumption that
-# steady-state activations stay below the worst case; out-of-capacity
-# activations gracefully fall back to slot=0 (silent inactive) per the
-# existing cap_v guard. Default ON because the env var alone defaults to
-# 1.0; users opting in must set TI_VULKAN_POOL_FRACTION explicitly.
-option(TI_VULKAN_POINTER_POOL_FRACTION
-  "Enable TI_VULKAN_POOL_FRACTION env var to shrink pointer-pool capacity" ON)
-if(TI_VULKAN_POINTER_POOL_FRACTION)
-  target_compile_definitions(spirv_codegen PRIVATE TI_VULKAN_POINTER_POOL_FRACTION=1)
-endif()
-
-# G10-P2 (2026-04-30): ambient-zone fallback for inactive pointer-SNode reads.
-# Default ON: appends a zero-initialized cell-sized region per pointer SNode
-# at the end of its pool, and routes `pointer_lookup_or_activate(
-# do_activate=false)` (i.e. read accesses to inactive cells) to that region
-# instead of pool[0]. Aligns Vulkan's behavior with LLVM's `ambient_val_addr`
-# semantics — `x[inactive_idx]` reads as zero rather than as whatever
-# pool[0] currently contains. Fixes the user-reported "inactive read
-# returns garbage" issue (compile_doc/SNode_Vulkan_规划.md §9.2). Memory
-# overhead is one cell_stride per pointer SNode (typically a few KiB).
-# Default OFF would only be used as an emergency rollback to the legacy
-# pool[0] fallback.
-option(TI_VULKAN_POINTER_AMBIENT_ZONE
-  "Route inactive pointer-SNode reads to a zero ambient zone (LLVM-equivalent)" ON)
-if(TI_VULKAN_POINTER_AMBIENT_ZONE)
-  target_compile_definitions(spirv_codegen PRIVATE TI_VULKAN_POINTER_AMBIENT_ZONE=1)
-endif()
+# (B-2.b) Removed compile-time options TI_VULKAN_POINTER_POOL_FRACTION and
+# TI_VULKAN_POINTER_AMBIENT_ZONE — see header comment near the top of this
+# file. Both are runtime CompileConfig fields now.
