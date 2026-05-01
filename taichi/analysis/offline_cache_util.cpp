@@ -120,6 +120,10 @@ static std::vector<std::uint8_t> get_offline_cache_key_of_compile_config(
     // 即使 codegen 在 B-3.b 不读 binding_id，提前纳入 cache key 避免 B-3.c
     // 切换 codegen 后命中旧缓存。默认 false 哈希稳定。
     serializer(config.vulkan_pointer_independent_pool);
+    // C-2.1 (2026-05): allocator_kind 选不同 allocator 实现 → SPIR-V kernel
+    // 寻址（C-2.3 起）和 SNodeTree allocator 构造均不同；必须进入 cache key。
+    // 默认 "bump" 字符串哈希稳定，旧用户无 invalidation。
+    serializer(config.vulkan_pointer_allocator_kind);
   }
   serializer.finalize();
 

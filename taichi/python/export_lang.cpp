@@ -194,6 +194,8 @@ void export_lang(py::module &m) {
                      &CompileConfig::vulkan_pointer_pool_fraction)
       .def_readwrite("vulkan_pointer_independent_pool",
                      &CompileConfig::vulkan_pointer_independent_pool)
+      .def_readwrite("vulkan_pointer_allocator_kind",
+                     &CompileConfig::vulkan_pointer_allocator_kind)
       .def_readwrite("print_ir", &CompileConfig::print_ir)
       .def_readwrite("print_preprocessed_ir",
                      &CompileConfig::print_preprocessed_ir)

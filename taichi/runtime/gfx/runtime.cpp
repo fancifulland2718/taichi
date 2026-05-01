@@ -387,15 +387,15 @@ GfxRuntime::KernelHandle GfxRuntime::register_taichi_kernel(
 #if defined(TI_WITH_VULKAN_POINTER)
   // B-3.b (2026-05): 枚举所有独立 pool buffer。allocator->independent_pool_alloc()
   // 返回 nullptr 表示该 SNode 仍走 root_buffer 子区间（在 vector 中跳过）。
+  // C-2.2 (2026-05): independent_pool_alloc() 已升级为 DeviceNodeAllocator 基类
+  // 虚方法，BumpOnly 与 Chunked skeleton 都能透出 chunk[0] DeviceAllocation。
   for (const auto &[rid, sid_to_alloc] : node_allocators_) {
     (void)rid;
     for (const auto &[sid, allocator_ptr] : sid_to_alloc) {
-      auto *bump = dynamic_cast<BumpOnlyDeviceNodeAllocator *>(
-          allocator_ptr.get());
-      if (bump == nullptr) {
+      if (allocator_ptr == nullptr) {
         continue;
       }
-      DeviceAllocation *indep = bump->independent_pool_alloc();
+      DeviceAllocation *indep = allocator_ptr->independent_pool_alloc();
       if (indep != nullptr) {
         params.node_allocator_pool_buffers.emplace_back(sid, indep);
       }

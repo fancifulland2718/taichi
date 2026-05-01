@@ -30,6 +30,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "taichi/rhi/device.h"
 #include "taichi/codegen/spirv/spirv_allocator_contract.h"
@@ -74,6 +75,11 @@ class DeviceNodeAllocator {
 
   // codegen 端用：返回发射 SPIR-V allocate/lookup 所需的 contract
   virtual SpirvAllocatorContract spirv_contract() const = 0;
+
+  // B-3.b / C-2.2：如果 allocator 拥有独立 pool / chunk[0]
+  // DeviceAllocation，返回指针供 runtime 注入 descriptor set
+  // ；nullptr = 走 root_buffer 子区间（与 B-3.a 及以前一致）。
+  virtual DeviceAllocation *independent_pool_alloc() const { return nullptr; }
 };
 
 // -----------------------------------------------------------------------------
@@ -122,6 +128,14 @@ class BumpOnlyDeviceNodeAllocator final : public DeviceNodeAllocator {
     // descriptor binding 使用，实际上是 dead allocation（B-3.c 切 codegen）。
     bool use_independent_pool{false};
     std::size_t independent_pool_size{0};
+    // C-2.1 (2026-05): allocator_kind 由 contract 透传到 Params；BumpOnly
+    // 仅在工厂端检查并拒绝 Chunked，不读取 chunk_* 字段。
+    ::taichi::lang::spirv::SpirvAllocatorContract::AllocatorKind
+        allocator_kind{::taichi::lang::spirv::SpirvAllocatorContract::
+                           AllocatorKind::Bump};
+    uint32_t chunk_log2_capacity{0};
+    uint32_t max_chunks{0};
+    int32_t chunk_descriptor_array_first_binding{-1};
   };
 
   explicit BumpOnlyDeviceNodeAllocator(const Params &p);
@@ -137,7 +151,7 @@ class BumpOnlyDeviceNodeAllocator final : public DeviceNodeAllocator {
 
   // B-3.b (2026-05): 返回独立 pool DeviceAllocation 指针供 runtime 注入
   // descriptor set；nullptr = 未开独立池（走 root_buffer 子区间）。
-  DeviceAllocation *independent_pool_alloc() const;
+  DeviceAllocation *independent_pool_alloc() const override;
 
  private:
   Params params_;
@@ -146,9 +160,53 @@ class BumpOnlyDeviceNodeAllocator final : public DeviceNodeAllocator {
   std::unique_ptr<DeviceAllocationGuard> independent_pool_guard_;
 };
 
-// 工厂：路线切换的唯一入口（未来 freelist 实现也走这里）
+// -----------------------------------------------------------------------------
+// ChunkedDeviceNodeAllocator —— C-2.2 skeleton（2026-05-01）
+// -----------------------------------------------------------------------------
 //
-// 当前实现只支持 bump-only；后续若加 freelist，只在此处加一个 enum 分支。
+// C-2.2 阶段目标（参见 SNode_Vulkan_规划.md §12.2）：
+//
+//   - 引入「pool 由 N 个 chunk DeviceAllocation 组成」的 runtime 结构；
+//   - **shader 寻址不变**（仍走 BumpOnly 的单 buffer 路径），因此 C-2.2 单独
+//     启用时 byte-equivalent，可放心 ON/OFF 双向测试；
+//   - 暴露 `chunks()` / `num_chunks()` 给后续 C-2.3，让 codegen 在 descriptor
+//     probe 通过且 kind=chunked 时切换为 chunk-array indexing。
+//
+// 当前 skeleton 实现策略：内部 own 一个 BumpOnlyDeviceNodeAllocator，强制
+// `use_independent_pool=true`，把那块独立 DeviceAllocation 视为 chunk[0]。
+// `initial_chunks=1`，max_chunks 来自 contract 的 max_chunks（0 = 无限，
+// skeleton 阶段都只 alloc 1 个）。virtual 接口全部转发，与 BumpOnly 字节等价。
+//
+class ChunkedDeviceNodeAllocator final : public DeviceNodeAllocator {
+ public:
+  using Params = BumpOnlyDeviceNodeAllocator::Params;
+
+  explicit ChunkedDeviceNodeAllocator(const Params &p);
+  ~ChunkedDeviceNodeAllocator() override;
+
+  DeviceAllocation pool_buffer() const override;
+  std::size_t pool_capacity() const override;
+  std::size_t cell_payload_bytes() const override;
+  void clear_all(CommandList *cmd) override;
+  SpirvAllocatorContract spirv_contract() const override;
+  DeviceAllocation *independent_pool_alloc() const override;
+
+  // C-2.2 新增：chunk descriptor list（C-2.3 的 codegen 入口）。
+  // skeleton 阶段始终返回 1 元素 list（chunk[0] = 独立 pool buffer）。
+  std::vector<DeviceAllocation> chunks() const;
+  uint32_t num_chunks() const { return 1; }
+
+ private:
+  // 内部组合：BumpOnly 已经实现 watermark + 整池清零 + spirv_contract。
+  std::unique_ptr<BumpOnlyDeviceNodeAllocator> bump_;
+};
+
+// 工厂：路线切换的唯一入口。
+//
+// 分支：
+//   - allocator_kind=Bump（默认）：返回 BumpOnlyDeviceNodeAllocator；
+//   - allocator_kind=Chunked（C-2.2+）：返回 ChunkedDeviceNodeAllocator
+//     skeleton（1 chunk = 整池，shader 寻址不变，byte-equivalent）。
 std::unique_ptr<DeviceNodeAllocator> create_device_node_allocator(
     const BumpOnlyDeviceNodeAllocator::Params &params);
 

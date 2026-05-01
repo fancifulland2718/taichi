@@ -124,12 +124,81 @@ SpirvAllocatorContract BumpOnlyDeviceNodeAllocator::spirv_contract() const {
 }
 
 // -----------------------------------------------------------------------------
+// ChunkedDeviceNodeAllocator —— C-2.2 skeleton
+// -----------------------------------------------------------------------------
+//
+// 见 snode_allocator.h 顶部注释：当前 skeleton 仅 own 一个 BumpOnly 子分配器
+// 并强制独立 pool（chunk[0] = 独立 DeviceAllocation）；shader 寻址完全不变。
+// chunks() 暴露 1 元素 list 供 C-2.3 的 codegen 替换为 descriptor-array 寻址。
+//
+ChunkedDeviceNodeAllocator::ChunkedDeviceNodeAllocator(const Params &p) {
+  // C-2.2 skeleton：byte-equivalent 路径必须有独立 pool buffer（即使
+  // codegen 仍读 root_buffer，B-3.b 保证独立 buffer 在初始化时被清零；
+  // 后续 C-2.3 把 codegen 切到 chunk[0] 时直接复用）。
+  Params bump_params = p;
+  bump_params.use_independent_pool = true;
+  if (bump_params.independent_pool_size == 0) {
+    // independent_pool_size 由 snode_struct_compiler 在 B-3.b 起填入；
+    // 若上层未填（例如老路径未 opt-in B-3.b），按 contract 自计算下界：
+    // watermark(4B) + freelist + ambient + pool_data。skeleton 用最简
+    // 上界：pool_data_offset + pool_capacity * cell_payload_bytes。
+    bump_params.independent_pool_size =
+        static_cast<std::size_t>(p.pool_data_offset) +
+        p.pool_capacity * p.cell_payload_bytes;
+  }
+  bump_ = std::make_unique<BumpOnlyDeviceNodeAllocator>(bump_params);
+}
+
+ChunkedDeviceNodeAllocator::~ChunkedDeviceNodeAllocator() = default;
+
+DeviceAllocation ChunkedDeviceNodeAllocator::pool_buffer() const {
+  return bump_->pool_buffer();
+}
+
+std::size_t ChunkedDeviceNodeAllocator::pool_capacity() const {
+  return bump_->pool_capacity();
+}
+
+std::size_t ChunkedDeviceNodeAllocator::cell_payload_bytes() const {
+  return bump_->cell_payload_bytes();
+}
+
+void ChunkedDeviceNodeAllocator::clear_all(CommandList *cmd) {
+  bump_->clear_all(cmd);
+}
+
+SpirvAllocatorContract ChunkedDeviceNodeAllocator::spirv_contract() const {
+  // C-2.2 skeleton：contract 与 BumpOnly 完全一致（shader 寻址不变）。
+  // C-2.3 起会在 contract 上把 allocator_kind=Chunked + chunk_* 字段
+  // 进一步透传给 SPIR-V codegen 切换到 chunk-array indexing。
+  return bump_->spirv_contract();
+}
+
+DeviceAllocation *ChunkedDeviceNodeAllocator::independent_pool_alloc() const {
+  return bump_->independent_pool_alloc();
+}
+
+std::vector<DeviceAllocation> ChunkedDeviceNodeAllocator::chunks() const {
+  // skeleton：单 chunk = 独立 pool buffer。C-2.2 暂时复用 pool_buffer()，
+  // C-2.3 起会随 grow 操作动态 push_back。
+  return {bump_->pool_buffer()};
+}
+
+// -----------------------------------------------------------------------------
 // Factory
 // -----------------------------------------------------------------------------
 
 std::unique_ptr<DeviceNodeAllocator> create_device_node_allocator(
     const BumpOnlyDeviceNodeAllocator::Params &params) {
-  // Phase 2a 只此一种实现；将来加 freelist 时在此处分支。
+  // C-2.1 (2026-05): allocator_kind 工厂分支。
+  // C-2.2 (2026-05): Chunked skeleton 上线，与 Bump 字节等价（1 chunk =
+  //   整池 + shader 寻址不变）。默认仍为 Bump，C-2.3 完成 shader 切换并
+  //   验证 grow 收益后再考虑 flip。任一路径都不得 silent 降级。
+  using AllocatorKind =
+      ::taichi::lang::spirv::SpirvAllocatorContract::AllocatorKind;
+  if (params.allocator_kind == AllocatorKind::Chunked) {
+    return std::make_unique<ChunkedDeviceNodeAllocator>(params);
+  }
   return std::make_unique<BumpOnlyDeviceNodeAllocator>(params);
 }
 

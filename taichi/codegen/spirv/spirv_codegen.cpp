@@ -922,8 +922,44 @@ class TaskCodegen : public IRVisitor {
         ir_->uint_immediate_number(u32_t, contract.cell_stride_bytes);
     auto pool_offset_v = ir_->uint_immediate_number(
         u32_t, contract.pool_data_offset);
-    auto cell_byte_offset = ir_->add(
-        pool_offset_v, ir_->mul(effective_slot, cell_stride_v));
+    spirv::Value cell_byte_offset;
+    if (contract.allocator_kind ==
+        SpirvAllocatorContract::AllocatorKind::Chunked) {
+      // C-2.3 (2026-05): chunked-allocator addressing。把 effective_slot
+      // 拆为 (chunk_idx, local_slot) 对：
+      //   chunk_idx  = slot >> chunk_log2_capacity
+      //   local_slot = slot &  ((1 << chunk_log2_capacity) - 1)
+      //   cell_byte  = pool_data_offset
+      //              + chunk_idx * (1 << chunk_log2_capacity) * cell_stride
+      //              + local_slot * cell_stride
+      // 当 1 << chunk_log2_capacity >= pool_capacity（由 snode_struct_compiler
+      // 在 C-2.3 保证）时，slot 恒落在 chunk[0]，与 Bump 路径字节等价；
+      // C-2.4 起才允许 chunk_idx > 0 并接 descriptor array 拼出多 chunk
+      // physical buffer。
+      const uint32_t chunk_log2 = contract.chunk_log2_capacity;
+      TI_ASSERT(chunk_log2 < 32);
+      const uint32_t chunk_size_cells = 1u << chunk_log2;
+      const uint64_t chunk_size_bytes_64 =
+          static_cast<uint64_t>(chunk_size_cells) *
+          static_cast<uint64_t>(contract.cell_stride_bytes);
+      TI_ASSERT(chunk_size_bytes_64 <= 0xffffffffull);
+      auto chunk_log2_v = ir_->uint_immediate_number(u32_t, chunk_log2);
+      auto chunk_mask_v =
+          ir_->uint_immediate_number(u32_t, chunk_size_cells - 1u);
+      auto chunk_size_bytes_v = ir_->uint_immediate_number(
+          u32_t, static_cast<uint32_t>(chunk_size_bytes_64));
+      auto chunk_idx = ir_->make_value(
+          spv::OpShiftRightLogical, u32_t, effective_slot, chunk_log2_v);
+      auto local_slot = ir_->make_value(
+          spv::OpBitwiseAnd, u32_t, effective_slot, chunk_mask_v);
+      auto chunk_byte_off = ir_->mul(chunk_idx, chunk_size_bytes_v);
+      auto local_byte_off = ir_->mul(local_slot, cell_stride_v);
+      cell_byte_offset = ir_->add(
+          pool_offset_v, ir_->add(chunk_byte_off, local_byte_off));
+    } else {
+      cell_byte_offset = ir_->add(
+          pool_offset_v, ir_->mul(effective_slot, cell_stride_v));
+    }
     // G10-P2 (2026-04-30 → B-2.a 2026-05): for inactive reads
     // (do_activate=false), route the byte offset to the per-pointer-SNode
     // ambient zone instead of pool[0]. The ambient zone is cell_stride

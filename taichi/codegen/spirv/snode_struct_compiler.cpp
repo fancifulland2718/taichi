@@ -177,6 +177,49 @@ class StructCompiler {
               ? SpirvAllocatorContract::AllocProtocol::CasMarker
               : SpirvAllocatorContract::AllocProtocol::Legacy;
       c.pool_fraction = resolve_pool_fraction(policy_.pool_fraction);
+      // C-2.1 (2026-05): allocator_kind 透传。Bump 路径所有 chunk_* 字段保持
+      // 默认 0/-1，codegen 与 runtime 都不读取，byte-equivalent。
+      // C-2.3 隐患 2 修复：kind 字符串集合显式校验，写错时直接 TI_ERROR，
+      // 不允许 silent fallback 到 bump（遵循 §12.2.0 第 2 条「不回退 silent
+      // OOC」原则）。
+      TI_ERROR_IF(
+          policy_.allocator_kind != "bump" &&
+              policy_.allocator_kind != "chunked",
+          "vulkan_pointer_allocator_kind must be one of {{\"bump\","
+          " \"chunked\"}}, got \"{}\". Refusing silent fallback.",
+          policy_.allocator_kind);
+      c.allocator_kind =
+          (policy_.allocator_kind == "chunked")
+              ? SpirvAllocatorContract::AllocatorKind::Chunked
+              : SpirvAllocatorContract::AllocatorKind::Bump;
+      // C-2.3 (2026-05): 选择 Chunked 时计算 chunk_log2_capacity，使单
+      // chunk 容量不小于 pool capacity；这样 SPIR-V 侧拆分出的
+      // chunk_idx 在有效 slot 范围内恒 0，local_slot == slot，字节等
+      // 价于 Bump。max_chunks=1 表明当前阶段仅 chunk[0] 被实际使用，
+      // C-2.4 引入多 chunk + descriptor array 后才会递增。
+      // C-2.3 隐患 1 修复：chunk_size_bytes = chunk_size_cells *
+      // cell_stride 必须落在 u32（codegen 端 SPIR-V 用 u32 mul），否
+      // 则 (chunk_idx * chunk_size_bytes) 溢出会让寻址错位。极端值
+      // 由用户 vk_max_active 驱动，校验在此处一次性兜住。
+      if (c.allocator_kind ==
+          SpirvAllocatorContract::AllocatorKind::Chunked) {
+        uint32_t chunk_log2 = 0;
+        while ((1u << chunk_log2) < static_cast<uint32_t>(capacity)) {
+          ++chunk_log2;
+        }
+        const uint64_t chunk_size_bytes_64 =
+            (uint64_t{1} << chunk_log2) * static_cast<uint64_t>(cell_bytes);
+        TI_ERROR_IF(
+            chunk_log2 >= 32 || chunk_size_bytes_64 > 0xffffffffull,
+            "pointer SNode {}: chunked allocator chunk_size_bytes={} "
+            "(chunk_log2={}, cell_stride={}) overflows u32 SPIR-V address "
+            "math. Reduce vk_max_active or pool capacity, or wait for C-2.4 "
+            "u64 addressing.",
+            desc.snode->get_node_type_name_hinted(), chunk_size_bytes_64,
+            chunk_log2, cell_bytes);
+        c.chunk_log2_capacity = chunk_log2;
+        c.max_chunks = 1;
+      }
       c.watermark_offset = static_cast<uint32_t>(cursor);
       cursor += 4;
       // B-2.b: 原 #if TI_VULKAN_POINTER_FREELIST 布局下放为运行时 policy_.freelist。

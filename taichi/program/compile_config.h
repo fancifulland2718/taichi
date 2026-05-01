@@ -151,6 +151,14 @@ struct CompileConfig {
   // 间，行为字节等价）。多 pointer / 嵌套 pointer 自动回退 root。默认 false 与历史
   // 行为字节等价。详见 compile_doc/SNode_Vulkan_规划.md §10.4.2 B-3.b。
   bool vulkan_pointer_independent_pool{false};
+  // C-2.1 (2026-05): pointer SNode device-side allocator 选择。append-only
+  // 骨架：合法值 {"bump", "chunked"}。默认 "bump" = 路线 B 行为，byte-equivalent。
+  // "chunked" 在 C-2.2 之前**不可用**，C-2.1 仅做 plumbing（CompileConfig →
+  //  Python kwarg → PointerLayoutPolicy → SpirvAllocatorContract → BumpOnly
+  //  Params → cache key），factory 端遇到 "chunked" 抛 TI_NOT_IMPLEMENTED，
+  //  绝不 silent 降级回 bump（与 C-1.b 删除 OOC 静默 fallback 同一原则）。
+  // 详见 compile_doc/SNode_Vulkan_规划.md §12.2.0 / §12.2.1。
+  std::string vulkan_pointer_allocator_kind{"bump"};
   int max_vector_width;
   bool print_preprocessed_ir;
   bool print_ir;

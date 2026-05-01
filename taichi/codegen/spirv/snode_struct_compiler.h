@@ -96,6 +96,10 @@ struct PointerLayoutPolicy {
   // 时，把该 pointer 的 pool 元数据切到独立 NodeAllocatorPool buffer。
   // 默认 false 与历史行为字节等价。多 pointer / 嵌套 pointer 仍走 root_buffer fallback。
   bool independent_pool{false};
+  // C-2.1（2026-05）：pointer SNode device-side allocator 选择。合法值
+  // {"bump", "chunked"}。默认 "bump" 与 B 路线 byte-equivalent；"chunked"
+  // 在 C-2.2 前未实现，工厂端报错。
+  std::string allocator_kind{"bump"};
 };
 
 CompiledSNodeStructs compile_snode_structs(

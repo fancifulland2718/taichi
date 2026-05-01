@@ -70,6 +70,25 @@ struct SpirvAllocatorContract {
   // 偏移字段以该 buffer 内 offset 0 为基准。-1（默认）= 池仍寄居 root_buffer
   // 子区间，偏移字段以 root_buffer 内 offset 0 为基准（B-1/B-2/B-3.b 行为）。
   int32_t pool_buffer_binding_id{-1};
+
+  // C-2.1 (2026-05) — 路线 C chunked allocator 骨架字段（append-only）。
+  //   AllocatorKind::Bump（默认）：B 路线行为，下面三个字段为 0/-1，codegen 与
+  //     runtime 完全忽略，byte-equivalent。
+  //   AllocatorKind::Chunked：C-2.2 起的 chunked allocator 路径；C-2.1 阶段
+  //     工厂端会在见到 Chunked 时直接 TI_NOT_IMPLEMENTED，不 silent fallback。
+  // 详见 compile_doc/SNode_Vulkan_规划.md §12.2.1。
+  enum class AllocatorKind : uint8_t {
+    Bump = 0,
+    Chunked = 1,
+  };
+  AllocatorKind allocator_kind{AllocatorKind::Bump};
+  // chunk 容量取 log2 形式（codegen 端用 SHR 即可定位 chunk_idx）。
+  // 0 = 未设置（Bump 路径默认）。
+  uint32_t chunk_log2_capacity{0};
+  // chunk 数上限（runtime 端 descriptor 数组长度）。0 = 未设置。
+  uint32_t max_chunks{0};
+  // chunk descriptor 数组首 binding；-1 = 未设置（Bump 路径默认）。
+  int32_t chunk_descriptor_array_first_binding{-1};
 };
 
 }  // namespace spirv

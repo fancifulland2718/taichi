@@ -41,6 +41,13 @@ void SNodeTreeManager::materialize_snode_tree(
       p.ambient_offset = contract.ambient_offset;
       p.alloc_protocol = contract.alloc_protocol;
       p.pool_fraction = contract.pool_fraction;
+      // C-2.1 (2026-05): allocator_kind / chunk_* 透传到 Params。Bump 路径
+      // 这些字段保持默认 0/-1，BumpOnly 不读取，byte-equivalent。
+      p.allocator_kind = contract.allocator_kind;
+      p.chunk_log2_capacity = contract.chunk_log2_capacity;
+      p.max_chunks = contract.max_chunks;
+      p.chunk_descriptor_array_first_binding =
+          contract.chunk_descriptor_array_first_binding;
       p.root_buffer_alloc = root_alloc;
       // B-3.b (2026-05): contract.pool_buffer_binding_id >= 0 表示 layout 端
       // 已选定该 pointer SNode 走独立 NodeAllocatorPool；此处申请独立
