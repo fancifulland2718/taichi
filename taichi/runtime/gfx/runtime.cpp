@@ -240,6 +240,13 @@ CompiledTaichiKernel::CompiledTaichiKernel(const Params &ti_params)
     BufferInfo buffer = {BufferType::NodeAllocatorPool, sid};
     input_buffers_[buffer] = alloc;
   }
+  // C-2.5 (2026-05): 注册 chunked allocator 的全部 chunk DeviceAllocation
+  // 列表。dispatch 时按 BufferBind.chunk_count > 0 用 rw_buffer_array(N)
+  // 把 N 个 buffer 一并 bind 到单个 descriptor array binding。
+  for (const auto &[sid, allocs] : ti_params.node_allocator_chunk_arrays) {
+    BufferInfo buffer = {BufferType::NodeAllocatorPool, sid};
+    chunk_arrays_[buffer] = allocs;
+  }
 #endif
 
   const auto arg_sz = ti_kernel_attribs_.ctx_attribs.args_bytes();
@@ -398,6 +405,14 @@ GfxRuntime::KernelHandle GfxRuntime::register_taichi_kernel(
       DeviceAllocation *indep = allocator_ptr->independent_pool_alloc();
       if (indep != nullptr) {
         params.node_allocator_pool_buffers.emplace_back(sid, indep);
+      }
+      // C-2.5 (2026-05): chunked allocator 在 rw_buffer_array 路径下需要
+      // 全部 chunk 的 DeviceAllocation 列表。num_chunks() > 1 时按 sid 注入；
+      // 单 chunk allocator 退化到 node_allocator_pool_buffers 单 buffer 路径。
+      auto chunk_list = allocator_ptr->chunks();
+      if (chunk_list.size() > 1u) {
+        params.node_allocator_chunk_arrays.emplace_back(
+            sid, std::move(chunk_list));
       }
     }
   }
@@ -600,6 +615,24 @@ void GfxRuntime::launch_kernel(KernelHandle handle,
         bindings->rw_buffer(bind.binding,
                             ret_buffer ? *ret_buffer : kDeviceNullAllocation);
       } else {
+        // C-2.5 (2026-05): chunked NodeAllocatorPool 走 rw_buffer_array 路径。
+        // attribs 端 BufferBind.chunk_count > 0 标记此 binding 是 descriptor
+        // array of N storage buffers；runtime 用 GfxRuntime allocator 端的
+        // chunks() 列表（已在 ctor 时拷入 chunk_arrays_）一次性 bind 全部
+        // N 个 DeviceAllocation。chunk_count == 0 走原 rw_buffer 单 buffer 路径。
+        if (bind.chunk_count > 0u) {
+          if (auto *chunks = ti_kernel->get_chunk_array(bind.buffer)) {
+            TI_ASSERT_INFO(
+                chunks->size() == bind.chunk_count,
+                "C-2.5: chunk_count mismatch sid={}, attribs={} runtime={}",
+                bind.buffer.root_id, bind.chunk_count, chunks->size());
+            bindings->rw_buffer_array(bind.binding, *chunks);
+            continue;
+          }
+          // Fallback (no chunked allocator registered): bind first chunk
+          // only via rw_buffer; SPIR-V will read chunk[0] safely (single
+          // chunk path was byte-equivalent under C-2.4.a Commit A).
+        }
         DeviceAllocation *alloc = ti_kernel->get_buffer_bind(bind.buffer);
         bindings->rw_buffer(bind.binding,
                             alloc ? *alloc : kDeviceNullAllocation);

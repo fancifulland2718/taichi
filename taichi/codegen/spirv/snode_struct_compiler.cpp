@@ -201,24 +201,65 @@ class StructCompiler {
       // cell_stride 必须落在 u32（codegen 端 SPIR-V 用 u32 mul），否
       // 则 (chunk_idx * chunk_size_bytes) 溢出会让寻址错位。极端值
       // 由用户 vk_max_active 驱动，校验在此处一次性兜住。
+      uint32_t pool_cells = static_cast<uint32_t>(capacity);
       if (c.allocator_kind ==
           SpirvAllocatorContract::AllocatorKind::Chunked) {
+        // C-2.5 (2026-05)：chunked allocator 限 max_chunks > 1 时只支持
+        // 顶层 pointer SNode（parent == root 或 parent 是无 pool 的 dense/
+        // bitmasked 等容器）。嵌套 chunked pointer（外层 pointer 也是
+        // chunked）需要在 listgen / 多级 slot_ptr 寻址中跨 chunk，超出
+        // C-2.5 范围。max_chunks == 1 路径 byte-equivalent，不需此限制。
+        const uint32_t requested_max_chunks =
+            std::max(policy_.max_chunks, 1u);
+        if (requested_max_chunks > 1u) {
+          for (auto *p = desc.snode->parent; p != nullptr; p = p->parent) {
+            TI_ERROR_IF(
+                p->type == SNodeType::pointer,
+                "pointer SNode {}: nested chunked pointer (an ancestor "
+                "pointer SNode {} is also a pointer) is not supported "
+                "with vulkan_pointer_max_chunks > 1. Set "
+                "vulkan_pointer_max_chunks=1 or restructure the SNode tree "
+                "so only the leaf-most pointer is sparse.",
+                desc.snode->get_node_type_name_hinted(),
+                p->get_node_type_name_hinted());
+          }
+        }
+        // C-2.5 (2026-05)：chunked allocator 把池切成 max_chunks 个独立
+        // DeviceAllocation（chunk[0] 复用 NodeAllocatorPool buffer 含 meta
+        // + pool_data；chunk[k>0] 是 cell-only 独立 buffer）。每 chunk
+        // 容量 = 1 << chunk_log2_capacity，其中 chunk_log2 = ceil_log2(
+        // ceil(capacity/max_chunks))；SPIR-V 端 chunk_idx = effective_slot
+        // >> chunk_log2 取值 [0, max_chunks-1]，通过 descriptor array of
+        // buffers 二步 OpAccessChain 寻址（详见 spirv_codegen.cpp）。
+        //
+        // pool_data 区只占 chunk[0] 内的 chunk_size_cells * cell_bytes；
+        // max_chunks=1 时 chunk_size_cells = next_pow2(capacity)，与 Bump
+        // 路径布局字节等价（capacity 是 2 幂时完全一致）。
+        const uint32_t max_chunks = std::max(policy_.max_chunks, 1u);
+        const uint32_t chunk_capacity =
+            (static_cast<uint32_t>(capacity) + max_chunks - 1u) / max_chunks;
         uint32_t chunk_log2 = 0;
-        while ((1u << chunk_log2) < static_cast<uint32_t>(capacity)) {
+        while ((1u << chunk_log2) < chunk_capacity) {
           ++chunk_log2;
         }
+        const uint32_t chunk_size_cells = 1u << chunk_log2;
         const uint64_t chunk_size_bytes_64 =
-            (uint64_t{1} << chunk_log2) * static_cast<uint64_t>(cell_bytes);
+            static_cast<uint64_t>(chunk_size_cells) *
+            static_cast<uint64_t>(cell_bytes);
         TI_ERROR_IF(
             chunk_log2 >= 32 || chunk_size_bytes_64 > 0xffffffffull,
-            "pointer SNode {}: chunked allocator chunk_size_bytes={} "
-            "(chunk_log2={}, cell_stride={}) overflows u32 SPIR-V address "
-            "math. Reduce vk_max_active or pool capacity, or wait for C-2.4 "
-            "u64 addressing.",
-            desc.snode->get_node_type_name_hinted(), chunk_size_bytes_64,
-            chunk_log2, cell_bytes);
+            "pointer SNode {}: chunked allocator single-chunk size exceeds "
+            "u32 SPIR-V address math (chunk_log2={}, chunk_size_bytes={}, "
+            "max_chunks={}). Reduce vk_max_active, increase "
+            "vulkan_pointer_max_chunks, or wait for u64 addressing.",
+            desc.snode->get_node_type_name_hinted(), chunk_log2,
+            chunk_size_bytes_64, max_chunks);
         c.chunk_log2_capacity = chunk_log2;
-        c.max_chunks = 1;
+        c.max_chunks = max_chunks;
+        // pool_data 区只占 chunk[0]：chunk_size_cells * cell_bytes。
+        // chunk[k>0] 物理 buffer 在 ChunkedDeviceNodeAllocator 中独立
+        // alloc，layout pass 不涉及。
+        pool_cells = chunk_size_cells;
       }
       c.watermark_offset = static_cast<uint32_t>(cursor);
       cursor += 4;
@@ -234,7 +275,10 @@ class StructCompiler {
       }
       cursor = (cursor + 3u) & ~size_t(3);
       c.pool_data_offset = static_cast<uint32_t>(cursor);
-      cursor += cell_bytes * capacity;
+      // C-2.5 (2026-05)：Chunked 路径 pool_cells = chunk_size_cells（仅
+      // chunk[0] 容量；chunk[k>0] 在独立 DeviceAllocation 不计入 cursor）。
+      // Bump 路径 pool_cells = capacity。
+      cursor += static_cast<size_t>(cell_bytes) * pool_cells;
       // B-2.b: 原 #if TI_VULKAN_POINTER_AMBIENT_ZONE 下放为运行时 policy_.ambient_zone。
       if (policy_.ambient_zone) {
         // G10-P2: 零初始化 cell-sized ambient zone。pointer_lookup_or_activate

@@ -21,6 +21,7 @@ void GfxProgramImpl::compile_snode_tree_types(SNodeTree *tree) {
   policy.pool_fraction = config->vulkan_pointer_pool_fraction;
   policy.independent_pool = config->vulkan_pointer_independent_pool;
   policy.allocator_kind = config->vulkan_pointer_allocator_kind;
+  policy.max_chunks = config->vulkan_pointer_max_chunks;
   if (runtime_) {
     snode_tree_mgr_->materialize_snode_tree(tree, policy);
   } else {
@@ -39,6 +40,7 @@ void GfxProgramImpl::materialize_snode_tree(SNodeTree *tree,
   policy.pool_fraction = config->vulkan_pointer_pool_fraction;
   policy.independent_pool = config->vulkan_pointer_independent_pool;
   policy.allocator_kind = config->vulkan_pointer_allocator_kind;
+  policy.max_chunks = config->vulkan_pointer_max_chunks;
   snode_tree_mgr_->materialize_snode_tree(tree, policy);
 }
 

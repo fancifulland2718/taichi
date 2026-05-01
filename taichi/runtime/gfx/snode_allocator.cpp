@@ -90,6 +90,17 @@ DeviceAllocation *BumpOnlyDeviceNodeAllocator::independent_pool_alloc() const {
 
 void BumpOnlyDeviceNodeAllocator::clear_all(CommandList *cmd) {
   TI_ASSERT(cmd != nullptr);
+  // C-2.4.a Commit B (2026-05): 独立池路径下整个 buffer 清零。Chunked
+  // 路径把 pool_data 区扩为 max_chunks * chunk_size_cells * cell_bytes，
+  // BumpOnly 只看到 pool_capacity 不够覆盖；用整 buffer fill 既兼容
+  // Bump (max_chunks=1, footprint == watermark+pool_capacity*cell_bytes) 又
+  // 兼容 Chunked (footprint > pool_capacity*cell_bytes)。同时也覆盖
+  // freelist / ambient zone 区域，与原来的两段 fill 行为等价。
+  if (independent_pool_guard_) {
+    cmd->buffer_fill(independent_pool_guard_->get_ptr(0),
+                     kBufferSizeEntireSize, /*data=*/0u);
+    return;
+  }
   // 1) watermark 置 0（4 字节）
   cmd->buffer_fill(params_.root_buffer_alloc.get_ptr(
                        params_.watermark_offset),
@@ -135,6 +146,8 @@ ChunkedDeviceNodeAllocator::ChunkedDeviceNodeAllocator(const Params &p) {
   // C-2.2 skeleton：byte-equivalent 路径必须有独立 pool buffer（即使
   // codegen 仍读 root_buffer，B-3.b 保证独立 buffer 在初始化时被清零；
   // 后续 C-2.3 把 codegen 切到 chunk[0] 时直接复用）。
+  // 上层 policy 在 chunked 路径下应已传 use_independent_pool=true；这里
+  // 无条件赋值是兜底，不打 WARN（实测当前路径不触发）。
   Params bump_params = p;
   bump_params.use_independent_pool = true;
   if (bump_params.independent_pool_size == 0) {
@@ -147,6 +160,61 @@ ChunkedDeviceNodeAllocator::ChunkedDeviceNodeAllocator(const Params &p) {
         p.pool_capacity * p.cell_payload_bytes;
   }
   bump_ = std::make_unique<BumpOnlyDeviceNodeAllocator>(bump_params);
+
+  // C-2.4.a Commit A (2026-05) → C-2.5 (2026-05): 静态预分配 max_chunks-1
+  // 个额外 chunk。每个 chunk size = chunk_size_cells * cell_stride，其中
+  // chunk_size_cells = 1 << chunk_log2_capacity（由 layout pass 计算并通过
+  // contract → Params 透传）。chunk[0] 仍是 NodeAllocatorPool buffer（含
+  // meta + chunk[0] 的 pool_data），chunk[k>0] 是 cell-only buffer，由
+  // SPIR-V chunked descriptor array 经二步 OpAccessChain 寻址。
+  if (p.max_chunks > 1u) {
+    TI_ASSERT_INFO(
+        p.chunk_log2_capacity < 32u,
+        "ChunkedDeviceNodeAllocator: chunk_log2_capacity={} out of range "
+        "(snode_id={})",
+        p.chunk_log2_capacity, p.snode_id);
+    const uint64_t chunk_size_cells_64 = 1ull << p.chunk_log2_capacity;
+    const uint64_t extra_chunk_bytes_64 =
+        chunk_size_cells_64 * static_cast<uint64_t>(p.cell_payload_bytes);
+    TI_ASSERT_INFO(
+        extra_chunk_bytes_64 <= 0xffffffffull,
+        "ChunkedDeviceNodeAllocator: extra chunk size {} exceeds u32 "
+        "(snode_id={})",
+        extra_chunk_bytes_64, p.snode_id);
+    const std::size_t extra_chunk_bytes =
+        static_cast<std::size_t>(extra_chunk_bytes_64);
+    extra_chunks_.reserve(p.max_chunks - 1u);
+    Stream *stream = p.device->get_compute_stream();
+    for (uint32_t i = 1; i < p.max_chunks; ++i) {
+      Device::AllocParams alloc_params;
+      alloc_params.size = extra_chunk_bytes;
+      alloc_params.host_write = false;
+      alloc_params.host_read = false;
+      alloc_params.export_sharing = false;
+      alloc_params.usage = AllocUsage::Storage;
+      auto [guard, res] = p.device->allocate_memory_unique(alloc_params);
+      TI_ASSERT_INFO(
+          res == RhiResult::success,
+          "ChunkedDeviceNodeAllocator: failed to allocate extra chunk[{}] "
+          "of {} bytes (snode_id={}, RhiResult={})",
+          i, extra_chunk_bytes, p.snode_id, static_cast<int>(res));
+      auto [cmdlist, cmd_res] = stream->new_command_list_unique();
+      TI_ASSERT(cmd_res == RhiResult::success);
+      cmdlist->buffer_fill(guard->get_ptr(0), kBufferSizeEntireSize,
+                           /*data=*/0);
+      stream->submit_synced(cmdlist.get());
+      extra_chunks_.push_back(std::move(guard));
+    }
+    extra_chunks_total_bytes_ =
+        extra_chunk_bytes * extra_chunks_.size();
+    TI_TRACE(
+        "ChunkedDeviceNodeAllocator: snode_id={} max_chunks={} "
+        "extra_chunks={} chunk_size_cells={} extra_chunk_bytes={} "
+        "total_extra_bytes={}",
+        p.snode_id, p.max_chunks, extra_chunks_.size(), chunk_size_cells_64,
+        extra_chunk_bytes,
+        extra_chunk_bytes * extra_chunks_.size());
+  }
 }
 
 ChunkedDeviceNodeAllocator::~ChunkedDeviceNodeAllocator() = default;
@@ -179,9 +247,20 @@ DeviceAllocation *ChunkedDeviceNodeAllocator::independent_pool_alloc() const {
 }
 
 std::vector<DeviceAllocation> ChunkedDeviceNodeAllocator::chunks() const {
-  // skeleton：单 chunk = 独立 pool buffer。C-2.2 暂时复用 pool_buffer()，
-  // C-2.3 起会随 grow 操作动态 push_back。
-  return {bump_->pool_buffer()};
+  // chunk[0] = bump_->pool_buffer()（独立 pool buffer，包含 watermark/freelist/
+  // ambient/pool_data）。Commit A 起 chunk[1..N-1] 依顺序 append，为未来
+  // Commit B 的跨 chunk 寻址提供全部 DeviceAllocation。
+  std::vector<DeviceAllocation> result;
+  result.reserve(1u + extra_chunks_.size());
+  result.push_back(bump_->pool_buffer());
+  for (const auto &g : extra_chunks_) {
+    result.push_back(*g);
+  }
+  return result;
+}
+
+std::size_t ChunkedDeviceNodeAllocator::extra_chunks_total_bytes() const {
+  return extra_chunks_total_bytes_;
 }
 
 // -----------------------------------------------------------------------------

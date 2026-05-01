@@ -115,9 +115,33 @@ class VulkanResourceSet : public ShaderResourceSet {
     }
   };
 
+  // C-2.5 (2026-05): descriptor array of storage buffers. Each entry maps
+  // to one VkDescriptorBufferInfo with offset=0, range=VK_WHOLE_SIZE; the
+  // SPIR-V side accesses chunk[k] via OpAccessChain on the array variable.
+  // descriptorCount = buffers.size() at finalize time.
+  struct BufferArray {
+    std::vector<vkapi::IVkBuffer> buffers;
+
+    bool operator==(const BufferArray &rhs) const {
+      if (buffers.size() != rhs.buffers.size()) {
+        return false;
+      }
+      for (size_t i = 0; i < buffers.size(); ++i) {
+        if (buffers[i] != rhs.buffers[i]) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    bool operator!=(const BufferArray &rhs) const {
+      return !(*this == rhs);
+    }
+  };
+
   struct Binding {
     VkDescriptorType type{VK_DESCRIPTOR_TYPE_MAX_ENUM};
-    std::variant<Buffer, Image, Texture> res{Buffer()};
+    std::variant<Buffer, Image, Texture, BufferArray> res{Buffer()};
 
     bool operator==(const Binding &other) const {
       return other.type == type && other.res == res;
@@ -139,6 +163,11 @@ class VulkanResourceSet : public ShaderResourceSet {
       } else if (const Texture *tex = std::get_if<Texture>(&res)) {
         rhi_impl::hash_combine(hash, (void *)tex->view.get());
         rhi_impl::hash_combine(hash, (void *)tex->sampler.get());
+      } else if (const BufferArray *ba = std::get_if<BufferArray>(&res)) {
+        rhi_impl::hash_combine(hash, ba->buffers.size());
+        for (const auto &b : ba->buffers) {
+          rhi_impl::hash_combine(hash, (void *)b.get());
+        }
       }
       return hash;
     }
@@ -216,6 +245,12 @@ class VulkanResourceSet : public ShaderResourceSet {
   ShaderResourceSet &rw_image(uint32_t binding,
                               DeviceAllocation alloc,
                               int lod) final;
+
+  // C-2.5 (2026-05): descriptor array of storage buffers (single binding,
+  // descriptorCount=N). All buffers must use VK_WHOLE_SIZE range.
+  ShaderResourceSet &rw_buffer_array(
+      uint32_t binding,
+      const std::vector<DeviceAllocation> &allocs) final;
 
   rhi_impl::RhiReturn<vkapi::IVkDescriptorSet> finalize();
 

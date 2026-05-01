@@ -84,10 +84,19 @@ struct TaskAttributes {
   struct BufferBind {
     BufferInfo buffer;
     int binding{0};
+    // C-2.5 (2026-05): >0 marks this binding as a chunked descriptor array
+    // (single binding holds N storage buffers; emitted via
+    // VulkanResourceSet::rw_buffer_array). 0 = single-buffer binding (legacy
+    // path, byte-equivalent). Only meaningful when buffer.type ==
+    // BufferType::NodeAllocatorPool. The runtime side enumerates chunks via
+    // GfxRuntime::node_allocators_[root][sid]->chunks() at dispatch time,
+    // so this number is just a signal; the actual buffers come from the
+    // allocator.
+    uint32_t chunk_count{0};
 
     std::string debug_string() const;
 
-    TI_IO_DEF(buffer, binding);
+    TI_IO_DEF(buffer, binding, chunk_count);
   };
 
   struct TextureBind {

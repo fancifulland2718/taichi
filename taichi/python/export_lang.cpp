@@ -196,6 +196,8 @@ void export_lang(py::module &m) {
                      &CompileConfig::vulkan_pointer_independent_pool)
       .def_readwrite("vulkan_pointer_allocator_kind",
                      &CompileConfig::vulkan_pointer_allocator_kind)
+      .def_readwrite("vulkan_pointer_max_chunks",
+                     &CompileConfig::vulkan_pointer_max_chunks)
       .def_readwrite("print_ir", &CompileConfig::print_ir)
       .def_readwrite("print_preprocessed_ir",
                      &CompileConfig::print_preprocessed_ir)

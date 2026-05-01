@@ -52,6 +52,13 @@ class CompiledTaichiKernel {
     // 包传入，CompiledTaichiKernel 构造时按 sid 注册到 input_buffers_ 以供
     // descriptor set fallback 路径绑定。key = SNode id。默认 (OFF) 为空。
     std::vector<std::pair<int, DeviceAllocation *>> node_allocator_pool_buffers;
+    // C-2.5 (2026-05): chunked allocator 的全部 chunk DeviceAllocation 列表。
+    // key = SNode id；value = {chunk[0], chunk[1], ..., chunk[N-1]}。
+    // 只在 max_chunks > 1 时填充；单 chunk allocator（含 Bump）走上面的
+    // node_allocator_pool_buffers 单 buffer 路径。CompiledTaichiKernel 在
+    // dispatch 时按 BufferBind.chunk_count>0 调 rw_buffer_array(N)。
+    std::vector<std::pair<int, std::vector<DeviceAllocation>>>
+        node_allocator_chunk_arrays;
 #endif
 
     PipelineCache *backend_cache{nullptr};
@@ -72,6 +79,18 @@ class CompiledTaichiKernel {
     return input_buffers_[bind];
   }
 
+  // C-2.5 (2026-05): retrieve all chunk DeviceAllocations for a chunked
+  // NodeAllocatorPool binding. Returns nullptr if `bind` is not a chunked
+  // pool. Key = sid stored in bind.root_id.
+  const std::vector<DeviceAllocation> *get_chunk_array(
+      const BufferInfo &bind) const {
+    auto it = chunk_arrays_.find(bind);
+    if (it == chunk_arrays_.end()) {
+      return nullptr;
+    }
+    return &it->second;
+  }
+
  private:
   TaichiKernelAttributes ti_kernel_attribs_;
   std::vector<TaskAttributes> tasks_attribs_;
@@ -79,6 +98,10 @@ class CompiledTaichiKernel {
   [[maybe_unused]] Device *device_;
 
   InputBuffersMap input_buffers_;
+  // C-2.5 (2026-05): per-binding chunk DeviceAllocation lists for chunked
+  // NodeAllocatorPool bindings. Empty when no SNode uses chunked allocator.
+  std::unordered_map<BufferInfo, std::vector<DeviceAllocation>, BufferInfoHasher>
+      chunk_arrays_;
 
   size_t args_buffer_size_{0};
   size_t ret_buffer_size_{0};

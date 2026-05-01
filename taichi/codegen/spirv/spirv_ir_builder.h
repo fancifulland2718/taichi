@@ -72,6 +72,10 @@ enum class ValueKind {
   kConstant,
   kVectorPtr,
   kStructArrayPtr,
+  // C-2.5 (2026-05): variable pointer to OpTypeArray of SSBO struct;
+  // accessed by struct_array_access_chunked which emits a 3-index
+  // OpAccessChain (chunk_idx, struct_member=0, slot_word_idx).
+  kChunkedArrayPtr,
   kVariablePtr,
   kPhysicalPtr,
   kTexture,
@@ -379,7 +383,23 @@ class IRBuilder {
                         uint32_t descriptor_set,
                         uint32_t binding,
                         const std::string &name);
+  // C-2.5 (2026-05): emit an OpVariable of OpTypeArray<SSBO_struct, N> for
+  // a single binding holding N storage buffers (descriptorCount=N on the
+  // Vulkan side). Returned value has kind kChunkedArrayPtr; access via
+  // struct_array_access_chunked(value_type, var, chunk_idx, slot_word_idx).
+  Value buffer_array_argument(const SType &value_type,
+                              uint32_t descriptor_set,
+                              uint32_t binding,
+                              uint32_t array_count,
+                              const std::string &name);
   Value struct_array_access(const SType &res_type, Value buffer, Value index);
+  // C-2.5: 3-index OpAccessChain on a kChunkedArrayPtr. chunk_idx selects
+  // the descriptor-array slot; slot_word_idx is the within-chunk word
+  // offset (cell_byte_offset / 4 typically).
+  Value struct_array_access_chunked(const SType &res_type,
+                                    Value chunked_buffer,
+                                    Value chunk_idx,
+                                    Value slot_word_idx);
 
   Value texture_argument(int num_channels,
                          int num_dimensions,

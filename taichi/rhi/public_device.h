@@ -201,6 +201,20 @@ class RHI_DLL_EXPORT ShaderResourceSet {
                                       int lod) {
     RHI_NOT_IMPLEMENTED
   }
+
+  /**
+   * C-2.5 (2026-05): Bind an array of storage buffers under a single
+   * binding (descriptorCount=N). The SPIR-V variable side declares an
+   * OpTypeArray of SSBO struct and accesses chunk[k] via OpAccessChain on
+   * the array index. Used by the chunked pointer-SNode allocator.
+   * @params binding The binding index (single binding holds N buffers)
+   * @params allocs The Device Allocations that map to chunk[0..N-1]
+   */
+  virtual ShaderResourceSet &rw_buffer_array(
+      uint32_t binding,
+      const std::vector<DeviceAllocation> &allocs) {
+    RHI_NOT_IMPLEMENTED
+  }
 };
 
 // A set of states / resources for rasterization

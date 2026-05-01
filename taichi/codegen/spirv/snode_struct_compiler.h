@@ -100,6 +100,11 @@ struct PointerLayoutPolicy {
   // {"bump", "chunked"}。默认 "bump" 与 B 路线 byte-equivalent；"chunked"
   // 在 C-2.2 前未实现，工厂端报错。
   std::string allocator_kind{"bump"};
+  // C-2.4.a（2026-05）：chunked 路径上限。默认 1 与 C-2.3 等价（单
+  // chunk = 整池）；step i 仅透传到 contract.max_chunks，不改 SPIR-V
+  // 寻址。后续 step ii–v 会在 max_chunks > 1 时发射 descriptor array
+  // of buffers + 两步 OpAccessChain（选 chunk 后再在 chunk 内寻址）。
+  uint32_t max_chunks{1};
 };
 
 CompiledSNodeStructs compile_snode_structs(

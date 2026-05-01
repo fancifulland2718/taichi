@@ -349,6 +349,13 @@ class TaskCodegen : public IRVisitor {
       ptr_val = ir_->add(origin_val, ir_->cast(origin_val.stype, offset_val));
       ptr_to_buffers_[stmt] = ptr_to_buffers_[stmt->origin];
     }
+    // C-2.5: forward chunk_idx if origin had one (chunked pool routing).
+    {
+      auto it = ptr_to_chunk_idx_.find(stmt->origin);
+      if (it != ptr_to_chunk_idx_.end()) {
+        ptr_to_chunk_idx_[stmt] = it->second;
+      }
+    }
     ir_->register_value(stmt->raw_name(), ptr_val);
   }
 
@@ -409,6 +416,13 @@ class TaskCodegen : public IRVisitor {
       if (it != bit_ptr_bit_offsets_.end()) {
         bit_ptr_bit_offsets_[stmt] = it->second;
       }
+      // C-2.5: forward chunk_idx through quant_array (byte addr unchanged).
+      {
+        auto cit = ptr_to_chunk_idx_.find(stmt->input_ptr);
+        if (cit != ptr_to_chunk_idx_.end()) {
+          ptr_to_chunk_idx_[stmt] = cit->second;
+        }
+      }
       if (out_snode->is_place()) {
         TI_ASSERT(ptr_to_buffers_.count(stmt) == 0);
         // B-3.c-2: leaves under a pointer ancestor live in that pointer's
@@ -435,6 +449,13 @@ class TaskCodegen : public IRVisitor {
           ir_->get_primitive_type(ir_->get_taichi_uint_type(phys));
       bit_ptr_bit_offsets_[stmt] = ir_->uint_immediate_number(
           phys_uint_stype, static_cast<uint64_t>(member_bit_off));
+      // C-2.5: forward chunk_idx through bit_struct (byte addr unchanged).
+      {
+        auto cit = ptr_to_chunk_idx_.find(stmt->input_ptr);
+        if (cit != ptr_to_chunk_idx_.end()) {
+          ptr_to_chunk_idx_[stmt] = cit->second;
+        }
+      }
       if (out_snode->is_place()) {
         TI_ASSERT(ptr_to_buffers_.count(stmt) == 0);
         // B-3.c-2: see container_buffer_info note above.
@@ -446,6 +467,15 @@ class TaskCodegen : public IRVisitor {
     spirv::Value offset = make_pointer(desc.mem_offset_in_parent_cell);
     spirv::Value val = ir_->add(input_ptr_val, offset);
     ir_->register_value(stmt->raw_name(), val);
+
+    // C-2.5: forward chunk_idx through plain GetCh (byte addr advances
+    // within the same cell, which lives in the same chunk).
+    {
+      auto cit = ptr_to_chunk_idx_.find(stmt->input_ptr);
+      if (cit != ptr_to_chunk_idx_.end()) {
+        ptr_to_chunk_idx_[stmt] = cit->second;
+      }
+    }
 
     if (out_snode->is_place()) {
       TI_ASSERT(ptr_to_buffers_.count(stmt) == 0);
@@ -489,6 +519,23 @@ class TaskCodegen : public IRVisitor {
   spirv::Value container_buffer_value(const SNode *sn, int root_id) {
     return get_buffer_value(container_buffer_info(sn, root_id),
                             PrimitiveType::u32);
+  }
+
+  // C-2.5 (2026-05): if a NodeAllocatorPool binding `binding_id` belongs to
+  // a chunked allocator with max_chunks > 1, return its contract; else
+  // nullptr. Used by get_buffer_value to emit a descriptor array variable
+  // (buffer_array_argument) instead of a single-buffer variable.
+  const SpirvAllocatorContract *lookup_chunked_pool_contract(int binding_id) {
+    for (auto &cs : compiled_structs_) {
+      auto it = cs.pointer_contracts.find(binding_id);
+      if (it != cs.pointer_contracts.end() &&
+          it->second.allocator_kind ==
+              SpirvAllocatorContract::AllocatorKind::Chunked &&
+          it->second.max_chunks > 1u) {
+        return &it->second;
+      }
+    }
+    return nullptr;
   }
 
   spirv::Value bitmasked_activation(ActivationOp op,
@@ -585,7 +632,9 @@ class TaskCodegen : public IRVisitor {
                                           int root_id,
                                           const SNode *sn,
                                           spirv::Value index_u32,
-                                          bool do_activate) {
+                                          bool do_activate,
+                                          spirv::Value *chunk_idx_out =
+                                              nullptr) {
     const auto &snode_descs = compiled_structs_[root_id].snode_descriptors;
     const auto &desc = snode_descs.at(sn->id);
     // 路线 B B-1/B-4：通过 SpirvAllocatorContract 间接读 pointer SNode 的池
@@ -923,19 +972,27 @@ class TaskCodegen : public IRVisitor {
     auto pool_offset_v = ir_->uint_immediate_number(
         u32_t, contract.pool_data_offset);
     spirv::Value cell_byte_offset;
+    spirv::Value chunk_idx_val;  // C-2.5: defined only on Chunked path
     if (contract.allocator_kind ==
         SpirvAllocatorContract::AllocatorKind::Chunked) {
-      // C-2.3 (2026-05): chunked-allocator addressing。把 effective_slot
-      // 拆为 (chunk_idx, local_slot) 对：
-      //   chunk_idx  = slot >> chunk_log2_capacity
-      //   local_slot = slot &  ((1 << chunk_log2_capacity) - 1)
-      //   cell_byte  = pool_data_offset
-      //              + chunk_idx * (1 << chunk_log2_capacity) * cell_stride
-      //              + local_slot * cell_stride
-      // 当 1 << chunk_log2_capacity >= pool_capacity（由 snode_struct_compiler
-      // 在 C-2.3 保证）时，slot 恒落在 chunk[0]，与 Bump 路径字节等价；
-      // C-2.4 起才允许 chunk_idx > 0 并接 descriptor array 拼出多 chunk
-      // physical buffer。
+      // C-2.5 (2026-05): chunked-allocator addressing across N independent
+      // chunk buffers (descriptor array of N storage buffers, single
+      // binding). Layout is:
+      //   chunk[0]: meta zone (watermark / freelist / freelist_links /
+      //             ambient if enabled) + chunk_size_cells worth of pool
+      //             data starting at contract.pool_data_offset.
+      //   chunk[k>0]: chunk_size_cells worth of pool data starting at
+      //               offset 0 (no meta).
+      // Address split:
+      //   chunk_idx  = effective_slot >> chunk_log2_capacity
+      //   local_slot = effective_slot & ((1 << chunk_log2_capacity) - 1)
+      //   per_chunk_base = (chunk_idx == 0) ? pool_data_offset : 0
+      //   cell_byte_in_chunk = per_chunk_base + local_slot * cell_stride
+      // The returned cell_byte_offset is the byte address WITHIN the
+      // selected chunk buffer; chunk_idx is propagated separately so
+      // at_buffer() can emit struct_array_access_chunked. When max_chunks
+      // == 1, chunk_idx is identically 0 and per_chunk_base ==
+      // pool_data_offset, byte-equivalent to the Bump path.
       const uint32_t chunk_log2 = contract.chunk_log2_capacity;
       TI_ASSERT(chunk_log2 < 32);
       const uint32_t chunk_size_cells = 1u << chunk_log2;
@@ -946,16 +1003,17 @@ class TaskCodegen : public IRVisitor {
       auto chunk_log2_v = ir_->uint_immediate_number(u32_t, chunk_log2);
       auto chunk_mask_v =
           ir_->uint_immediate_number(u32_t, chunk_size_cells - 1u);
-      auto chunk_size_bytes_v = ir_->uint_immediate_number(
-          u32_t, static_cast<uint32_t>(chunk_size_bytes_64));
-      auto chunk_idx = ir_->make_value(
+      auto zero_v = ir_->uint_immediate_number(u32_t, 0);
+      chunk_idx_val = ir_->make_value(
           spv::OpShiftRightLogical, u32_t, effective_slot, chunk_log2_v);
       auto local_slot = ir_->make_value(
           spv::OpBitwiseAnd, u32_t, effective_slot, chunk_mask_v);
-      auto chunk_byte_off = ir_->mul(chunk_idx, chunk_size_bytes_v);
+      auto chunk_idx_is_zero = ir_->make_value(
+          spv::OpIEqual, ir_->bool_type(), chunk_idx_val, zero_v);
+      auto per_chunk_base = ir_->make_value(
+          spv::OpSelect, u32_t, chunk_idx_is_zero, pool_offset_v, zero_v);
       auto local_byte_off = ir_->mul(local_slot, cell_stride_v);
-      cell_byte_offset = ir_->add(
-          pool_offset_v, ir_->add(chunk_byte_off, local_byte_off));
+      cell_byte_offset = ir_->add(per_chunk_base, local_byte_off);
     } else {
       cell_byte_offset = ir_->add(
           pool_offset_v, ir_->mul(effective_slot, cell_stride_v));
@@ -977,6 +1035,19 @@ class TaskCodegen : public IRVisitor {
           u32_t, contract.ambient_offset);
       cell_byte_offset = ir_->make_value(
           spv::OpSelect, u32_t, is_zero, ambient_offset_v, cell_byte_offset);
+      // C-2.5: ambient zone lives in chunk[0]; force chunk_idx=0 when
+      // routing to it so struct_array_access_chunked picks the right
+      // descriptor-array slot.
+      if (contract.allocator_kind ==
+              SpirvAllocatorContract::AllocatorKind::Chunked &&
+          chunk_idx_val.id != 0) {
+        auto zero_v = ir_->uint_immediate_number(u32_t, 0);
+        chunk_idx_val = ir_->make_value(
+            spv::OpSelect, u32_t, is_zero, zero_v, chunk_idx_val);
+      }
+    }
+    if (chunk_idx_out != nullptr) {
+      *chunk_idx_out = chunk_idx_val;
     }
     return cell_byte_offset;
   }
@@ -1300,8 +1371,17 @@ class TaskCodegen : public IRVisitor {
       // Phase 2b: pointer indirection -> pool cell byte offset.
       spirv::Value input_index_val =
           ir_->query_value(stmt->input_index->raw_name());
+      // C-2.5 (2026-05): capture chunk_idx for chunked allocators so the
+      // leaf at_buffer() can route via struct_array_access_chunked. For
+      // non-chunked pools chunk_idx_val.id == 0 (default) and no
+      // ptr_to_chunk_idx_ entry is recorded, byte-equivalent path.
+      spirv::Value chunk_idx_val;
       val = pointer_lookup_or_activate(parent_val, root_id, sn, input_index_val,
-                                       /*do_activate=*/stmt->activate);
+                                       /*do_activate=*/stmt->activate,
+                                       &chunk_idx_val);
+      if (chunk_idx_val.id != 0) {
+        ptr_to_chunk_idx_[stmt] = chunk_idx_val;
+      }
     } else if (sn->type == SNodeType::quant_array) {
       // G9.2 (2026-04-30): all user cells in a quant_array share ONE
       // physical word inside the parent cell, so the byte address does
@@ -1332,6 +1412,11 @@ class TaskCodegen : public IRVisitor {
       if (it != ptr_to_buffers_.end()) {
         ptr_to_buffers_[stmt] = it->second;
       }
+      // C-2.5: forward chunk_idx through bit_struct lookup.
+      auto cit = ptr_to_chunk_idx_.find(stmt->input_snode);
+      if (cit != ptr_to_chunk_idx_.end()) {
+        ptr_to_chunk_idx_[stmt] = cit->second;
+      }
     } else {
       const auto &snode_descs = compiled_structs_[root_id].snode_descriptors;
       const auto &desc = snode_descs.at(sn->id);
@@ -1341,6 +1426,12 @@ class TaskCodegen : public IRVisitor {
       spirv::Value stride = make_pointer(desc.cell_stride);
       spirv::Value offset = ir_->mul(input_index_val, stride);
       val = ir_->add(parent_val, offset);
+      // C-2.5: forward chunk_idx from parent (dense lookup advances byte
+      // address within the same cell of the same chunk).
+      auto cit = ptr_to_chunk_idx_.find(stmt->input_snode);
+      if (cit != ptr_to_chunk_idx_.end()) {
+        ptr_to_chunk_idx_[stmt] = cit->second;
+      }
     }
     ir_->register_value(stmt->raw_name(), val);
   }
@@ -4212,6 +4303,16 @@ class TaskCodegen : public IRVisitor {
     spirv::Value idx_val = ir_->make_value(
         spv::OpShiftRightLogical, ptr_val.stype, ptr_val,
         ir_->uint_immediate_number(ptr_val.stype, size_t(std::log2(width))));
+    // C-2.5 (2026-05): chunked NodeAllocatorPool dispatch. ptr_to_chunk_idx_
+    // carries the runtime chunk_idx propagated from pointer_lookup_or_activate
+    // through the GetCh / SNodeLookup forwarding chain. Empty for
+    // non-chunked pools (byte-equivalent path).
+    auto chunk_it = ptr_to_chunk_idx_.find(ptr);
+    if (chunk_it != ptr_to_chunk_idx_.end()) {
+      TI_ASSERT(buffer.flag == spirv::ValueKind::kChunkedArrayPtr);
+      return ir_->struct_array_access_chunked(
+          ir_->get_primitive_type(dt), buffer, chunk_it->second, idx_val);
+    }
     spirv::Value ret =
         ir_->struct_array_access(ir_->get_primitive_type(dt), buffer, idx_val);
     return ret;
@@ -4303,8 +4404,30 @@ class TaskCodegen : public IRVisitor {
     int binding = binding_head_++;
     buffer_binding_map_[key] = binding;
 
-    spirv::Value buffer_value =
-        ir_->buffer_argument(type, 0, binding, buffer_instance_name(buffer));
+    // C-2.5 (2026-05): chunked NodeAllocatorPool emits a descriptor array
+    // of N storage buffers at this single binding. Each chunk's SSBO type
+    // is the same `struct { runtime_array u32 data; }`; chunk[0] holds
+    // meta + pool_data zone (Vulkan-side bound to the existing pool
+    // DeviceAllocation), chunk[k>0] holds cell-only data. SPIR-V access:
+    // OpAccessChain on the chunked array picks chunk[k] then indexes into
+    // its u32 runtime array.
+    spirv::Value buffer_value;
+    if (buffer.type == BufferType::NodeAllocatorPool) {
+      if (auto *contract = lookup_chunked_pool_contract(buffer.root_id[0])) {
+        buffer_value = ir_->buffer_array_argument(
+            type, 0, binding, contract->max_chunks,
+            buffer_instance_name(buffer));
+        buffer_value_map_[key] = buffer_value;
+        TI_TRACE(
+            "buffer name = {} (chunked, max_chunks={}), value = {}",
+            buffer_instance_name(buffer), contract->max_chunks,
+            buffer_value.id);
+        return buffer_value;
+      }
+    }
+
+    buffer_value = ir_->buffer_argument(type, 0, binding,
+                                        buffer_instance_name(buffer));
     buffer_value_map_[key] = buffer_value;
     TI_TRACE("buffer name = {}, value = {}", buffer_instance_name(buffer),
              buffer_value.id);
@@ -4527,7 +4650,18 @@ class TaskCodegen : public IRVisitor {
   std::vector<BufferBind> get_buffer_binds() {
     std::vector<BufferBind> result;
     for (auto &[key, val] : buffer_binding_map_) {
-      result.push_back(BufferBind{key.first, int(val)});
+      BufferBind bb{key.first, int(val)};
+      // C-2.5 (2026-05): mark chunked NodeAllocatorPool bindings so the
+      // runtime emits rw_buffer_array(N) instead of rw_buffer(1). The
+      // allocator's chunks() vector is the source of truth at dispatch
+      // time; chunk_count is just a positive marker matching contract.
+      if (key.first.type == BufferType::NodeAllocatorPool) {
+        if (auto *contract =
+                lookup_chunked_pool_contract(key.first.root_id[0])) {
+          bb.chunk_count = contract->max_chunks;
+        }
+      }
+      result.push_back(bb);
     }
     return result;
   }
@@ -4642,6 +4776,14 @@ class TaskCodegen : public IRVisitor {
   // by the new quant_array branch in SNodeLookupStmt, which itself only
   // runs for fields whose extension was admitted by extension.cpp).
   std::unordered_map<const Stmt *, spirv::Value> bit_ptr_bit_offsets_;
+  // C-2.5 (2026-05): chunk-index side table parallel to ptr_to_buffers_.
+  // When a Stmt's byte address resolves to a NodeAllocatorPool buffer that
+  // uses a chunked descriptor array (allocator_kind=Chunked, max_chunks>1),
+  // the runtime chunk_idx SSA value is stashed here. at_buffer() consumes
+  // it via struct_array_access_chunked. Empty for non-chunked pools and
+  // for non-NodeAllocatorPool routings; the addressing path is then
+  // byte-equivalent to vanilla.
+  std::unordered_map<const Stmt *, spirv::Value> ptr_to_chunk_idx_;
   std::unordered_map<std::vector<int>, Value, hashing::Hasher<std::vector<int>>>
       argid_to_tex_value_;
 };

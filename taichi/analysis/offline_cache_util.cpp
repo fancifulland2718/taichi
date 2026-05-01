@@ -124,6 +124,7 @@ static std::vector<std::uint8_t> get_offline_cache_key_of_compile_config(
     // 寻址（C-2.3 起）和 SNodeTree allocator 构造均不同；必须进入 cache key。
     // 默认 "bump" 字符串哈希稳定，旧用户无 invalidation。
     serializer(config.vulkan_pointer_allocator_kind);
+    serializer(config.vulkan_pointer_max_chunks);
   }
   serializer.finalize();
 

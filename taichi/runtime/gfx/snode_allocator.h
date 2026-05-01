@@ -80,6 +80,19 @@ class DeviceNodeAllocator {
   // DeviceAllocation，返回指针供 runtime 注入 descriptor set
   // ；nullptr = 走 root_buffer 子区间（与 B-3.a 及以前一致）。
   virtual DeviceAllocation *independent_pool_alloc() const { return nullptr; }
+
+  // C-2.5 (2026-05): 返回所有 chunk 的 DeviceAllocation。Bump / 单 chunk
+  // 实现返回 {independent_pool_alloc()}（或空，若没有独立 pool）；Chunked
+  // 实现返回 {chunk[0], chunk[1], ..., chunk[N-1]}。runtime 端在
+  // BufferBind.chunk_count > 0 时调用，把 N 个 buffer 一并 bind 到单
+  // 个 descriptor array binding。
+  virtual std::vector<DeviceAllocation> chunks() const {
+    auto *p = independent_pool_alloc();
+    if (p == nullptr) {
+      return {};
+    }
+    return {*p};
+  }
 };
 
 // -----------------------------------------------------------------------------
@@ -192,13 +205,33 @@ class ChunkedDeviceNodeAllocator final : public DeviceNodeAllocator {
   DeviceAllocation *independent_pool_alloc() const override;
 
   // C-2.2 新增：chunk descriptor list（C-2.3 的 codegen 入口）。
-  // skeleton 阶段始终返回 1 元素 list（chunk[0] = 独立 pool buffer）。
-  std::vector<DeviceAllocation> chunks() const;
-  uint32_t num_chunks() const { return 1; }
+  // C-2.2/2.3 阶段返回 1 元素（chunk[0] = 独立 pool buffer）；
+  // C-2.4 起改为返回 1 + extra_chunks_.size()。num_chunks() 与
+  // chunks().size() 必须始终一致 —— C-2.4 实施时同步修改。
+  std::vector<DeviceAllocation> chunks() const override;
+  uint32_t num_chunks() const {
+    return 1u + static_cast<uint32_t>(extra_chunks_.size());
+  }
+
+  // C-2.4.a Commit A (2026-05): 总额外 chunk 字节数（仅 chunk[1..N-1]的总
+  // 和），供 bench / 显存占用论证。Commit A 阶段这些额外 chunk 在 GPU
+  // 上被分配但 SPIR-V 路径仍只读 chunk[0]，是“显存就位”不是“codegen
+  // 就位”。Commit B 切重 codegen 后该接口依然返回同样值。
+  std::size_t extra_chunks_total_bytes() const;
 
  private:
   // 内部组合：BumpOnly 已经实现 watermark + 整池清零 + spirv_contract。
   std::unique_ptr<BumpOnlyDeviceNodeAllocator> bump_;
+  // C-2.4.a Commit A (2026-05): 静态预分配的 chunk[1..max_chunks-1]。
+  // 每个 chunk 大小 = ceil(pool_capacity / max_chunks) * cell_stride。
+  // ctor 后会广裁为 0。Commit A 阶段 SPIR-V codegen 不读这些 chunk（
+  // contract.chunk_log2_capacity 仍按整池 capacity 计算 → chunk_idx 恒 0）；
+  // Commit B 切真切分后才起作用。本贫静态 capacity 上限、不指望动态
+  // grow；C-2.4.c 才会动态伸缩。
+  std::vector<std::unique_ptr<DeviceAllocationGuard>> extra_chunks_;
+  // C-2.4.a Commit A: 记录额外 chunk 总字节数（仅 chunk[1..N-1]），供调试
+  // / bench 验证静态预分配生效。Commit A 以 ctor 内一次赋值，不变。
+  std::size_t extra_chunks_total_bytes_{0};
 };
 
 // 工厂：路线切换的唯一入口。

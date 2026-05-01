@@ -159,6 +159,12 @@ struct CompileConfig {
   //  绝不 silent 降级回 bump（与 C-1.b 删除 OOC 静默 fallback 同一原则）。
   // 详见 compile_doc/SNode_Vulkan_规划.md §12.2.0 / §12.2.1。
   std::string vulkan_pointer_allocator_kind{"bump"};
+  // C-2.4.a (2026-05): chunked allocator 允许的最大 chunk 数。默认 1
+  // 与 C-2.3 完全等价（单 chunk = 整池）。C-2.4.a 仅将该字段 plumbing
+  // 到 contract.max_chunks，后续 step ii–v 才会在 SPIR-V 侧发射
+  // descriptor array of buffers 以跨 chunk 寻址。该字段进入 offline cache
+  // key，避免同一 SNode 在 max_chunks 改变后复用旧缓存。
+  uint32_t vulkan_pointer_max_chunks{1};
   int max_vector_width;
   bool print_preprocessed_ir;
   bool print_ir;

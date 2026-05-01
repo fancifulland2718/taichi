@@ -770,6 +770,16 @@ Value IRBuilder::buffer_argument(const SType &value_type,
 Value IRBuilder::struct_array_access(const SType &res_type,
                                      Value buffer,
                                      Value index) {
+  // C-2.5 (2026-05): if the buffer is a chunked descriptor array, this
+  // call has historically been used for meta-zone access (freelist head,
+  // freelist links, watermark) which all live at fixed offsets in
+  // chunk[0]. Auto-route to chunk[0] so existing meta callers stay
+  // byte-equivalent without per-site changes; cell-data callers must use
+  // struct_array_access_chunked explicitly with the runtime chunk_idx.
+  if (buffer.flag == ValueKind::kChunkedArrayPtr) {
+    Value zero_chunk = uint_immediate_number(t_uint32_, 0);
+    return struct_array_access_chunked(res_type, buffer, zero_chunk, index);
+  }
   TI_ASSERT(buffer.flag == ValueKind::kStructArrayPtr);
   TI_ASSERT(res_type.flag == TypeKind::kPrimitive);
 
@@ -784,6 +794,85 @@ Value IRBuilder::struct_array_access(const SType &res_type,
   Value ret = new_value(ptr_type, ValueKind::kVariablePtr);
   ib_.begin(spv::OpAccessChain)
       .add_seq(ptr_type, ret, buffer, const_i32_zero_, index)
+      .commit(&function_);
+
+  return ret;
+}
+
+Value IRBuilder::buffer_array_argument(const SType &value_type,
+                                       uint32_t descriptor_set,
+                                       uint32_t binding,
+                                       uint32_t array_count,
+                                       const std::string &name) {
+  // C-2.5 (2026-05): descriptor array of storage buffers. Layout:
+  //   %ssbo_struct = OpTypeStruct { OpTypeRuntimeArray value_type } + Block
+  //   %arr         = OpTypeArray %ssbo_struct array_count
+  //   %arr_ptr     = OpTypePointer StorageBuffer %arr
+  //   %var         = OpVariable %arr_ptr StorageBuffer
+  //   OpDecorate %var DescriptorSet ds Binding b
+  // Vulkan side uses a single binding with descriptorCount=array_count
+  // and N VkDescriptorBufferInfo entries; SPIR-V side accesses chunk[k]
+  // via OpAccessChain on the array variable.
+  TI_ASSERT(array_count > 0);
+  spv::StorageClass storage_class;
+  if (caps_->get(cap::spirv_version) < 0x10300) {
+    storage_class = spv::StorageClassUniform;
+  } else {
+    storage_class = spv::StorageClassStorageBuffer;
+  }
+
+  SType sarr_type = get_struct_array_type(value_type, 0);
+
+  auto typed_name = name + "_" + value_type.dt.to_string();
+  this->debug_name(spv::OpName, sarr_type, typed_name + "_struct_array");
+
+  // Outer fixed-size array of SSBO structs (descriptor array).
+  SType outer_arr_type;
+  outer_arr_type.id = id_counter_++;
+  outer_arr_type.flag = TypeKind::kPtr;
+  outer_arr_type.element_type_id = sarr_type.id;
+  Value count_const = uint_immediate_number(t_uint32_, array_count);
+  ib_.begin(spv::OpTypeArray)
+      .add_seq(outer_arr_type, sarr_type, count_const)
+      .commit(&global_);
+  this->debug_name(spv::OpName, outer_arr_type,
+                   typed_name + "_chunked_array");
+
+  SType ptr_type = get_pointer_type(outer_arr_type, storage_class);
+  this->debug_name(spv::OpName, ptr_type, typed_name + "_chunked_ptr");
+
+  Value val = new_value(ptr_type, ValueKind::kChunkedArrayPtr);
+  ib_.begin(spv::OpVariable)
+      .add_seq(ptr_type, val, storage_class)
+      .commit(&global_);
+  this->debug_name(spv::OpName, val, typed_name);
+
+  this->decorate(spv::OpDecorate, val, spv::DecorationDescriptorSet,
+                 descriptor_set);
+  this->decorate(spv::OpDecorate, val, spv::DecorationBinding, binding);
+  return val;
+}
+
+Value IRBuilder::struct_array_access_chunked(const SType &res_type,
+                                             Value chunked_buffer,
+                                             Value chunk_idx,
+                                             Value slot_word_idx) {
+  TI_ASSERT(chunked_buffer.flag == ValueKind::kChunkedArrayPtr);
+  TI_ASSERT(res_type.flag == TypeKind::kPrimitive);
+
+  spv::StorageClass storage_class;
+  if (caps_->get(cap::spirv_version) < 0x10300) {
+    storage_class = spv::StorageClassUniform;
+  } else {
+    storage_class = spv::StorageClassStorageBuffer;
+  }
+
+  SType ptr_type = this->get_pointer_type(res_type, storage_class);
+  Value ret = new_value(ptr_type, ValueKind::kVariablePtr);
+  // OpAccessChain ptr base chunk_idx struct_member_0 slot_word_idx
+  ib_.begin(spv::OpAccessChain)
+      .add_seq(ptr_type, ret, chunked_buffer, chunk_idx, const_i32_zero_,
+               slot_word_idx)
       .commit(&function_);
 
   return ret;

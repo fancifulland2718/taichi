@@ -6,6 +6,7 @@
 #include <vector>
 #include <array>
 #include <set>
+#include <list>
 
 #include "taichi/rhi/vulkan/vulkan_common.h"
 #include "taichi/rhi/vulkan/vulkan_utils.h"
@@ -720,6 +721,28 @@ ShaderResourceSet &VulkanResourceSet::rw_image(uint32_t binding,
   return *this;
 }
 
+ShaderResourceSet &VulkanResourceSet::rw_buffer_array(
+    uint32_t binding,
+    const std::vector<DeviceAllocation> &allocs) {
+  // C-2.5 (2026-05): single binding, descriptorCount=N storage buffers.
+  // Each buffer is bound with VK_WHOLE_SIZE; SPIR-V side selects chunk[k]
+  // via OpAccessChain on the array variable. Empty allocs is treated as
+  // an empty descriptor write (caller's responsibility to ensure non-empty
+  // when shader actually reads).
+  dirty_ = true;
+  BufferArray ba;
+  ba.buffers.reserve(allocs.size());
+  for (const auto &alloc : allocs) {
+    vkapi::IVkBuffer buffer =
+        (alloc != kDeviceNullAllocation)
+            ? device_->get_vkbuffer(alloc.get_ptr(0))
+            : nullptr;
+    ba.buffers.push_back(buffer);
+  }
+  bindings_[binding] = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, std::move(ba)};
+  return *this;
+}
+
 RhiReturn<vkapi::IVkDescriptorSet> VulkanResourceSet::finalize() {
   if (!dirty_ && set_) {
     // If nothing changed directly return the set
@@ -750,6 +773,11 @@ RhiReturn<vkapi::IVkDescriptorSet> VulkanResourceSet::finalize() {
 
   std::forward_list<VkDescriptorBufferInfo> buffer_infos;
   std::forward_list<VkDescriptorImageInfo> image_infos;
+  // C-2.5 (2026-05): per-BufferArray storage. Each binding owns its own
+  // contiguous std::vector; the std::list keeps inner vectors stable in
+  // memory across emplaces so VkWriteDescriptorSet::pBufferInfo remains
+  // valid until vkUpdateDescriptorSets.
+  std::list<std::vector<VkDescriptorBufferInfo>> buffer_array_infos;
   std::vector<VkWriteDescriptorSet> desc_writes;
 
   set_->ref_binding_objs.clear();
@@ -805,6 +833,23 @@ RhiReturn<vkapi::IVkDescriptorSet> VulkanResourceSet::finalize() {
       if (tex->sampler) {
         set_->ref_binding_objs.push_back(tex->sampler);
       }
+    } else if (BufferArray *ba = std::get_if<BufferArray>(&resource)) {
+      // C-2.5: emit N contiguous VkDescriptorBufferInfo entries; each
+      // buffer is bound with offset=0, range=VK_WHOLE_SIZE. Empty array
+      // is rejected by Vulkan (descriptorCount must be > 0).
+      auto &infos = buffer_array_infos.emplace_back();
+      infos.resize(ba->buffers.size());
+      for (size_t i = 0; i < ba->buffers.size(); ++i) {
+        const auto &b = ba->buffers[i];
+        infos[i].buffer = b ? b->buffer : VK_NULL_HANDLE;
+        infos[i].offset = 0;
+        infos[i].range = VK_WHOLE_SIZE;
+        if (b) {
+          set_->ref_binding_objs.push_back(b);
+        }
+      }
+      write.descriptorCount = static_cast<uint32_t>(infos.size());
+      write.pBufferInfo = infos.data();
     } else {
       RHI_LOG_ERROR("Ignoring unsupported Descriptor Type");
     }
