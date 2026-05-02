@@ -59,9 +59,9 @@ Optional build-time switches (default ON; touch only when bisecting a regression
 
 ## ⚠️ Known correctness / stability issues
 
-> **The Vulkan sparse-SNode backend deviates from the LLVM cpu/cuda backend on two semantic contracts:**
+> **Two historical semantic deviations from the LLVM cpu/cuda backend, both now fixed:**
 > 1. ✅ Fixed (0.3.1): inactive sparse-cell reads return the dtype's zero value.
-> 2. ⚠️ Still present: 3D pointer **full activation** (every cell in the pointer container is concurrently first-written) followed by a listgen-dependent kernel triggers device-lost. This is an inherent limitation (single-slot ≥64-way concurrent CAS spin under GPU warp lockstep). **Only the specific pattern described under "Bug 2" below is affected.**
+> 2. ✅ Fixed (0.3.2, 2026-05-02): 3D pointer **full activation** device-lost is resolved by the C-9 deterministic-slot codegen path; details under "Bug 2" below.
 
 ### ✅ Fixed bug 1 (0.3.1, 2026-04-30): inactive sparse-cell reads return zero
 
@@ -73,50 +73,32 @@ LLVM cpu / cuda guarantees that reading an inactive sparse cell returns the dtyp
 
 **Remaining limitation**: inactive **writes** (out-of-capacity OOC) keep the documented silent-loss slot-0 path described in §3.1; this fix only changes inactive-read semantics.
 
-### ⚠️ Known limitation Bug 2: 3D pointer **full activation** triggers device-lost (**stability**)
+### ✅ Fixed bug 2 (0.3.2, 2026-05-02): 3D pointer **full activation** device-lost
 
-**Precise trigger conditions** (failing any of these → safe):
+**Historical trigger conditions (failing any one was already safe; now all are moot)**:
 
 1. The SNode tree contains a 3D pointer level (`ti.root.pointer(ti.ijk, ...)` or `pointer.pointer.dense(ti.ijk, ...)`);
 2. **Within a single frame** every cell of the pointer container is first-written (first write implies activate);
 3. Followed by a listgen-dependent kernel: struct-for (`for i,j,k in field:`) / `to_numpy()` / another kernel reading that field / a second full ndrange scan;
 4. ≥64 threads concurrently first-write to the same pointer cell.
 
-**Symptom**: the write kernel completes (`atomic_add` counter is correct) but the next dispatch hits `RHI Error: (-4) vkQueueSubmit failed` / on Windows the process aborts with code `0xC0000409`.
+**Historical symptom**: the write kernel completed (`atomic_add` counter was correct) but the next dispatch hit `RHI Error: (-4) vkQueueSubmit failed` / on Windows the process aborted with code `0xC0000409`.
 
-**Root cause (informational)**: this fork's pointer-activate protocol is *CAS-marker + spin-on-loss* (used to bring race-inflation cell counts from 12.5% to 100%). Under SPIR-V `OpLoopMerge` + GPU warp lockstep, when ≥64 lanes contend for the same slot, the winning lane and the spinning lanes are lockstep-blocked in the same warp → spin deadlock → driver TDR. A proper fix requires switching the protocol to host-enumerate-then-batch, which is a significant rewrite; **not scheduled for the short term**.
+**0.3.2 fix (C-9 deterministic-slot codegen)**: after observing that the default `pool_capacity == total_num_cells_from_root` (i.e. always equals the number of outer cells), pointer activation no longer needs an atomic allocator — every outer cell gets a statically assigned unique pool slot `new_slot = idx_u32 + 1 ∈ [1, capacity]`. The SPIR-V emission collapses to a single `OpAtomicCompareExchange(slot, 0, new_slot)`, replacing the previous four-instruction chain (`CAS-marker + atomicIAdd(watermark) + atomicStore + structured spin-loop`). All threads racing on the same outer cell compute the same `new_slot`, so the spin-loop disappears entirely along with the warp-lockstep deadlock.
 
-**Verified-safe patterns** (use freely):
+For full analysis and the regression matrix see `compile_doc/SNode_Vulkan_规划.md` §14. Acceptance test: [tests/p4/g10p1_user_repro.py](../../tests/p4/g10p1_user_repro.py) (5 consecutive runs Vulkan rc=0, cpu/cuda/vulkan sums equivalent within ±1e-5 single-precision tolerance).
 
-- ✅ 1D / 2D pointer full-fill (any size);
-- ✅ 3D pointer with sparse activation (typical sparsity ≤ 25%, e.g. activating 8³ cells in a 64³ grid);
-- ✅ 3D pointer with brick-scatter (outer ndrange over block coords, inner `ti.static` sequential over voxels in a block) — MPM-128, SPH, fluid-bricks, and similar idiomatic workloads;
-- ✅ **Nested pointers**: `pointer.pointer.dense` two-level layouts behave identically to single-level pointer (verified byte-equivalent across cpu/cuda/vulkan); the C-1 hint (see §3.7) attaches per level independently.
+**Default-on**: CompileConfig `vulkan_pointer_deterministic_slot` (default **`True`**), automatically engaged whenever `ti.init(arch=ti.vulkan, vulkan_sparse_experimental=True)`. The codegen falls back to the legacy CAS-marker path (byte-equivalent to 0.3.1) in three cases:
+- `vk_max_active` hint shrinks capacity below `worst_capacity`;
+- `vulkan_pointer_max_chunks > 1` engages the chunked allocator;
+- Multi-instance SNodes (`num_cells_per_container != total_num_cells_from_root`, e.g. certain deeply nested SNode trees).
 
-**Workaround 1: brick-scatter (recommended)**
+**Manual opt-out**: `ti.init(vulkan_pointer_deterministic_slot=False)` restores the 0.3.1 behavior byte-for-byte.
 
-```python
-@ti.kernel
-def fill():
-    # parallel over coarse blocks, serial inside
-    for bi, bj, bk in ti.ndrange(N // BS, N // BS, N // BS):
-        for ci, cj, ck in ti.static(ti.ndrange(BS, BS, BS)):
-            i, j, k = bi * BS + ci, bj * BS + cj, bk * BS + ck
-            field[i, j, k] = compute(i, j, k)
-```
+### Current recommendation for Vulkan sparse SNodes
 
-**Workaround 2: opt out to vanilla behavior**
-
-```python
-ti.init(arch=ti.vulkan, vulkan_sparse_experimental=False)
-# ti.root.pointer on Vulkan now falls back to vanilla 1.7.4 behavior (TI_NOT_IMPLEMENTED);
-# run the same code on ti.cpu / ti.cuda instead.
-```
-
-### Honest recommendation for Vulkan sparse SNodes today
-
-- ✅ Suitable: MPM / SPH / brick rendering atomic_add scatter (one cell per thread, rarely ≥64-way same-slot contention); small-active-set + dense compute; offline / host-synchronized small demos; nested pointer trees (e.g. OpenVDB-like B+ trees).
-- ⚠️ Not suitable yet: 3D pointer **full activation** "fill-then-reduce" workloads (blocked by Bug 2) — rewrite as brick-scatter or move to cpu / cuda.
+- ✅ Universally suitable: MPM / SPH / brick rendering atomic_add scatter; small-active-set + dense compute; nested pointer trees (e.g. OpenVDB-like B+ trees); 3D pointer **full activation** "fill-then-reduce" workloads (**newly supported in 0.3.2**).
+- ✅ Brick-scatter is still the recommended idiom for performance (better locality), but no longer required to avoid Bug 2.
 
 ---
 
@@ -238,7 +220,7 @@ The fork is regression-tested for cpu / cuda / vulkan three-backend numerical eq
 | `tests/p4/g8_cache_compat.py` | offline cache fresh / hit / corrupt-recover |
 | `tests/p4/c1_jit_capacity.py` | `vk_max_active` 4-tier fallback capacity resolution |
 | `tests/p4/c1_nested_pointer_pointer_dense.py` | nested `pointer.pointer.dense` three-backend equivalence (with hint) |
-| `tests/p4/g10p1_user_repro.py` | Bug 2 full-activation device-lost regression guard |
+| `tests/p4/g10p1_user_repro.py` | Bug 2 full-activation device-lost regression guard (PASS since 0.3.2) |
 
 Run (PowerShell):
 

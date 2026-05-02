@@ -125,6 +125,9 @@ static std::vector<std::uint8_t> get_offline_cache_key_of_compile_config(
     // 默认 "bump" 字符串哈希稳定，旧用户无 invalidation。
     serializer(config.vulkan_pointer_allocator_kind);
     serializer(config.vulkan_pointer_max_chunks);
+    // C-9 (2026-05): deterministic_slot 改变 alloc 协议（idx_u32+1 直写
+    // vs CasMarker 抢占），必须进入 cache key。详见规划 §14。
+    serializer(config.vulkan_pointer_deterministic_slot);
   }
   serializer.finalize();
 

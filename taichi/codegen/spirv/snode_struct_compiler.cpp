@@ -312,6 +312,25 @@ class StructCompiler {
         // contract 偏移以 root buffer 内 offset 0 为基准；binding_id = -1。
         result.root_size = cursor;
       }
+      // C-9 (2026-05): deterministic-slot gating。四条件同时满足才启用：
+      //   1) policy.deterministic_slot ON（CompileConfig flag 默认 ON）
+      //   2) capacity 未被 hint 收缩到 worst_case 以下（idx_u32 ∈ [0, worst_capacity)，
+      //      new_slot = idx_u32+1 ∈ [1, worst_capacity] 必须 ≤ capacity）
+      //   3) allocator_kind == Bump（chunked 路径 slot encoding 不同；本期不启用）
+      //   4) 本 snode 在树中是单实例（num_cells_per_container ==
+      //      total_num_cells_from_root）。多实例时 codegen 的 idx_u32 是
+      //      局部索引（[0, cells_per_container)），跨父实例会塌成同一
+      //      new_slot，破坏 1:1 映射。典型受影响：嵌套 pointer
+      //      (pointer.pointer.dense)。fallback 到 CasMarker / Legacy
+      //      继续工作。
+      // 任一不满足强制 false（§14.5 R1/R2、§14.8 #3）；自动 fallback 到
+      // CasMarker / Legacy 路径，与本节落地前字节等价。
+      c.deterministic_slot =
+          policy_.deterministic_slot &&
+          capacity >= worst_capacity &&
+          c.allocator_kind == SpirvAllocatorContract::AllocatorKind::Bump &&
+          static_cast<size_t>(desc.snode->num_cells_per_container) ==
+              worst_capacity;
       result.pointer_contracts.emplace(desc.snode->id, c);
     }
 

@@ -89,6 +89,13 @@ struct SpirvAllocatorContract {
   uint32_t max_chunks{0};
   // chunk descriptor 数组首 binding；-1 = 未设置（Bump 路径默认）。
   int32_t chunk_descriptor_array_first_binding{-1};
+
+  // C-9 (2026-05) — deterministic slot mapping。true 时 codegen 在
+  // do_activate=true 路径用 `new_slot = idx_u32 + 1` 直接 CAS 发布到
+  // slot_ptr，跳过 watermark / freelist / spin。仅当 layout 端确认
+  // pool_capacity >= worst_capacity 且 allocator_kind == Bump 时才会置 true。
+  // 详见 compile_doc/SNode_Vulkan_规划.md §14。
+  bool deterministic_slot{false};
 };
 
 }  // namespace spirv

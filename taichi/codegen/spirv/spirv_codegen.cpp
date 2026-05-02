@@ -678,6 +678,28 @@ class TaskCodegen : public IRVisitor {
 
     spirv::Value final_slot;
     if (do_activate) {
+      // C-9 (2026-05): deterministic-slot 路径（详见规划 §14）。layout 端
+      // 已确认 pool_capacity >= worst_capacity 且 allocator_kind == Bump，
+      // 因此 `new_slot = idx_u32 + 1` ∈ [1, pool_capacity] 唯一对应一个
+      // 池 slot，互不冲突。所有并发线程对同一 outer cell 计算同一 new_slot，
+      // CAS 直接发布；CAS 返回值任意（winner 见 0、loser 见 new_slot 或上一帧
+      // deactivate=0），但 `final_slot = new_slot` 永远正确。无 spin、无
+      // watermark、无 freelist；与 G10-P1 的 64-way single-slot spin-loop
+      // device-lost 完全脱钩。
+      if (contract.deterministic_slot) {
+        auto new_slot =
+            ir_->add(idx_u32, ir_->uint_immediate_number(u32_t, 1));
+        // 公布 new_slot：CAS(slot, 0, new_slot)。返回值忽略——所有竞争者
+        // 都会写入同一 new_slot，最终 slot_ptr 必为 new_slot；listgen
+        // 与下次 do_activate=false 的 atomicLoad 都会观察到一致结果。
+        ir_->make_value(
+            spv::OpAtomicCompareExchange, u32_t, slot_ptr,
+            /*scope=*/ir_->const_i32_one_,
+            /*semantics_eq=*/ir_->const_i32_zero_,
+            /*semantics_uneq=*/ir_->const_i32_zero_, new_slot,
+            ir_->uint_immediate_number(u32_t, 0));
+        final_slot = new_slot;
+      } else
       // B-2.b（2026-05）：原 #if TI_VULKAN_POINTER_CAS_MARKER 下放为运行时
       // contract.alloc_protocol 分支，与 layout 路径同源于 CompileConfig
       // 上的 vulkan_pointer_cas_marker。CasMarker 路径与原宏-ON 路径字节等价；

@@ -105,6 +105,9 @@ struct PointerLayoutPolicy {
   // 寻址。后续 step ii–v 会在 max_chunks > 1 时发射 descriptor array
   // of buffers + 两步 OpAccessChain（选 chunk 后再在 chunk 内寻址）。
   uint32_t max_chunks{1};
+  // C-9（2026-05）：pointer alloc 协议切换为 deterministic slot mapping。
+  // 详见 §14。layout 端额外 gating capacity >= worst_capacity && bump。
+  bool deterministic_slot{true};
 };
 
 CompiledSNodeStructs compile_snode_structs(

@@ -181,6 +181,12 @@ struct CompileConfig {
   // descriptor array of buffers 以跨 chunk 寻址。该字段进入 offline cache
   // key，避免同一 SNode 在 max_chunks 改变后复用旧缓存。
   uint32_t vulkan_pointer_max_chunks{1};
+  // C-9 (2026-05): pointer SNode alloc 协议改为 deterministic slot mapping
+  // （new_slot = idx_u32 + 1）。详见 compile_doc/SNode_Vulkan_规划.md §14。
+  // 默认 ON：消除 G10-P1 触发的 spin-loop device-lost；layout 端自动 gating
+  //   `capacity >= worst_capacity && allocator_kind == "bump"`，不满足时强制
+  //   降级到 cas_marker 路径（与本节落地前字节等价）。设 false 也可整体降级。
+  bool vulkan_pointer_deterministic_slot{true};
   int max_vector_width;
   bool print_preprocessed_ir;
   bool print_ir;
