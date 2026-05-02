@@ -141,6 +141,21 @@ Program::Program(Arch desired_arch) : snode_rw_accessors_bank_(this) {
   // query (the very next block already calls it for Extension::assertion).
   // Sticky once true; OR'd with the legacy TI_VULKAN_SPARSE env var.
   set_vulkan_sparse_experimental(config.vulkan_sparse_experimental);
+  // §13 (2026-05-02): default for vulkan_sparse_experimental is now true.
+  // Emit a one-shot informational warning whenever the experimental sparse
+  // path is exercised on Arch::vulkan, so users can correlate any unexpected
+  // behaviour with this opt-in path. Skipped on cpu/cuda (which never read
+  // the flag) and skipped when the user explicitly disables it.
+  if (config.arch == Arch::vulkan && config.vulkan_sparse_experimental) {
+    static bool sparse_warn_emitted = false;
+    if (!sparse_warn_emitted) {
+      sparse_warn_emitted = true;
+      TI_WARN(
+          "Vulkan sparse SNode support is experimental and enabled by default "
+          "as of taichi-forge 0.3.x; pass ti.init(vulkan_sparse_experimental="
+          "False) to disable if you observe regressions vs. cuda/cpu.");
+    }
+  }
   // G9.1: same propagation pattern for quant_array / bit_struct on Vulkan.
   set_vulkan_quant_experimental(config.vulkan_quant_experimental);
 

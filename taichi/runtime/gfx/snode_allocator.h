@@ -93,6 +93,14 @@ class DeviceNodeAllocator {
     }
     return {*p};
   }
+
+  // §13.4 (2026-05-02): does this allocator participate in the SPIR-V
+  // descriptor-array-of-buffers binding path? Bump returns false (single
+  // buffer); Chunked returns true regardless of max_chunks. Used by
+  // GfxRuntime to decide between node_allocator_pool_buffers (single)
+  // and node_allocator_chunk_arrays (descriptor array) so the runtime
+  // matches what spirv_codegen.cpp::lookup_chunked_pool_contract emits.
+  virtual bool is_chunked() const { return false; }
 };
 
 // -----------------------------------------------------------------------------
@@ -209,6 +217,7 @@ class ChunkedDeviceNodeAllocator final : public DeviceNodeAllocator {
   // C-2.4 起改为返回 1 + extra_chunks_.size()。num_chunks() 与
   // chunks().size() 必须始终一致 —— C-2.4 实施时同步修改。
   std::vector<DeviceAllocation> chunks() const override;
+  bool is_chunked() const override { return true; }
   uint32_t num_chunks() const {
     return 1u + static_cast<uint32_t>(extra_chunks_.size());
   }

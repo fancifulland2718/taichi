@@ -68,7 +68,7 @@
 | 参数 | 默认 | 用途 |
 |---|---|---|
 | `offline_cache_l_sem` | （关） | 内部测试 flag，不应在生产中使用。 |
-| `vulkan_quant_experimental` | `False` | **0.3.0 新增**。启用后 Vulkan 后端接受 `quant_array` / `bit_struct` 字段（即 `Extension::quant` / `Extension::quant_basic` 在 Vulkan 上可用）。已支持 `QuantInt` / `QuantFixed` 的读、写与多线程并发 `ti.atomic_add`（`OpAtomicCompareExchange` 自旋 RMW，`quant_array` 与 `BitpackedFields` / `bit_struct` 多字段同字均 OK），三后端字节等价。**明确不在 G9 范围**（G9 已收尾）：`QuantFloat` 共享指数、非 add 的原子操作（`atomic_min/max/and/or/xor`，与 LLVM 后端一致）——详见 `compile_doc/SNode_Vulkan_规划.md` §8.9 的暂缓理由与解锁条件。未实现路径会抛 `TI_NOT_IMPLEMENTED` / `TI_ERROR` 而非静默误编译。等价 env var：`TI_VULKAN_QUANT=1`。 |
+| `vulkan_quant_experimental` | `False` | **0.3.0 新增**。启用后 Vulkan 后端接受 `quant_array` / `bit_struct` 字段（即 `Extension::quant` / `Extension::quant_basic` 在 Vulkan 上可用）。已支持 `QuantInt` / `QuantFixed` 的读、写与多线程并发 `ti.atomic_add`（`OpAtomicCompareExchange` 自旋 RMW，`quant_array` 与 `BitpackedFields` / `bit_struct` 多字段同字均 OK），三后端字节等价。明确不支持：`QuantFloat` 共享指数、非 add 的原子操作（`atomic_min/max/and/or/xor`，与 LLVM 后端一致）。未实现路径会抛 `TI_NOT_IMPLEMENTED` / `TI_ERROR` 而非静默误编译。等价 env var：`TI_VULKAN_QUANT=1`。 |
 
 ---
 
@@ -77,7 +77,7 @@
 | 变量 | 取值 | 默认 | 用途 |
 |---|---|---|---|
 | `TI_VULKAN_POOL_FRACTION` | `(0.0, 1.0]` | `1.0` | 缩减每个 `pointer` SNode 的物理 cell pool 到 `max(num_cells_per_container, round(total × fraction))`。越界 activate 走既有 `cap_v` silent-inactive 守卫。非法 / `≤ 0` / `> 1` 回退 `1.0`。详细语义见 [sparse_snode_on_vulkan.zh.md](sparse_snode_on_vulkan.zh.md)。 |
-| `TI_VULKAN_QUANT` | `0` / `1` | `0` | **0.3.0 新增**。等价于 `ti.init(arch=ti.vulkan, vulkan_quant_experimental=True)`。开启后 `quant_array` 与 `BitpackedFields` / `bit_struct` 的读、写、`ti.atomic_add` 均可用。`QuantFloat` 共享指数、非 add 原子明确不在本 milestone 范围（详见 `compile_doc/SNode_Vulkan_规划.md` §8.9）。OFF 时行为与 vanilla 1.7.4 相同。 |
+| `TI_VULKAN_QUANT` | `0` / `1` | `0` | **0.3.0 新增**。等价于 `ti.init(arch=ti.vulkan, vulkan_quant_experimental=True)`。开启后 `quant_array` 与 `BitpackedFields` / `bit_struct` 的读、写、`ti.atomic_add` 均可用。`QuantFloat` 共享指数、非 add 原子明确不支持。OFF 时行为与 vanilla 1.7.4 相同。 |
 
 > 上游 taichi 已有的环境变量（`TI_ARCH` / `TI_DEVICE_MEMORY_GB` 等）保持原行为，不在此重列。
 

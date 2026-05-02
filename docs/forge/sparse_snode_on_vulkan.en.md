@@ -57,9 +57,11 @@ Optional build-time switches (default ON; touch only when bisecting a regression
 
 ---
 
-## ⚠️ Known correctness / stability issues (2026-04-30 user feedback, G10 in flight)
+## ⚠️ Known correctness / stability issues
 
-> **In 0.3.0 the Vulkan sparse-SNode backend deviates from the LLVM cpu/cuda backend on two semantic contracts. Until G10 lands, please follow the workarounds below.** Tracking: `compile_doc/SNode_Vulkan_规划.md` §9.
+> **The Vulkan sparse-SNode backend deviates from the LLVM cpu/cuda backend on two semantic contracts:**
+> 1. ✅ Fixed (0.3.1): inactive sparse-cell reads return the dtype's zero value.
+> 2. ⚠️ Still present: 3D pointer **full activation** (every cell in the pointer container is concurrently first-written) followed by a listgen-dependent kernel triggers device-lost. This is an inherent limitation (single-slot ≥64-way concurrent CAS spin under GPU warp lockstep). **Only the specific pattern described under "Bug 2" below is affected.**
 
 ### ✅ Fixed bug 1 (0.3.1, 2026-04-30): inactive sparse-cell reads return zero
 
@@ -71,13 +73,27 @@ LLVM cpu / cuda guarantees that reading an inactive sparse cell returns the dtyp
 
 **Remaining limitation**: inactive **writes** (out-of-capacity OOC) keep the documented silent-loss slot-0 path described in §3.1; this fix only changes inactive-read semantics.
 
-### ⚠️ Known bug 2: full-grid `ti.ndrange` writes to a 3D pointer field cause device-lost (**stability**)
+### ⚠️ Known limitation Bug 2: 3D pointer **full activation** triggers device-lost (**stability**)
 
-For a 64³ sparse grid laid out as `pointer(8) → bitmasked(4) → dense(2)` (or `pointer(8) → dense(8)`), running `for i,j,k in ti.ndrange(64, 64, 64): field[i,j,k] = ...` to fill every cell: the write itself succeeds, but **any listgen-dependent kernel that follows** (struct-for / `to_numpy()` / another kernel reading that field) triggers GPU TDR / device-lost. CPU/CUDA on the same code is fine.
+**Precise trigger conditions** (failing any of these → safe):
 
-**Counter-examples (work fine)**: 1D pointer full-fill, 2D pointer full-fill, 3D pointer with only a small number of active cells, and 3D pointer in *brick-scatter* mode (parallelize over block coordinates, serialize voxels inside the block). MPM-128 is brick-scatter, hence unaffected.
+1. The SNode tree contains a 3D pointer level (`ti.root.pointer(ti.ijk, ...)` or `pointer.pointer.dense(ti.ijk, ...)`);
+2. **Within a single frame** every cell of the pointer container is first-written (first write implies activate);
+3. Followed by a listgen-dependent kernel: struct-for (`for i,j,k in field:`) / `to_numpy()` / another kernel reading that field / a second full ndrange scan;
+4. ≥64 threads concurrently first-write to the same pointer cell.
 
-**Workaround today**: rewrite the fill kernel as brick-scatter:
+**Symptom**: the write kernel completes (`atomic_add` counter is correct) but the next dispatch hits `RHI Error: (-4) vkQueueSubmit failed` / on Windows the process aborts with code `0xC0000409`.
+
+**Root cause (informational)**: this fork's pointer-activate protocol is *CAS-marker + spin-on-loss* (used to bring race-inflation cell counts from 12.5% to 100%). Under SPIR-V `OpLoopMerge` + GPU warp lockstep, when ≥64 lanes contend for the same slot, the winning lane and the spinning lanes are lockstep-blocked in the same warp → spin deadlock → driver TDR. A proper fix requires switching the protocol to host-enumerate-then-batch, which is a significant rewrite; **not scheduled for the short term**.
+
+**Verified-safe patterns** (use freely):
+
+- ✅ 1D / 2D pointer full-fill (any size);
+- ✅ 3D pointer with sparse activation (typical sparsity ≤ 25%, e.g. activating 8³ cells in a 64³ grid);
+- ✅ 3D pointer with brick-scatter (outer ndrange over block coords, inner `ti.static` sequential over voxels in a block) — MPM-128, SPH, fluid-bricks, and similar idiomatic workloads;
+- ✅ **Nested pointers**: `pointer.pointer.dense` two-level layouts behave identically to single-level pointer (verified byte-equivalent across cpu/cuda/vulkan); the C-1 hint (see §3.7) attaches per level independently.
+
+**Workaround 1: brick-scatter (recommended)**
 
 ```python
 @ti.kernel
@@ -89,11 +105,18 @@ def fill():
             field[i, j, k] = compute(i, j, k)
 ```
 
+**Workaround 2: opt out to vanilla behavior**
+
+```python
+ti.init(arch=ti.vulkan, vulkan_sparse_experimental=False)
+# ti.root.pointer on Vulkan now falls back to vanilla 1.7.4 behavior (TI_NOT_IMPLEMENTED);
+# run the same code on ti.cpu / ti.cuda instead.
+```
+
 ### Honest recommendation for Vulkan sparse SNodes today
 
-- ✅ Suitable: MPM-style atomic_add scatter (one cell per thread); small-active-set + dense compute; offline / host-synchronized small demos.
-- ⚠️ Not suitable yet: 64³+ "fill the entire grid via `ti.ndrange`" workloads (blocked by bug 2).
-- Until that bug is fixed in G10, please keep using the LLVM cpu / cuda backend for that workload.
+- ✅ Suitable: MPM / SPH / brick rendering atomic_add scatter (one cell per thread, rarely ≥64-way same-slot contention); small-active-set + dense compute; offline / host-synchronized small demos; nested pointer trees (e.g. OpenVDB-like B+ trees).
+- ⚠️ Not suitable yet: 3D pointer **full activation** "fill-then-reduce" workloads (blocked by Bug 2) — rewrite as brick-scatter or move to cpu / cuda.
 
 ---
 
@@ -170,6 +193,30 @@ Any "spin until winner finishes the slot" protocol (race-to-activate on `pointer
 - Cross-tree `pointer` (multiple SNode trees referencing each other) — same as LLVM.
 - `ti.deactivate` on a `dense` directly under `root` — same as LLVM (`dense` does not support deactivate).
 
+### 3.6 Listgen iteration order is not a contract
+
+The LLVM backend traverses active cells in struct-for (`for I in field:`) following the SNode tree topology. The Vulkan backend only guarantees that **every currently-active cell is visited**; the visit order is unspecified. If your reduce kernel depends on a deterministic iteration order (e.g. `for i in field: result[0] += i.id`), the intermediate accumulation path may differ between backends and produce **non-byte-equal floating-point results** (final values still agree within 1e-5).
+
+Workaround: use `ti.atomic_add`, or sort before reducing.
+
+### 3.7 Declaring an explicit pointer capacity: `vk_max_active`
+
+Useful for nested pointer trees and large-`N` low-sparsity workloads. Given `pointer(ti.ij, N)`, the default behavior reserves `N²` cells worst-case in the root buffer; if you know the steady-state activate count is much lower, the hint shrinks the pool:
+
+```python
+# Vulkan only: cap this pointer's physical pool to 1024 cells (instead of the worst case)
+blk = ti.root.pointer(ti.ij, 1024, vk_max_active=1024)
+blk.dense(ti.ij, 8).place(x)
+```
+
+Rules:
+
+- The kwarg is honored only on the Vulkan backend; other backends ignore it (with a warn-once on first use).
+- 4-tier fallback priority: `vk_max_active` (kwarg) > `vulkan_pointer_pool_fraction` (`ti.init` kwarg) > `TI_VULKAN_POOL_FRACTION` (env var) > worst-case reservation.
+- Floor: the value is clamped up to `num_cells_per_container` so the deactivate freelist can hold at least one cell.
+- Out-of-capacity: silent inactive (same as §3.1), no exception.
+- Nested pointers: each level can be hinted independently — `outer = ti.root.pointer(ti.ij, OUTER, vk_max_active=N1); inner = outer.pointer(ti.ij, MID, vk_max_active=N2)`.
+
 ---
 
 ## 4. Verification matrix
@@ -189,6 +236,9 @@ The fork is regression-tested for cpu / cuda / vulkan three-backend numerical eq
 | `tests/p4/g2_pool_fraction.py` | `TI_VULKAN_POOL_FRACTION=0.25` three-backend equivalence |
 | `tests/p4/g4_probe.py` | dynamic flat-array protocol |
 | `tests/p4/g8_cache_compat.py` | offline cache fresh / hit / corrupt-recover |
+| `tests/p4/c1_jit_capacity.py` | `vk_max_active` 4-tier fallback capacity resolution |
+| `tests/p4/c1_nested_pointer_pointer_dense.py` | nested `pointer.pointer.dense` three-backend equivalence (with hint) |
+| `tests/p4/g10p1_user_repro.py` | Bug 2 full-activation device-lost regression guard |
 
 Run (PowerShell):
 
@@ -233,7 +283,7 @@ We surveyed the canonical real-time GPU workloads to decide whether shipping `ha
 Why `hash` SNode is **not** the right tool for these:
 
 - All of them have a **bounded coordinate space** (the simulation domain or screen-space frustum), so the unbounded-coordinate property of `hash` is unused.
-- Vulkan has no device-side dynamic allocator; a faithful `hash` SNode would have to choose between (a) statically reserving the worst-case bucket array — functionally identical to a user-level hash on `dense`, or (b) chunked re-hashing — a feature category Forge has explicitly de-scoped (see internal Phase 3/4 notes).
+- Vulkan has no device-side dynamic allocator; a faithful `hash` SNode would have to choose between (a) statically reserving the worst-case bucket array — functionally identical to a user-level hash on `dense`, or (b) chunked re-hashing — a feature category this fork has explicitly de-scoped.
 - Race conditions on GPU hash insertion are non-trivial (linear-probe + CAS + warp lockstep) and overlap with the `pointer` race-to-activate work that already lives in `pointer` SNode.
 
 ### 6.2 Recommended substitutes
@@ -271,7 +321,7 @@ Regression baselines: [tests/p4/g9_quant_baseline.py](https://github.com/taichi-
 - **API**: every public Python API (`ti.root.pointer/.dense/.bitmasked/.dynamic/.place`, `ti.activate/.deactivate/.is_active/.length/.append`, `ti.root.deactivate_all`, etc.) preserves vanilla 1.7.4 semantics on the LLVM backends. The newly available SNode types on Vulkan only add reach; nothing existing is broken.
 - **Offline cache**: cache keys already include the SNode-tree structural hash, so changes such as the pool fraction or the dynamic protocol invalidate the cache automatically.
 - **C-API**: sparse SNode root-buffer layouts are exposed through the existing `c_api/include/` headers; AOT artefact format is unchanged.
-- **Wheel**: the published binary wheel ships every G1–G4 / G6–G8 path enabled. No additional build flags are required.
+- **Wheel**: the published binary wheel ships every sparse-SNode capability of this backend (pointer / bitmasked / dynamic / experimental quant) enabled by default. No additional build flags are required.
 
 ---
 

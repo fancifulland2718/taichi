@@ -407,10 +407,14 @@ GfxRuntime::KernelHandle GfxRuntime::register_taichi_kernel(
         params.node_allocator_pool_buffers.emplace_back(sid, indep);
       }
       // C-2.5 (2026-05): chunked allocator 在 rw_buffer_array 路径下需要
-      // 全部 chunk 的 DeviceAllocation 列表。num_chunks() > 1 时按 sid 注入；
-      // 单 chunk allocator 退化到 node_allocator_pool_buffers 单 buffer 路径。
+      // 全部 chunk 的 DeviceAllocation 列表。
+      // §13.4 (2026-05-02): 任意 chunk 数（含 1）都走 chunk_arrays 路径，
+      // 与 spirv_codegen.cpp::lookup_chunked_pool_contract 同步——后者已
+      // 移除 max_chunks>1 限制；codegen 与 runtime 必须对 chunked 是否
+      // 走 descriptor array 给出相同答案，避免 binding 不匹配 (§13.4
+      // ptr_to_chunk_idx_ vs ptr_to_buffers_ 不变量)。
       auto chunk_list = allocator_ptr->chunks();
-      if (chunk_list.size() > 1u) {
+      if (!chunk_list.empty() && allocator_ptr->is_chunked()) {
         params.node_allocator_chunk_arrays.emplace_back(
             sid, std::move(chunk_list));
       }

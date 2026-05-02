@@ -81,7 +81,15 @@ struct CompileConfig {
   // the resulting SPIR-V differs structurally only when the user actually
   // declares sparse SNodes, which already segregates the cache by SNode tree
   // hash.
-  bool vulkan_sparse_experimental{false};
+  // §13 (2026-05-02): default flipped from false -> true after the full P4
+  // matrix (g10_full_ndrange_pointer_3d / g10_inactive_read_zero /
+  // vulkan_pointer_smoke / listgen / ported / deactivate_all / recycle /
+  // race / c2_4b_demo_workload, 9 scripts) was verified PASS on the current
+  // pyd. A one-shot TI_WARN at Program ctor advertises the experimental
+  // status whenever the path is actually exercised on Arch::vulkan. Users
+  // can opt out via ti.init(vulkan_sparse_experimental=False) which fully
+  // restores the vanilla 1.7.4 "reject sparse on Vulkan" behaviour.
+  bool vulkan_sparse_experimental{true};
   // G9.1 (taichi-forge 0.3.0): opt-in for the experimental quant_array /
   // bit_struct path on the Vulkan backend. Default false matches vanilla
   // taichi 1.7.4 (quant_array is LLVM-only). When true, Program ctor calls
@@ -148,9 +156,17 @@ struct CompileConfig {
   // B-3.b (2026-05): 当 SNodeTree 内恰好 1 个 pointer SNode 时，把该 pointer 的
   // pool 元数据切到独立 NodeAllocatorPool descriptor binding（B-3.b 仅做 plumbing：
   // 申请独立 DeviceAllocation + 注册 input_buffer，codegen 仍读 root_buffer 子区
-  // 间，行为字节等价）。多 pointer / 嵌套 pointer 自动回退 root。默认 false 与历史
-  // 行为字节等价。详见 compile_doc/SNode_Vulkan_规划.md §10.4.2 B-3.b。
-  bool vulkan_pointer_independent_pool{false};
+  // 间，行为字节等价）。多 pointer / 嵌套 pointer 自动回退 root。
+  // §13 (2026-05-02): default ON. Earlier flip-then-revert in this same
+  // session blamed c2_4b_demo_workload.py's chunked-path failure on
+  // independent_pool=true; root cause was actually that
+  // gfx_program.cpp built `PointerLayoutPolicy` straight from this flag,
+  // so chunked+max_chunks>1 would land at indep_pool=false and emit
+  // BufferInfo(Root,...) (kStorageBuffer) for cells that had a recorded
+  // ptr_to_chunk_idx_ entry, tripping the kChunkedArrayPtr assert in
+  // spirv_codegen.cpp::at_buffer. Fix lives in gfx_program.cpp
+  // (coerce_pointer_policy_for_chunked) and re-enables this default.
+  bool vulkan_pointer_independent_pool{true};
   // C-2.1 (2026-05): pointer SNode device-side allocator 选择。append-only
   // 骨架：合法值 {"bump", "chunked"}。默认 "bump" = 路线 B 行为，byte-equivalent。
   // "chunked" 在 C-2.2 之前**不可用**，C-2.1 仅做 plumbing（CompileConfig →

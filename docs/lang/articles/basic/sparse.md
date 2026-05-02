@@ -41,6 +41,7 @@ In Taichi, you can compose data structures similar to VDB and SPGrid with SNodes
 
 :::note
 **Backend compatibility**: The LLVM-based backends (CPU/CUDA) offer the full functionality for performing computations on spatially sparse data structures.
+The Vulkan backend in this fork supports `pointer` / `bitmasked` / `dynamic` SNodes with three-backend numerical equivalence, plus experimental `quant_array` / `bit_struct` (opt-in). It carries documented limitations (statically-sized capacity, listgen iteration order is unspecified, and a 3D-pointer full-activation device-lost gap). See [docs/forge/sparse_snode_on_vulkan.en.md](../../../forge/sparse_snode_on_vulkan.en.md) for the full Vulkan-side semantics, the `vk_max_active` capacity hint, and verified-safe patterns before relying on Vulkan.
 Using sparse data structures on the Metal backend is now deprecated. The support for Dynamic SNode has been removed in v1.3.0,
 and the support for Pointer/Bitmasked SNode will be removed in v1.4.0.
 :::

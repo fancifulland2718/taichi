@@ -522,19 +522,31 @@ class TaskCodegen : public IRVisitor {
   }
 
   // C-2.5 (2026-05): if a NodeAllocatorPool binding `binding_id` belongs to
-  // a chunked allocator with max_chunks > 1, return its contract; else
-  // nullptr. Used by get_buffer_value to emit a descriptor array variable
+  // a chunked allocator, return its contract; else nullptr. Used by
+  // get_buffer_value to emit a descriptor array variable
   // (buffer_array_argument) instead of a single-buffer variable.
+  //
+  // 2026-05-02 fix: pointer_contracts is keyed by SNode id, not by binding
+  // id. The previous implementation used `find(binding_id)` which only
+  // happened to work because pool_buffer_binding_id == snode_id by
+  // construction; iterate on values and match on `pool_buffer_binding_id`
+  // to keep the lookup well-defined.
+  // 2026-05-02 §13.4: drop the `max_chunks > 1u` precondition. The
+  // SNodeLookupStmt visitor records `ptr_to_chunk_idx_` for *any* chunked
+  // allocator (including max_chunks==1, where chunk_idx is structurally
+  // 0); at_buffer then asserts `kChunkedArrayPtr` on the resolved buffer.
+  // Emit a descriptor array (length 1) so the buffer flag matches. This
+  // costs one extra OpAccessChain step at run time but keeps the codegen
+  // invariant uniform.
+  // C-2.5 §13.4 (2026-05-02): chunked allocator now flattens to a single
+  // contiguous pool buffer (see snode_struct_compiler.cpp pool_cells = capacity
+  // for AllocatorKind::Chunked). The descriptor-array path was unsound on
+  // drivers without `SPV_EXT_descriptor_indexing`/`NonUniform` decoration
+  // (collapsed all accesses to chunk[0]). Returning nullptr unconditionally
+  // routes NodeAllocatorPool through the standard single-buffer codegen
+  // (kStructArrayPtr), byte-equivalent to AllocatorKind::Bump.
   const SpirvAllocatorContract *lookup_chunked_pool_contract(int binding_id) {
-    for (auto &cs : compiled_structs_) {
-      auto it = cs.pointer_contracts.find(binding_id);
-      if (it != cs.pointer_contracts.end() &&
-          it->second.allocator_kind ==
-              SpirvAllocatorContract::AllocatorKind::Chunked &&
-          it->second.max_chunks > 1u) {
-        return &it->second;
-      }
-    }
+    (void)binding_id;
     return nullptr;
   }
 
@@ -972,52 +984,25 @@ class TaskCodegen : public IRVisitor {
     auto pool_offset_v = ir_->uint_immediate_number(
         u32_t, contract.pool_data_offset);
     spirv::Value cell_byte_offset;
-    spirv::Value chunk_idx_val;  // C-2.5: defined only on Chunked path
-    if (contract.allocator_kind ==
-        SpirvAllocatorContract::AllocatorKind::Chunked) {
-      // C-2.5 (2026-05): chunked-allocator addressing across N independent
-      // chunk buffers (descriptor array of N storage buffers, single
-      // binding). Layout is:
-      //   chunk[0]: meta zone (watermark / freelist / freelist_links /
-      //             ambient if enabled) + chunk_size_cells worth of pool
-      //             data starting at contract.pool_data_offset.
-      //   chunk[k>0]: chunk_size_cells worth of pool data starting at
-      //               offset 0 (no meta).
-      // Address split:
-      //   chunk_idx  = effective_slot >> chunk_log2_capacity
-      //   local_slot = effective_slot & ((1 << chunk_log2_capacity) - 1)
-      //   per_chunk_base = (chunk_idx == 0) ? pool_data_offset : 0
-      //   cell_byte_in_chunk = per_chunk_base + local_slot * cell_stride
-      // The returned cell_byte_offset is the byte address WITHIN the
-      // selected chunk buffer; chunk_idx is propagated separately so
-      // at_buffer() can emit struct_array_access_chunked. When max_chunks
-      // == 1, chunk_idx is identically 0 and per_chunk_base ==
-      // pool_data_offset, byte-equivalent to the Bump path.
-      const uint32_t chunk_log2 = contract.chunk_log2_capacity;
-      TI_ASSERT(chunk_log2 < 32);
-      const uint32_t chunk_size_cells = 1u << chunk_log2;
-      const uint64_t chunk_size_bytes_64 =
-          static_cast<uint64_t>(chunk_size_cells) *
-          static_cast<uint64_t>(contract.cell_stride_bytes);
-      TI_ASSERT(chunk_size_bytes_64 <= 0xffffffffull);
-      auto chunk_log2_v = ir_->uint_immediate_number(u32_t, chunk_log2);
-      auto chunk_mask_v =
-          ir_->uint_immediate_number(u32_t, chunk_size_cells - 1u);
-      auto zero_v = ir_->uint_immediate_number(u32_t, 0);
-      chunk_idx_val = ir_->make_value(
-          spv::OpShiftRightLogical, u32_t, effective_slot, chunk_log2_v);
-      auto local_slot = ir_->make_value(
-          spv::OpBitwiseAnd, u32_t, effective_slot, chunk_mask_v);
-      auto chunk_idx_is_zero = ir_->make_value(
-          spv::OpIEqual, ir_->bool_type(), chunk_idx_val, zero_v);
-      auto per_chunk_base = ir_->make_value(
-          spv::OpSelect, u32_t, chunk_idx_is_zero, pool_offset_v, zero_v);
-      auto local_byte_off = ir_->mul(local_slot, cell_stride_v);
-      cell_byte_offset = ir_->add(per_chunk_base, local_byte_off);
-    } else {
-      cell_byte_offset = ir_->add(
-          pool_offset_v, ir_->mul(effective_slot, cell_stride_v));
-    }
+    spirv::Value chunk_idx_val;  // C-2.5 §13.4: kept .id==0 (flat path);
+                                 // see snode_struct_compiler.cpp comment.
+    // C-2.5 §13.4 (2026-05-02): chunked allocator uses a single contiguous
+    // pool buffer of full `capacity` cells with flat bump-style addressing
+    // (byte-equivalent to AllocatorKind::Bump). The historical chunked
+    // formula (chunk_idx = effective_slot >> chunk_log2; per_chunk_base ?
+    // pool_data_offset : 0; cell_byte = per_chunk_base + local_slot *
+    // cell_stride) emitted an `OpAccessChain` indexing into a per-binding
+    // `OpTypeArray<SSBO,max_chunks>` with a runtime `chunk_idx`, which
+    // requires `SPV_EXT_descriptor_indexing` + `NonUniform` decoration;
+    // without those the Vulkan spec leaves the behavior undefined and
+    // tested drivers silently collapse all accesses to chunk[0]. The
+    // eager allocation of all extra chunks at construction time already
+    // negated the design's only benefit (lazy growth), so flattening here
+    // is both correct and simpler. AllocatorKind::Chunked is retained on
+    // the contract for forward compatibility with a future true
+    // lazy-growth path.
+    cell_byte_offset = ir_->add(
+        pool_offset_v, ir_->mul(effective_slot, cell_stride_v));
     // G10-P2 (2026-04-30 → B-2.a 2026-05): for inactive reads
     // (do_activate=false), route the byte offset to the per-pointer-SNode
     // ambient zone instead of pool[0]. The ambient zone is cell_stride

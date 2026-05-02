@@ -256,10 +256,20 @@ class StructCompiler {
             chunk_size_bytes_64, max_chunks);
         c.chunk_log2_capacity = chunk_log2;
         c.max_chunks = max_chunks;
-        // pool_data 区只占 chunk[0]：chunk_size_cells * cell_bytes。
-        // chunk[k>0] 物理 buffer 在 ChunkedDeviceNodeAllocator 中独立
-        // alloc，layout pass 不涉及。
-        pool_cells = chunk_size_cells;
+        // C-2.5 §13.4 (2026-05-02 fix): chunked allocator now uses a single
+        // contiguous pool buffer of full `capacity` cells with flat
+        // bump-style addressing (`pool_data_offset + effective_slot *
+        // cell_stride`). The previous descriptor-array path
+        // (`OpAccessChain` on `OpTypeArray<SSBO,max_chunks>` with
+        // per-invocation `chunk_idx`) required `SPV_EXT_descriptor_indexing`
+        // + `NonUniform` decoration to behave correctly across drivers;
+        // without those, drivers silently collapsed all accesses to
+        // chunk[0] (verified: max_chunks=N → sum_f = chunk_size_N).
+        // Eager pre-allocation of all chunks already negates the only
+        // benefit of split buffers, so we keep `chunk_log2_capacity` /
+        // `max_chunks` in the contract for future true lazy-growth but
+        // make the current addressing flat / byte-equivalent to Bump.
+        pool_cells = static_cast<uint32_t>(capacity);
       }
       c.watermark_offset = static_cast<uint32_t>(cursor);
       cursor += 4;

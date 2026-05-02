@@ -68,7 +68,7 @@ All defaults match upstream 1.7.4 unless noted.
 | Kwarg | Default | Purpose |
 |---|---|---|
 | `offline_cache_l_sem` | (off) | Internal / testing flag, not for production use. |
-| `vulkan_quant_experimental` | `False` | **New in 0.3.0.** When ON, the Vulkan backend accepts `quant_array` / `bit_struct` fields (i.e. `Extension::quant` / `Extension::quant_basic` are reported supported on Vulkan). Supported: `QuantInt` / `QuantFixed` read, write, and concurrent multi-thread `ti.atomic_add` (via SPIR-V `OpAtomicCompareExchange` spin RMW) on `quant_array` and on multi-field `BitpackedFields` / `bit_struct`, byte-equivalent to cpu / cuda. **Explicitly out of scope** (G9 closed): `QuantFloat` shared-exponent and the non-add atomic ops (`atomic_min/max/and/or/xor`, identical restriction to the LLVM backend) — see `compile_doc/SNode_Vulkan_规划.md` §8.9 for the deferral rationale and unblock conditions. Unsupported sites raise `TI_NOT_IMPLEMENTED` / `TI_ERROR` rather than silently miscompile. Equivalent env var: `TI_VULKAN_QUANT=1`. |
+| `vulkan_quant_experimental` | `False` | **New in 0.3.0.** When ON, the Vulkan backend accepts `quant_array` / `bit_struct` fields (i.e. `Extension::quant` / `Extension::quant_basic` are reported supported on Vulkan). Supported: `QuantInt` / `QuantFixed` read, write, and concurrent multi-thread `ti.atomic_add` (via SPIR-V `OpAtomicCompareExchange` spin RMW) on `quant_array` and on multi-field `BitpackedFields` / `bit_struct`, byte-equivalent to cpu / cuda. **Explicitly not supported**: `QuantFloat` shared-exponent and the non-add atomic ops (`atomic_min/max/and/or/xor`, identical restriction to the LLVM backend). Unsupported sites raise `TI_NOT_IMPLEMENTED` / `TI_ERROR` rather than silently miscompile. Equivalent env var: `TI_VULKAN_QUANT=1`. |
 
 ---
 
@@ -77,7 +77,7 @@ All defaults match upstream 1.7.4 unless noted.
 | Variable | Range | Default | Purpose |
 |---|---|---|---|
 | `TI_VULKAN_POOL_FRACTION` | `(0.0, 1.0]` | `1.0` | Shrinks each `pointer` SNode's physical cell pool to `max(num_cells_per_container, round(total × fraction))`. Out-of-capacity activates fall through the existing `cap_v` silent-inactive guard. Invalid / `≤ 0` / `> 1` falls back to `1.0`. Detailed semantics: see [sparse_snode_on_vulkan.en.md](sparse_snode_on_vulkan.en.md). |
-| `TI_VULKAN_QUANT` | `0` / `1` | `0` | **New in 0.3.0.** Equivalent to `ti.init(arch=ti.vulkan, vulkan_quant_experimental=True)`. When ON, `quant_array` and `BitpackedFields` / `bit_struct` read, write, and `ti.atomic_add` are all available on Vulkan. `QuantFloat` shared-exponent and non-add atomics are explicitly out of scope (see `compile_doc/SNode_Vulkan_规划.md` §8.9). OFF preserves vanilla 1.7.4 behaviour. |
+| `TI_VULKAN_QUANT` | `0` / `1` | `0` | **New in 0.3.0.** Equivalent to `ti.init(arch=ti.vulkan, vulkan_quant_experimental=True)`. When ON, `quant_array` and `BitpackedFields` / `bit_struct` read, write, and `ti.atomic_add` are all available on Vulkan. `QuantFloat` shared-exponent and non-add atomics are explicitly not supported. OFF preserves vanilla 1.7.4 behaviour. |
 
 > Other environment variables documented in upstream Taichi remain unchanged (`TI_ARCH`, `TI_DEVICE_MEMORY_GB`, etc.). They are not re-listed here.
 

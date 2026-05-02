@@ -12,6 +12,28 @@ namespace taichi::lang {
 GfxProgramImpl::GfxProgramImpl(CompileConfig &config) : ProgramImpl(config) {
 }
 
+// 2026-05-02 §13.4: chunked allocator emits a SPIR-V descriptor array
+// (kChunkedArrayPtr) at the NodeAllocatorPool binding regardless of
+// max_chunks; that binding only exists when independent_pool=true. Force
+// it on for any chunked policy and warn-once if the user explicitly
+// disabled it, so ptr_to_chunk_idx_ entries always pair with a
+// kChunkedArrayPtr buffer (invariant required by
+// spirv_codegen.cpp::at_buffer).
+static void coerce_pointer_policy_for_chunked(spirv::PointerLayoutPolicy &p) {
+  if (p.allocator_kind == "chunked" && !p.independent_pool) {
+    static bool warned = false;
+    if (!warned) {
+      TI_WARN(
+          "vulkan_pointer_allocator_kind=chunked requires "
+          "vulkan_pointer_independent_pool=true (max_chunks={}); coercing "
+          "to true.",
+          p.max_chunks);
+      warned = true;
+    }
+    p.independent_pool = true;
+  }
+}
+
 void GfxProgramImpl::compile_snode_tree_types(SNodeTree *tree) {
   // B-2.b: build pointer SNode allocator policy from CompileConfig.
   spirv::PointerLayoutPolicy policy;
@@ -22,6 +44,7 @@ void GfxProgramImpl::compile_snode_tree_types(SNodeTree *tree) {
   policy.independent_pool = config->vulkan_pointer_independent_pool;
   policy.allocator_kind = config->vulkan_pointer_allocator_kind;
   policy.max_chunks = config->vulkan_pointer_max_chunks;
+  coerce_pointer_policy_for_chunked(policy);
   if (runtime_) {
     snode_tree_mgr_->materialize_snode_tree(tree, policy);
   } else {
@@ -41,6 +64,7 @@ void GfxProgramImpl::materialize_snode_tree(SNodeTree *tree,
   policy.independent_pool = config->vulkan_pointer_independent_pool;
   policy.allocator_kind = config->vulkan_pointer_allocator_kind;
   policy.max_chunks = config->vulkan_pointer_max_chunks;
+  coerce_pointer_policy_for_chunked(policy);
   snode_tree_mgr_->materialize_snode_tree(tree, policy);
 }
 

@@ -161,81 +161,23 @@ ChunkedDeviceNodeAllocator::ChunkedDeviceNodeAllocator(const Params &p) {
   }
   bump_ = std::make_unique<BumpOnlyDeviceNodeAllocator>(bump_params);
 
-  // C-2.4.a Commit A (2026-05) → C-2.5 (2026-05): 静态预分配 max_chunks-1
-  // 个额外 chunk。每个 chunk size = chunk_size_cells * cell_stride，其中
-  // chunk_size_cells = 1 << chunk_log2_capacity（由 layout pass 计算并通过
-  // contract → Params 透传）。chunk[0] 仍是 NodeAllocatorPool buffer（含
-  // meta + chunk[0] 的 pool_data），chunk[k>0] 是 cell-only buffer，由
-  // SPIR-V chunked descriptor array 经二步 OpAccessChain 寻址。
-  if (p.max_chunks > 1u) {
-    // C-2.4.c (2026-05): probe descriptor-array hard limit before any
-    // physical chunk allocation. Vulkan core only guarantees
-    // maxPerStageDescriptorStorageBuffers >= 4, so users who set
-    // vulkan_pointer_max_chunks=N too aggressively must hit a clean
-    // TI_ERROR rather than a late vkCreateDescriptorSetLayout failure or
-    // device-lost. Backends that don't expose this limit (default
-    // implementation in public_device.h) return UINT32_MAX and skip the
-    // check.
-    const uint32_t descriptor_cap =
-        p.device->get_max_storage_buffer_descriptors_per_binding();
-    TI_TRACE(
-        "ChunkedDeviceNodeAllocator: snode_id={} max_chunks={} "
-        "descriptor_cap={} (UINT32_MAX={})",
-        p.snode_id, p.max_chunks, descriptor_cap, UINT32_MAX);
-    TI_ERROR_IF(
-        p.max_chunks > descriptor_cap,
-        "ChunkedDeviceNodeAllocator: vulkan_pointer_max_chunks={} exceeds "
-        "device limit maxPerStageDescriptorStorageBuffers={} (snode_id={}). "
-        "Lower max_chunks or run on a device with a larger descriptor "
-        "limit.",
-        p.max_chunks, descriptor_cap, p.snode_id);
-    TI_ASSERT_INFO(
-        p.chunk_log2_capacity < 32u,
-        "ChunkedDeviceNodeAllocator: chunk_log2_capacity={} out of range "
-        "(snode_id={})",
-        p.chunk_log2_capacity, p.snode_id);
-    const uint64_t chunk_size_cells_64 = 1ull << p.chunk_log2_capacity;
-    const uint64_t extra_chunk_bytes_64 =
-        chunk_size_cells_64 * static_cast<uint64_t>(p.cell_payload_bytes);
-    TI_ASSERT_INFO(
-        extra_chunk_bytes_64 <= 0xffffffffull,
-        "ChunkedDeviceNodeAllocator: extra chunk size {} exceeds u32 "
-        "(snode_id={})",
-        extra_chunk_bytes_64, p.snode_id);
-    const std::size_t extra_chunk_bytes =
-        static_cast<std::size_t>(extra_chunk_bytes_64);
-    extra_chunks_.reserve(p.max_chunks - 1u);
-    Stream *stream = p.device->get_compute_stream();
-    for (uint32_t i = 1; i < p.max_chunks; ++i) {
-      Device::AllocParams alloc_params;
-      alloc_params.size = extra_chunk_bytes;
-      alloc_params.host_write = false;
-      alloc_params.host_read = false;
-      alloc_params.export_sharing = false;
-      alloc_params.usage = AllocUsage::Storage;
-      auto [guard, res] = p.device->allocate_memory_unique(alloc_params);
-      TI_ASSERT_INFO(
-          res == RhiResult::success,
-          "ChunkedDeviceNodeAllocator: failed to allocate extra chunk[{}] "
-          "of {} bytes (snode_id={}, RhiResult={})",
-          i, extra_chunk_bytes, p.snode_id, static_cast<int>(res));
-      auto [cmdlist, cmd_res] = stream->new_command_list_unique();
-      TI_ASSERT(cmd_res == RhiResult::success);
-      cmdlist->buffer_fill(guard->get_ptr(0), kBufferSizeEntireSize,
-                           /*data=*/0);
-      stream->submit_synced(cmdlist.get());
-      extra_chunks_.push_back(std::move(guard));
-    }
-    extra_chunks_total_bytes_ =
-        extra_chunk_bytes * extra_chunks_.size();
-    TI_TRACE(
-        "ChunkedDeviceNodeAllocator: snode_id={} max_chunks={} "
-        "extra_chunks={} chunk_size_cells={} extra_chunk_bytes={} "
-        "total_extra_bytes={}",
-        p.snode_id, p.max_chunks, extra_chunks_.size(), chunk_size_cells_64,
-        extra_chunk_bytes,
-        extra_chunk_bytes * extra_chunks_.size());
-  }
+  // C-2.5 §13.4 (2026-05-02): chunked allocator flattens to a single
+  // contiguous pool buffer of full `pool_capacity` cells (snode_struct_
+  // compiler.cpp sets `pool_cells = capacity` for AllocatorKind::Chunked,
+  // and spirv_codegen.cpp pointer_lookup_or_activate uses bump-style flat
+  // addressing for both kinds, see §13.4 in compile_doc/SNode_Vulkan_规划
+  // .md). The previous descriptor-array path (`OpAccessChain` with per-
+  // invocation `chunk_idx` into an `OpTypeArray<SSBO,max_chunks>`) was
+  // unsound on Vulkan drivers without `SPV_EXT_descriptor_indexing`/
+  // `NonUniform` decoration: drivers silently collapsed all accesses to
+  // chunk[0]. Eager pre-allocation of all extra chunks at construction
+  // time already negated the design's only intended benefit (lazy growth),
+  // so flattening here is both correct and simpler. AllocatorKind::Chunked
+  // is retained on the contract (and `max_chunks` / `chunk_log2_capacity`
+  // are still wired through Params) for forward compatibility with a
+  // future true lazy-growth path that will need `SPV_EXT_descriptor_
+  // indexing`. `chunks()` returns a 1-element vector and the runtime
+  // dispatch never sees `chunk_count > 0`.
 }
 
 ChunkedDeviceNodeAllocator::~ChunkedDeviceNodeAllocator() = default;
