@@ -282,3 +282,109 @@ def test_cublaslt_capture_rejects_bad_bindings_and_reset_invalidates():
     assert plan.closed and provider.closed
     with pytest.raises(RuntimeError):
         graph.run(dict(a=values, b=values, output=output))
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+@pytest.mark.parametrize(
+    "layout,epilogue", (("row_major", "identity"), ("transposed_column_major", "relu"))
+)
+def test_cublaslt_frozen_configuration_restores_without_heuristic(
+    layout, epilogue, monkeypatch
+):
+    from dataclasses import replace
+    from taichi_forge.hardware._cublaslt_algorithms import (
+        _AlgorithmChoice,
+        _MatmulRecipePlan,
+    )
+
+    provider = _provider_or_skip()
+    semantics = dict(
+        m=65,
+        n=49,
+        k=97,
+        batch_count=2,
+        transpose_a=True,
+        transpose_b=True,
+        alpha=0.75,
+        beta=0.25,
+        a="a",
+        b="b",
+        output="output",
+    )
+    description = _MatmulRecipePlan(
+        provider,
+        semantics,
+        layout=layout,
+        epilogue=epilogue,
+        workspace_limit_bytes=32 << 20,
+        preparation_only=True,
+    )
+    assert description.workspace is None
+    with pytest.raises(RuntimeError, match="materialized"):
+        description._capture()
+    choices = tuple(
+        _AlgorithmChoice.from_dict(choice.to_dict()) for choice in description.choices
+    )
+    assert choices == description.choices
+    description.close()
+    generator = np.random.default_rng(99)
+    host = [
+        generator.standard_normal(shape).astype(np.float32)
+        for shape in ((2, 97, 65), (2, 49, 97), (2, 65, 49))
+    ]
+    a, b, output = [ti.ndarray(ti.f32, shape=value.shape) for value in host]
+    a.from_numpy(host[0])
+    b.from_numpy(host[1])
+    expected = (
+        0.75
+        * (
+            host[0].astype(np.float64).transpose(0, 2, 1)
+            @ host[1].astype(np.float64).transpose(0, 2, 1)
+        )
+        + 0.25 * host[2]
+    )
+    if epilogue == "relu":
+        expected = np.maximum(expected, 0)
+
+    def no_heuristic(*_args):
+        raise AssertionError(
+            "Selected-plan restoration must not rerun heuristic search"
+        )
+
+    with monkeypatch.context() as restoration:
+        restoration.setattr(provider._library, "heuristic", no_heuristic)
+        for choice in dict.fromkeys((choices[0], choices[-1])):
+            plan = _MatmulRecipePlan(
+                provider,
+                semantics,
+                layout=layout,
+                epilogue=epilogue,
+                workspace_limit_bytes=32 << 20,
+                choice=choice,
+            )
+            assert plan.workspace_bytes == choice.workspace_bytes
+            recording = plan._capture()
+            builder = ti.graph.GraphBuilder()
+            builder.append_native(recording)
+            graph = builder.compile()
+            bindings = graph.bind(dict(a=a, b=b, output=output))
+            output.from_numpy(host[2])
+            graph.run(bindings)
+            np.testing.assert_allclose(
+                output.to_numpy(), expected, rtol=2e-5, atol=2e-5
+            )
+            del graph, bindings, builder, recording
+            gc.collect()
+            plan.close()
+        with pytest.raises(RuntimeError, match="workspace drifted"):
+            _MatmulRecipePlan(
+                provider,
+                semantics,
+                layout=layout,
+                epilogue=epilogue,
+                workspace_limit_bytes=32 << 20,
+                choice=replace(
+                    choices[0], workspace_bytes=choices[0].workspace_bytes + 256
+                ),
+            )
+    provider.close()

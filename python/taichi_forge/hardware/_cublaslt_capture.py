@@ -34,6 +34,10 @@ class _PlanLease:
             plan.provider._validate_lifetime()
             if plan.closed:
                 raise TaichiRuntimeError("cuBLASLt capture requires a live plan")
+            if getattr(plan, "_preparation_only", False):
+                raise TaichiRuntimeError(
+                    "cuBLASLt preparation descriptions must be materialized before capture"
+                )
             plan._capture_leases += 1
             self.plan = plan
 
@@ -80,12 +84,14 @@ class _MatmulCaptureRecipe(_CudaGraphCaptureRecipe):
         native.algorithm = ctypes.string_at(
             ctypes.byref(plan._heuristic.algo), ctypes.sizeof(_MatmulAlgo)
         )
-        native.shapes = [plan.a_shape, plan.b_shape, plan.output_shape]
+        shapes = (plan.a_shape, plan.b_shape, plan.output_shape)
+        order = plan._capture_operand_order
+        native.shapes = [shapes[i] for i in order]
         native.workspace_bytes = plan.workspace_bytes
         native.alpha, native.beta = plan.alpha, plan.beta
         arguments = [
             Arg(ArgKind.NDARRAY, name, f32, ndim=len(shape))
-            for name, shape in zip(self.names, native.shapes)
+            for name, shape in zip((self.names[i] for i in order), native.shapes)
         ]
         if plan.workspace_bytes:
             arguments.append(Arg(ArgKind.NDARRAY, self.names[3], u8, ndim=1))

@@ -58,6 +58,8 @@ _MATRIX_LAYOUT_BATCH_COUNT = 5
 _MATRIX_LAYOUT_STRIDED_BATCH_OFFSET = 6
 _MATMUL_DESC_TRANSA = 3
 _MATMUL_DESC_TRANSB = 4
+_MATMUL_DESC_EPILOGUE = 7
+_EPILOGUE_RELU = 2
 _MATMUL_PREF_MAX_WORKSPACE_BYTES = 1
 _CUBLAS_STATUS_SUCCESS = 0
 
@@ -609,7 +611,11 @@ class CublasLtMatmulPlan(BackendCommandRecording):
                 "algorithm_sha256": hashlib.sha256(algo_bytes).hexdigest(),
                 "workspace_bytes": self.workspace_bytes,
                 "workspace_limit_bytes": self.workspace_limit_bytes,
-                "row_major": True,
+                "row_major": self._physical_layout == "row_major",
+                "physical_layout": self._physical_layout,
+                "epilogue": self._physical_epilogue,
+                "alpha": self.alpha,
+                "beta": self.beta,
             },
         )
         attach_retained_execution_contract(
@@ -654,24 +660,28 @@ class CublasLtMatmulPlan(BackendCommandRecording):
         matrix = (self.m, self.n)
         return matrix if self.batch_count == 1 else (self.batch_count, *matrix)
 
-    def _create_layout(self, rows, columns):
+    def _create_layout(self, rows, columns, *, column_major=False):
         library = self.provider._library
         layout = ctypes.c_void_p()
         library.require(
             library.layout_create(
-                ctypes.byref(layout), _CUDA_R_32F, rows, columns, columns
+                ctypes.byref(layout),
+                _CUDA_R_32F,
+                rows,
+                columns,
+                rows if column_major else columns,
             ),
             "matrix layout creation",
         )
         try:
-            order = ctypes.c_int(_CUBLASLT_ORDER_ROW)
+            order = ctypes.c_int(0 if column_major else _CUBLASLT_ORDER_ROW)
             _set_attribute(
                 library,
                 library.layout_set_attribute,
                 layout,
                 _MATRIX_LAYOUT_ORDER,
                 order,
-                "row-major layout",
+                "matrix storage order",
             )
             if self.batch_count > 1:
                 count = ctypes.c_int(self.batch_count)
@@ -698,7 +708,15 @@ class CublasLtMatmulPlan(BackendCommandRecording):
         self._layouts.append(layout)
         return layout
 
-    def _create_native_plan(self):
+    def _create_descriptors(self, *, layout="row_major", epilogue="identity"):
+        if layout not in ("row_major", "transposed_column_major"):
+            raise ValueError("Unknown cuBLASLt physical layout")
+        if epilogue not in ("identity", "relu"):
+            raise ValueError("Unknown cuBLASLt physical epilogue")
+        self._physical_layout = layout
+        self._physical_epilogue = epilogue
+        column_major = layout == "transposed_column_major"
+        self._capture_operand_order = (1, 0, 2) if column_major else (0, 1, 2)
         library = self.provider._library
         desc = ctypes.c_void_p()
         library.require(
@@ -708,8 +726,11 @@ class CublasLtMatmulPlan(BackendCommandRecording):
             "matmul descriptor creation",
         )
         self._matmul_desc = desc
-        trans_a = ctypes.c_int(_CUBLAS_OP_T if self.transpose_a else _CUBLAS_OP_N)
-        trans_b = ctypes.c_int(_CUBLAS_OP_T if self.transpose_b else _CUBLAS_OP_N)
+        transpose_a, transpose_b = self.transpose_a, self.transpose_b
+        if column_major:
+            transpose_a, transpose_b = transpose_b, transpose_a
+        trans_a = ctypes.c_int(_CUBLAS_OP_T if transpose_a else _CUBLAS_OP_N)
+        trans_b = ctypes.c_int(_CUBLAS_OP_T if transpose_b else _CUBLAS_OP_N)
         _set_attribute(
             library,
             library.matmul_desc_set_attribute,
@@ -726,13 +747,27 @@ class CublasLtMatmulPlan(BackendCommandRecording):
             trans_b,
             "transpose-B attribute",
         )
-        a_rows, a_columns = self.a_shape[-2:]
-        b_rows, b_columns = self.b_shape[-2:]
-        output_rows, output_columns = self.output_shape[-2:]
-        self._a_layout = self._create_layout(a_rows, a_columns)
-        self._b_layout = self._create_layout(b_rows, b_columns)
-        self._c_layout = self._create_layout(output_rows, output_columns)
-        self._d_layout = self._create_layout(output_rows, output_columns)
+        if epilogue == "relu":
+            _set_attribute(
+                library,
+                library.matmul_desc_set_attribute,
+                desc,
+                _MATMUL_DESC_EPILOGUE,
+                ctypes.c_uint32(_EPILOGUE_RELU),
+                "ReLU epilogue",
+            )
+        shapes = (self.a_shape[-2:], self.b_shape[-2:], self.output_shape[-2:])
+        if column_major:
+            shapes = tuple(shapes[i][::-1] for i in self._capture_operand_order)
+        self._a_layout = self._create_layout(*shapes[0], column_major=column_major)
+        self._b_layout = self._create_layout(*shapes[1], column_major=column_major)
+        self._c_layout = self._create_layout(*shapes[2], column_major=column_major)
+        self._d_layout = self._create_layout(*shapes[2], column_major=column_major)
+        return desc
+
+    def _create_native_plan(self):
+        library = self.provider._library
+        desc = self._create_descriptors()
         preference = ctypes.c_void_p()
         library.require(
             library.preference_create(ctypes.byref(preference)),
