@@ -234,7 +234,28 @@ class GraphRecipeComposer:
                 for structural_path in covered_structural_paths
             )
             direct_parents = {path.rsplit("/", 1)[0] for path in source_paths}
-            if not owns_common_ancestor and len(direct_parents) != 1:
+            # A consecutive interval of complete sibling subtrees also forms
+            # one sequential region (for example CGraph / native / CGraph).
+            # Leaf parents differ there, but each covered subtree was checked
+            # above and source_indices already forbids skipping an executable.
+            coverage_roots = tuple(
+                self._regions[region_id]
+                for region_id in fragment.coverage_region_ids
+                if self._regions[region_id].parent_region_id not in covered
+            )
+            root_parents = {region.parent_region_id for region in coverage_roots}
+            root_ordinals = sorted(region.child_index for region in coverage_roots)
+            sequential_subtrees = (
+                len(root_parents) == 1
+                and None not in root_parents
+                and self._regions[next(iter(root_parents))].kind == "sequential_region"
+                and root_ordinals == list(range(root_ordinals[0], root_ordinals[-1] + 1))
+            )
+            if (
+                not owns_common_ancestor
+                and len(direct_parents) != 1
+                and not sequential_subtrees
+            ):
                 raise GraphRecipeCompositionError(
                     "multi-region fragment must share one sequential parent or "
                     "replace a complete structural subtree"

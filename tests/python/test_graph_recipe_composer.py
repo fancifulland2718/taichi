@@ -825,6 +825,20 @@ def test_multi_region_fragment_does_not_cross_structural_parents_implicitly():
     recipe = GraphRecipeComposer(definition).compose((whole_subtree,))
     assert recipe.baseline_coverage_region_ids == ()
 
+    # Explicitly owning both complete sibling subtrees is also a legal
+    # sequential replacement. Owning only their leaves above is not.
+    sibling_subtrees = GraphRecipeFragment.create(
+        definition,
+        provider_namespace="test.explicit_topology",
+        provider_version="1",
+        provider_domain_version="test-domain-v1",
+        fragment_key="fragment:sibling_subtrees",
+        coverage_region_ids=tuple(region.region_id for region in definition.regions[1:]),
+        tasks=(_task("siblings", "explicit_sibling_subtrees"),),
+    )
+    recipe = GraphRecipeComposer(definition).compose((sibling_subtrees,))
+    assert recipe.baseline_coverage_region_ids == (definition.regions[0].region_id,)
+
 
 @test_utils.test(arch=ti.cpu)
 def test_actual_graph_definition_feeds_the_fragment_composer_without_v1_space():

@@ -18,6 +18,7 @@ class GraphRuntimeRecipeAssembly:
         "_dispatch_rewriters",
         "_map_source_groups",
         "_node_expanders",
+        "_node_source_indices",
         "_node_rewriters",
         "_operation_rewriters",
         "_parallel_schedules",
@@ -32,6 +33,7 @@ class GraphRuntimeRecipeAssembly:
         self._operation_rewriters = {}
         self._node_rewriters = {}
         self._node_expanders = {}
+        self._node_source_indices = {}
         self._parallel_schedules = {}
         self._map_source_groups = []
         self._workspace_pair = False
@@ -124,13 +126,23 @@ class GraphRuntimeRecipeAssembly:
     def node_rewriter(self, node_index):
         return self._node_rewriters.get(int(node_index))
 
-    def expand_node(self, node_index, expander):
+    def expand_node(self, node_index, expander, *, source_node_indices=None):
         self._register(
             self._node_expanders,
             int(node_index),
             self._callable(expander, "node expander"),
             "one node expansion",
         )
+        if source_node_indices is not None:
+            indices = tuple(int(index) for index in source_node_indices)
+            if not indices or any(
+                index < 0 or index >= len(self.spec.nodes) for index in indices
+            ):
+                raise ValueError("runtime Graph expansion has invalid source nodes")
+            self._node_source_indices[int(node_index)] = indices
+
+    def source_node_indices(self, node_index):
+        return self._node_source_indices.get(int(node_index), (int(node_index),))
 
     def node_expander(self, node_index):
         return self._node_expanders.get(int(node_index))
@@ -159,7 +171,9 @@ class GraphRuntimeRecipeAssembly:
         """Install one complete submission strategy, only at materialization."""
         if self._binding_executor_factory is not None:
             raise ValueError("runtime Graph binding executor is selected twice")
-        self._binding_executor_factory = self._callable(factory, "binding executor factory")
+        self._binding_executor_factory = self._callable(
+            factory, "binding executor factory"
+        )
 
     @property
     def binding_executor_factory(self):

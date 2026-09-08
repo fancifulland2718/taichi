@@ -11222,12 +11222,21 @@ class _GraphSpec:
         map_groups = assembly.map_source_groups
 
         nodes = []
+        node_source_regions = []
         dispatch_offset = 0
         consumed_map_groups = set()
         for node_index, node in enumerate(self.nodes):
+            source_indices = assembly.source_node_indices(node_index)
+            source_regions = tuple(
+                source.region_id
+                for source in definition.sources
+                if any(source.path.startswith(f"graph/{index}:") for index in source_indices)
+            )
             node_expander = assembly.node_expander(node_index)
             if node_expander is not None:
-                nodes.extend(tuple(node_expander(node)))
+                expanded = tuple(node_expander(node))
+                nodes.extend(expanded)
+                node_source_regions.extend(source_regions for _ in expanded)
                 if isinstance(node, _CompiledCGraphNode):
                     dispatch_offset += _dispatch_leaf_count(node.ir_node)
                 continue
@@ -11285,6 +11294,7 @@ class _GraphSpec:
             if node_rewriter is not None:
                 node = node_rewriter(node)
             nodes.append(node)
+            node_source_regions.append(source_regions)
 
         if len(consumed_map_groups) != len(map_groups):
             raise TaichiRuntimeError(
@@ -11300,6 +11310,7 @@ class _GraphSpec:
             graph_native_algorithm_sources=self._graph_native_algorithm_sources,
         )
         variant._definition_source_spec = self
+        variant._recipe_node_source_regions = tuple(node_source_regions)
         variant._complete_recipe_id = recipe.recipe_id
         variant._disable_qualified_fusion_selector = True
         variant._binding_executor_factory = assembly.binding_executor_factory

@@ -1002,7 +1002,18 @@ def observe_graph_physical_manifest(definition, recipe, graph):
             "materialized Graph does not own this GraphDefinition"
         )
     pipeline = tuple(graph._spec.pipeline_definition)
-    stage_regions = _stage_source_regions(definition, recipe, pipeline)
+    stage_regions = getattr(graph._spec, "_recipe_node_source_regions", None)
+    if stage_regions is None:
+        stage_regions = _stage_source_regions(definition, recipe, pipeline)
+    elif (
+        len(stage_regions) != len(pipeline)
+        or any(not regions for regions in stage_regions)
+        or {region for regions in stage_regions for region in regions}
+        != {source.region_id for source in definition.sources}
+    ):
+        raise GraphPhysicalManifestError(
+            "materialized node lineage does not cover the frozen Graph sources"
+        )
     kernels = []
     tasks = []
     commands = []
