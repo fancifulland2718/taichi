@@ -48,7 +48,7 @@ def d1_provider_operations(_operation):
             "root_ordered",
             "runtime_ordered",
             "provider_owned",
-            "existing_internal",
+            "existing_public",
             activation_mode="explicit_hardware_api",
             dependency_name="cuBLASLt",
             resource_effects=(
@@ -59,6 +59,15 @@ def d1_provider_operations(_operation):
             ),
             lifetime_policy="provider_plan",
             update_policy="rebind",
+            public_api="ti.linalg.record_matmul",
+            recipe_semantic_api="ti.linalg.record_matmul",
+            recipe_provider_api="ti.hardware.linalg.MatmulRecipeProvider",
+            recipe_scope=(
+                "CUDA compact scalar f32 fixed-shape matmul",
+                "optional strided batch and transpose, identity or ReLU",
+                "prepared frozen algorithms, operand packing and epilogue regions",
+                "caller-qualified finite-input tolerance; freeze before materialization",
+            ),
             requirements=(
                 "user-managed compatible cuBLASLt shared library",
                 "CUDA runtime compatible with the active NVIDIA driver",
@@ -67,7 +76,7 @@ def d1_provider_operations(_operation):
             layouts=("compact row-major single or strided-batched matrices",),
             numeric_contracts=("output = alpha * op(a) @ op(b) + beta * output",),
             notes=(
-                "Private retained execution proof; no dedicated public callable API is exported.",
+                "Public semantic matmul regions use prepared native Graph capture; the expert retained-plan Python API remains private.",
                 "Library load is process scoped, the handle is runtime-generation scoped, and descriptors, algorithm choice, and workspace belong to one retained plan.",
                 "Ordinary kernels and matrix expressions are never rewritten to call cuBLASLt, and no automatic crossover is admitted.",
                 "The user may pass a path through the generic provider probe or TI_CUBLASLT_LIBRARY_PATH without adding a Forge wheel variant.",

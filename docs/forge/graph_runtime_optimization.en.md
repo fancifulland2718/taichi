@@ -130,8 +130,9 @@ invalidates the Graph and all of its BindingSets.
 On capable CUDA runtimes, the default recipe providers can also generate an
 exclusive whole-Graph immutable-frame candidate. It supports one ndarray-only
 segment containing ordinary JIT dispatches and fixed-plan commands produced by
-`ti.linalg.record_fft()` or `SparseMatrix.record_spmm()`, including mixed FFT/SpMM
-segments. Arbitrary vendor recordings, external synchronization domains, SNodes,
+`ti.linalg.record_fft()`, `SparseMatrix.record_spmm()`, or (with native matmul-frame
+support) `ti.linalg.record_matmul()`. Compatible regions may be composed in one
+segment. Arbitrary vendor recordings, external synchronization domains, SNodes,
 device-controlled topology and multi-lane workspaces are not included. Captured
 commands must produce kernel nodes only. Discovery alone does not prove that an
 installed vendor plan meets this condition; binding preparation reports failure.

@@ -51,13 +51,52 @@ cuTENSOR、AmgX 或 NCCL 绝不会触发 compiler rewrite。
 | Driver-native segmented scan | `GraphBuilder.segmented_scan()` 与默认 recipe providers | 固定、互不重叠的 i32/u32 数组和不可变 segment；global correction 使用 retained CUDA recording 与 Graph-bound scratch，不依赖外部 Toolkit 库；仍是 fixed-resource action，不是 binding-frame region。 |
 | Vulkan VkFFT | 显式 fixed-storage plan 或 root Graph recording | Vulkan JIT/source adapter；不意味着已有内建完整 FFT recipe 搜索或 CUDA binding-frame 接入。 |
 | 其他 cuSPARSE / cuFFT / cuDSS expert operation | 既有显式 plan 和已说明的 root Graph recording | recording 本身不提供 recipe generator；cuDSS root 有序调用不能描述成 CUDA Graph capture。 |
-| cuBLASLt | retained internal execution/recording 基础 | cuBLAS probe 不意味着已公开完整 matmul-region recipe 域。 |
+| cuBLASLt matmul region | `ti.linalg.record_matmul(...)`，随后 `operation.prepare()` | CUDA 紧凑 scalar-f32、固定形状及可选 strided batch。显式 `ti.hardware.linalg.MatmulRecipeProvider()` 组合冻结算法/workspace、真实输入打包、独立/融合 ReLU；专家 retained-plan API 仍为私有。 |
 | cuSPARSELt / cuTENSOR / AmgX | 下文的显式 provider plan | 当前没有公开 complete-recipe provider 或通用 Graph recording 路线。 |
 
-先准备数学 operation，再 freeze Graph。SpMM/FFT 要求显式的 finite-input / f32 tolerance 合同，
+先准备数学 operation，再 freeze Graph。SpMM/FFT/matmul 要求显式的 finite-input / f32 tolerance 合同，
 Forge 不在每次 replay 扫描数值。FFT 正向、逆向均不归一化，连续应用两者会将输入乘以 `H * W`。
 layout、精度和归一化属于语义要求，不是优化器选择。vendor 不开放的内部信息报告为 unknown，
 不能据此虚构内部 kernel 数。
+
+### Matmul 准备与复用
+
+语义为 `D = activation(alpha * op(A) @ op(B) + beta * D)`，activation 支持 `identity` 或 `relu`。
+transpose、系数、dtype、形状和调用者确认的 tolerance 都是语义事实，不是搜索轴。输入值可在每次 replay 改变；
+输出不能与任一输入重叠，输入之间允许只读别名。tolerance 声明不自动保证任意输入的精度，仍由 evaluator/下游验证。
+
+```python
+operation = ti.linalg.record_matmul(
+    512, 512, 512, transpose_a=True, activation="relu",
+    absolute_tolerance=2e-5, relative_tolerance=2e-5,
+)
+operation.prepare(workspace_limit_bytes=32 << 20, heuristic_limit=4)
+builder = ti.graph.GraphBuilder()
+builder.append_native(operation)
+definition = builder.freeze()
+providers = (*ti.graph.default_recipe_providers(),
+             ti.hardware.linalg.MatmulRecipeProvider())
+```
+
+把同一 provider set 与常规 workload/evaluation/backend 合同传给 `definition.search_recipes()`；CompileIQ
+只调度完整 recipe ID。`definition.compile()` 物化 baseline。此语义描述必须先 **freeze 再执行**，不是可以直接
+运行的专家 plan。prepare 只查询元数据、冻结公开算法配置，不序列化 opaque 执行字节、不执行 matmul，也不分配
+候选 GPU workspace。物化时只重建所请求的计划和精确 workspace，不重跑 heuristic。
+选中输入转置打包时，每次 replay 都刷新 Graph 私有数组，不假设输入恒定、不引入隐式值缓存。仅改变等价描述符
+写法不生成布局候选。融合 activation 的中间输出不可见；需要该输出时应建立分开的语义操作。
+
+与 `decision.selection_artifact` 一起保存 `operation.preparation_artifact()`。新进程用相同参数构造
+`record_matmul(..., preparation=saved)` 和等价 Graph，再调用 `resolve_recipe(saved_selection, providers=providers)`
+与 `materialize(selection)`。导入的准备耗时仍是历史事实；设备/component/配置漂移在冷边界拒绝，不静默替换算法。
+operation.close 不破坏存活 Graph 持有的计划。固定绑定检查放在 Graph.bind 发布边界，immutable binding replay
+不增加 matmul 数值扫描或 provider 校验。
+
+支持的 native runtime 还可组合不可变参数帧 recipe；仅有 typed matmul capture、尚无 frame 能力的旧 runtime
+不会生成这一组合。cuBLASLt 及传递库仍由用户配置（`TI_CUBLASLT_LIBRARY_PATH`），不改变普通 kernel、runtime auto
+或 wheel 依赖类别。精确 workspace/私有数组与参数映像单列，vendor/driver 未知存储不伪装为零。融合和打包都不是
+通用赢家，host、device 和显存证据分开判断。
+
+### FFT 与 SpMM 准备及复用
 
 两种分离 FFT 都先批量变换所有行，再利用输出数组原地变换列，无额外 dense transpose buffer。
 逐图像方案在列阶段调用 batch 数次；跨 batch 方案每列调用一次，单次批量处理独立图像。这改变物理

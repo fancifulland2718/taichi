@@ -102,7 +102,8 @@ for bindings in (bindings_a, bindings_b, bindings_a):
 
 在具备能力的 CUDA runtime 上，默认 provider 可生成独占 whole-Graph 的不可变参数帧候选。
 范围是一段 ndarray Graph：普通 JIT dispatch 与 `ti.linalg.record_fft()`、
-`SparseMatrix.record_spmm()` 生成的固定计划可混合；不包含任意 vendor recording、外部同步域、
+`SparseMatrix.record_spmm()`、具备 native matmul-frame 支持时的 `ti.linalg.record_matmul()` 固定计划可混合；
+不包含任意 vendor recording、外部同步域、
 SNode、device-controlled topology 或多 lane workspace。捕获结果必须只有 kernel node；发现候选
 不等于当前 vendor plan 一定满足条件，不满足时在绑定准备阶段明确失败。
 

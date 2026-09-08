@@ -234,12 +234,12 @@ class GraphBindingFrameRecipeProvider(GraphRuntimeFragmentProvider):
                 "reuse completed event handles up to the observed queue peak until executor close",
             ),
             "limitations": (
-                "one CUDA Graph and one workspace lane; only certified fixed-plan FFT/SpMM commands may join JIT dispatches",
+                "one CUDA Graph and one workspace lane; only certified fixed-plan FFT/SpMM/matmul commands may join JIT dispatches",
                 "no SNode, external synchronization domain or device-controlled topology; capture must contain only kernel nodes",
                 "raw mapping calls include argument preparation; use Graph.bind to amortize it",
                 "prepared frames trade retained argument memory and setup for binding-switch cost",
                 "cached completion handles retain opaque driver storage, not measured ndarray or peak VRAM bytes",
-                "wraps baseline or explicitly compatible FFT/SpMM region strategies; unrelated replacements remain unavailable",
+                "wraps baseline or explicitly compatible FFT/SpMM/matmul region strategies; unrelated replacements remain unavailable",
                 "benefit and driver-owned memory require workload measurements",
             ),
         }

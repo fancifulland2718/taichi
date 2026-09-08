@@ -59,15 +59,69 @@ entry is declared for that operation; it does not prohibit application providers
 | Toolkit reset-monoid segmented scan | Existing `GraphBuilder.segmented_scan()` plus `CubSegmentedScanRecipeProvider(manifest_path)` from `taichi_forge.hardware.source_providers` | Optional source-provider addon; bounded i32/u32 sum and immutable segmented layout. Prepared capture, workspace and head-bitset lifetime form the physical recipe; the addon is not part of the portable runtime wheel. |
 | Other cuSPARSE / cuFFT / cuDSS expert operations | Existing explicit plans and documented root Graph recording | Recording alone does not provide a recipe generator. cuDSS root ordering must not be described as CUDA Graph capture. |
 | Vulkan VkFFT | Explicit fixed-storage plan or root Graph recording | Vulkan JIT/source adapter; no built-in complete FFT-recipe search or CUDA binding-frame integration is implied. |
-| cuBLASLt | Retained internal execution/recording foundation | No public complete matmul-region recipe domain is implied by the cuBLAS probe. |
+| cuBLASLt matmul region | `ti.linalg.record_matmul(...)`, then `operation.prepare()` | CUDA compact scalar-f32, fixed shape and optional strided batch. Explicit `ti.hardware.linalg.MatmulRecipeProvider()` composes frozen algorithm/workspace choices, real operand packing, and separate/fused ReLU. The expert retained-plan API remains private. |
 | cuSPARSELt / cuTENSOR / AmgX | Explicit provider plans described below | No complete-recipe provider or general Graph recording route is currently exposed. |
 
-Prepare mathematical operations before freezing the Graph. SpMM and FFT require
+Prepare mathematical operations before freezing the Graph. SpMM, FFT and matmul require
 explicit finite-input / f32 tolerance contracts; Forge does not scan values on
 each replay. FFT forward and inverse are both unnormalized, so applying both
 multiplies the input by `H * W`. Layout, precision and normalization are semantic
 requirements, not optimizer choices. Vendor internals not exposed by the library
 are reported as unknown, not fabricated kernel counts.
+
+### Matmul preparation and reuse
+
+Matmul semantics are `D = activation(alpha * op(A) @ op(B) + beta * D)`.
+`activation` is `"identity"` or `"relu"`; transpose flags, coefficients, dtype,
+shape and caller-qualified tolerances are semantic facts, not search axes.
+Inputs may change every replay. Output must be distinct from both inputs;
+read/read alias is allowed. The tolerance declaration is not an automatic
+accuracy guarantee: the evaluator/downstream application validates its values.
+
+```python
+operation = ti.linalg.record_matmul(
+    512, 512, 512, transpose_a=True, activation="relu",
+    absolute_tolerance=2e-5, relative_tolerance=2e-5,
+)
+operation.prepare(workspace_limit_bytes=32 << 20, heuristic_limit=4)
+builder = ti.graph.GraphBuilder()
+builder.append_native(operation)
+definition = builder.freeze()
+providers = (*ti.graph.default_recipe_providers(),
+             ti.hardware.linalg.MatmulRecipeProvider())
+```
+
+Pass this provider set to `definition.search_recipes()` with the normal workload,
+evaluation and backend contracts; CompileIQ schedules only complete recipe IDs.
+`definition.compile()` materializes the baseline. This semantic description must
+be **frozen before execution**; it is not a directly executable expert plan.
+Preparation queries metadata and freezes documented algorithm configurations,
+not opaque native bytes. It allocates no candidate GPU workspace and executes no
+matmul. Materialization reconstructs only the requested plan and its exact
+workspace, without rerunning the heuristic. Actual transpose packing, when
+selected, refreshes private input buffers on every replay; no constant-input
+assumption or hidden value cache is introduced. Equivalent descriptor spelling
+alone is not a layout candidate. Fused activation has no externally visible
+intermediate output; use separate semantic operations when that output is needed.
+
+Save `operation.preparation_artifact()` with `decision.selection_artifact`.
+In another process, construct the same `record_matmul(..., preparation=saved)`
+and equivalent Graph, then `resolve_recipe(saved_selection, providers=providers)`
+and `materialize(selection)`. Imported setup timings remain historical facts.
+Device/component/configuration drift rejects reuse at cold boundaries rather than
+silently selecting another algorithm. Closing the operation does not invalidate
+plans retained by live Graphs. Fixed bindings are checked at `Graph.bind()`;
+immutable binding replay adds no matmul-specific scan or provider validation.
+
+Capable native runtimes also compose these regions with immutable argument-frame
+recipes. Older runtimes with typed matmul capture but without frame support omit
+that composition. cuBLASLt and its transitive libraries remain user-managed
+(`TI_CUBLASLT_LIBRARY_PATH`); ordinary kernels, runtime auto and wheel dependency
+profiles do not change. Exact workspace/private-buffer bytes and argument images
+are reported separately from unknown vendor/driver storage. Neither fusion nor
+packing is a universal winner; host, device and memory evidence remain separate.
+
+### FFT and SpMM preparation and reuse
 
 Both separable FFT strategies transform all rows first and use the output array
 for in-place columns, without a dense transpose buffer. The per-image plan then

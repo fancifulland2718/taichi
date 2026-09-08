@@ -148,6 +148,17 @@ class MatmulRecipeProvider(GraphRuntimeFragmentProvider):
                 "prepared_matmul_regions" if sources else "no_frozen_matmul_source"
             ),
             "semantic_api": "ti.linalg.record_matmul",
+            "baselines": tuple(
+                {
+                    "source_key": path,
+                    "semantic_contract": source.semantics,
+                    "frozen_config": source.physical_config(source.baseline),
+                    "physical_id": source.physical_id(source.baseline),
+                    "component_applicability": source.facts["component"],
+                    "preparation_observation": source.facts["preparation"],
+                }
+                for path, _, source, _ in sources
+            ),
             "unavailable": tuple(row[2].facts["unavailable"] for row in sources),
         }
 

@@ -136,9 +136,9 @@ def test_hardware_recipe_entry_points_are_static_narrow_and_do_not_load_vendor_r
     assert "CUDA f32 CSR SparsePattern" in spmm["scope"]
     assert fft["semantic_api"] == "ti.linalg.record_fft"
     assert "CUDA batched 2D complex-f32" in fft["scope"]
-    expert_only = ti.hardware.capability("linalg.matmul.cublaslt_explicit").to_dict()["recipe_search"]
-    assert expert_only["status"] == "no_builtin_entry_declared"
-    assert expert_only["provider_api"] is None
+    matmul = ti.hardware.capability("linalg.matmul.cublaslt_explicit").to_dict()["recipe_search"]
+    assert matmul["semantic_api"] == "ti.linalg.record_matmul"
+    assert matmul["provider_api"] == "ti.hardware.linalg.MatmulRecipeProvider"
     assert spmm["qualification"] == "static_entry_points_not_workload_availability"
 
 
@@ -608,13 +608,13 @@ def test_capability_and_provider_queries_are_stable_and_fail_closed():
         "operation_ids": ("linalg.gemm.cublas",),
     }
     cublaslt = ti.hardware.capability("linalg.matmul.cublaslt_explicit")
-    assert cublaslt.implementation_status == "existing_internal"
+    assert cublaslt.implementation_status == "existing_public"
     assert cublaslt.activation_mode == "explicit_hardware_api"
     assert cublaslt.scopes == ("python", "graph")
     assert cublaslt.workspace_ownership == "provider_owned"
     assert cublaslt.lifetime_policy == "provider_plan"
     assert cublaslt.update_policy == "rebind"
-    assert cublaslt.public_api is None
+    assert cublaslt.public_api == "ti.linalg.record_matmul"
     assert "no automatic crossover" in cublaslt.notes[2]
     cub = ti.hardware.capability("algorithms.primitives.cub")
     assert cub.scopes == ("python", "graph")

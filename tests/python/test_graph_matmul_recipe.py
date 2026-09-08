@@ -262,6 +262,7 @@ def test_matmul_public_search_resolves_frozen_choices_without_heuristics(monkeyp
     report = ti.graph.GraphOptimizationReportV2.from_json(decision.report.to_json())
     assert report.to_dict() == decision.report.to_dict()
     assert "frozen_config" in report.to_json()
+    assert "baselines" in report.to_json()
     assert "matmul-physical:" in report.to_json()
 
 
