@@ -30,6 +30,7 @@
 #include "taichi/ir/statements.h"
 #include "taichi/analysis/offline_cache_util.h"
 #include "taichi/program/graph_builder.h"
+#include "taichi/program/graph_value_program.h"
 #include "taichi/program/cuda_scan_capture.h"
 #include "taichi/program/cuda_cublaslt_capture.h"
 #include "taichi/program/cuda_cutensor_capture.h"
@@ -579,6 +580,46 @@ py::dict primitive_workspace_snapshot_to_dict(
 }  // namespace
 
 void export_lang(py::module &m) {
+  m.def("_graph_pointwise_value_program", [](lang::Kernel *kernel) {
+    TI_ERROR_IF(kernel == nullptr, "Value-program query received a null kernel");
+    auto tree_guard = kernel->program->acquire_snode_tree_lifecycle_read_guard();
+    const auto program = lang::inspect_graph_pointwise_value_program(
+        kernel->program->compile_config(), kernel);
+    py::dict result;
+    result["contract"] = "pointwise-integer32-preoffload";
+    result["available"] = program.available;
+    result["blocker"] = program.blocker;
+    result["metadata"] = graph_kernel_metadata_to_python(program.metadata);
+    result["output_argument"] = program.output_argument;
+    result["output_runtime_affine"] = program.output_runtime_affine;
+    result["result"] = program.result;
+    py::list nodes;
+    for (const auto &node : program.nodes) {
+      py::dict item;
+      using Kind = lang::GraphValueNode::Kind;
+      const char *kind = "constant";
+      switch (node.kind) {
+        case Kind::constant: break;
+        case Kind::index: kind = "index"; break;
+        case Kind::scalar_argument: kind = "scalar_argument"; break;
+        case Kind::array_load: kind = "array_load"; break;
+        case Kind::unary: kind = "unary"; break;
+        case Kind::binary: kind = "binary"; break;
+      }
+      item["kind"] = kind;
+      item["dtype"] = node.dtype->to_string();
+      item["operands"] = node.operands;
+      item["argument"] = node.argument;
+      item["constant_bits"] = node.constant_bits;
+      item["runtime_affine"] = node.runtime_affine;
+      item["operation"] = node.kind == Kind::unary ?
+          unary_op_type_name(node.unary_op) : node.kind == Kind::binary ?
+          binary_op_type_name(node.binary_op) : "";
+      nodes.append(std::move(item));
+    }
+    result["nodes"] = std::move(nodes);
+    return result;
+  });
   m.def("_cuda_scan_capture_workspace_bytes", &lang::cuda_scan_capture_workspace_bytes);
   py::class_<lang::CudaCublasLtCapturePlan>(m, "_CudaCublasLtCapturePlan")
       .def(py::init<>())
