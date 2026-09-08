@@ -43,6 +43,56 @@ def test_strict_elf_export_audit_matches_final_binary(monkeypatch, tmp_path):
         wheel.close()
 
 
+@pytest.mark.parametrize("provider", ("cudss", "vkfft"))
+def test_windows_provider_optional_exports_are_owner_scoped(
+    provider, monkeypatch, tmp_path
+):
+    required = f"taichi_forge_{provider}_provider_query"
+    stem = (
+        validate_runtime_wheel.VKFFT_ADAPTER_STEM
+        if provider == "vkfft"
+        else "taichi_forge_cudss_provider_abi1_cudss080"
+    )
+    member = f"taichi_forge_runtime/_lib/hardware_providers/{stem}.dll"
+    monkeypatch.setattr(validate_runtime_wheel.shutil, "which", lambda name: name)
+    exports = set()
+    monkeypatch.setattr(
+        validate_runtime_wheel.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="\n".join(
+                f"    {index} 0 00001000 {symbol}"
+                for index, symbol in enumerate(sorted(exports), 1)
+            ),
+        ),
+    )
+    with _wheel_with_member(tmp_path / "runtime.whl", member) as wheel:
+        def audit():
+            validate_runtime_wheel._strict_provider_exports(
+                wheel, {member: required}, "windows"
+            )
+
+        exports.add(required)
+        audit()  # Previous adapters do not need the new extension symbols.
+        extensions = validate_runtime_wheel.OPTIONAL_PROVIDER_EXPORTS[required]
+        for extension in sorted(extensions):
+            exports.add(extension)
+            audit()
+        exports.remove(required)
+        with pytest.raises(RuntimeError, match="requires"):
+            audit()
+        exports.add(required)
+        exports.add("taichi_forge_other_provider_query")
+        with pytest.raises(RuntimeError, match="permits only"):
+            audit()
+        if provider == "vkfft":
+            exports.remove("taichi_forge_other_provider_query")
+            exports.add("unintended_shader_compiler_export")
+            with pytest.raises(RuntimeError, match="permits only"):
+                audit()
+
+
 def test_strict_elf_export_audit_rejects_repair_drift(monkeypatch, tmp_path):
     wheel = _wheel_with_member(
         tmp_path / "runtime.whl",

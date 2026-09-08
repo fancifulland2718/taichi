@@ -54,6 +54,22 @@ OPTIONAL_RUNTIME_PROVIDERS = {
     ),
 }
 VKFFT_ADAPTER_STEM = "taichi_forge_vkfft_provider_abi1_vkfft134"
+# Additive C ABI extensions remain optional for older compatible adapters.
+# Keep these owner-specific: an arbitrary Forge-prefixed export is not an ABI.
+OPTIONAL_PROVIDER_EXPORTS = {
+    "taichi_forge_cudss_provider_query": frozenset(
+        {
+            "taichi_forge_cudss_configuration_query",
+            "taichi_forge_cudss_allocator_query",
+        }
+    ),
+    "taichi_forge_vkfft_provider_query": frozenset(
+        {
+            "taichi_forge_vkfft_recipe_query",
+            "taichi_forge_vkfft_record_inline",
+        }
+    ),
+}
 VKFFT_LICENSE_FILES = (
     "VkFFT-LICENSE.txt",
     "glslang-LICENSE.txt",
@@ -381,10 +397,12 @@ def _strict_provider_exports(zf: ZipFile, members: dict[str, str], platform: str
             else:
                 symbols = {line.split()[0].split("@", 1)[0] for line in completed.stdout.splitlines() if line.split()}
             forge_exports = {symbol for symbol in symbols if symbol.startswith("taichi_forge_")}
-            if forge_exports != {required} or (VKFFT_ADAPTER_STEM in member and symbols != {required}):
+            allowed = {required} | OPTIONAL_PROVIDER_EXPORTS.get(required, frozenset())
+            audited = symbols if VKFFT_ADAPTER_STEM in member else forge_exports
+            if required not in audited or not audited <= allowed:
                 raise RuntimeError(
-                    f"provider adapter {member} must export exactly {required!r}; "
-                    f"found Forge exports {sorted(forge_exports)}"
+                    f"provider adapter {member} requires {required!r} and permits only "
+                    f"{sorted(allowed)}; found exports {sorted(audited)}"
                 )
 
 
