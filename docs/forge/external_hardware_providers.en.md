@@ -24,7 +24,7 @@ APIs for the bounded operations below; discovery probes remain non-executing.
 | cuDSS 0.8.x | Registered bundled-adapter ABI | Forge adapter; user vendor runtime | `ti.hardware.probe("cudss", library_path=...)` | Domain auto/explicit or root Graph; not kernel-callable |
 | OptiX ABI 93/105/118 | Registered bundled-adapter ABI | Forge adapter; user/driver vendor runtime | `ti.hardware.probe("optix", library_path=...)` | Explicit scene/launch or root Graph; not kernel-callable |
 | Vulkan driver/ICD | D0 backend dependency, not a D1 provider | OS/GPU driver installation | `ti.init(arch=ti.vulkan)` plus capability queries | Kernel and documented native Vulkan APIs |
-| cuSPARSELt 0.8.x-0.9.x | Registered bundled-adapter ABI | Forge adapter; user optional package | `ti.hardware.tensor.CusparseLtProvider` / `CusparseLtMatmulPlan.record` | FP16 2:4 plan and retained root Graph capture; no kernel intrinsic or automatic rewrite |
+| cuSPARSELt 0.8.x-0.9.x | Registered bundled-adapter ABI | Forge adapter; user optional package | `ti.hardware.tensor.CusparseLtProvider` / `ti.linalg.record_sparse_matmul` | Retained FP16 2:4 capture and complete shared-A matmul recipes; no kernel intrinsic or automatic rewrite |
 | cuTENSOR 2.0.x-2.7.x | Registered bundled-adapter ABI | Forge adapter; user optional package | `ti.hardware.tensor.CutensorProvider` / `ti.linalg.record_contraction` | Retained root Graph capture and complete contraction dataflows; no kernel intrinsic or implicit auto rewrite |
 | AmgX stable C API | Registered bundled-adapter ABI | Forge adapter; user source build | `ti.hardware.probe(...)` or `ti.hardware.linalg.AmgxProvider` | Explicit host-CSR solver; no Graph/kernel/auto route |
 | NCCL | Outside Forge's current single-GPU scope | User system package | No public Forge probe or execution API | External multi-GPU communication only |
@@ -61,7 +61,7 @@ entry is declared for that operation; it does not prohibit application providers
 | Vulkan VkFFT | Explicit fixed-storage plan or root Graph recording | Vulkan JIT/source adapter; no built-in complete FFT-recipe search or CUDA binding-frame integration is implied. |
 | cuBLASLt matmul region | `ti.linalg.record_matmul(...)`, then `operation.prepare()` | CUDA compact scalar-f32, fixed shape and optional strided batch. Explicit `ti.hardware.linalg.MatmulRecipeProvider()` composes frozen algorithm/workspace choices, real operand packing, and separate/fused ReLU. The expert retained-plan API remains private. |
 | cuTENSOR contraction region | `ti.linalg.record_contraction(...)`, then `operation.prepare()` | Explicit `ti.hardware.tensor.ContractionRecipeProvider()` composes real input permutations and vendor/separate epilogues; includes retained workspace and immutable binding frames. |
-| cuSPARSELt | Explicit plan and `plan.record(...)` | Root Graph capture of a compressed snapshot or recompress/matmul. Recording alone does not provide a complete strategy-search domain. |
+| cuSPARSELt shared-A region | `ti.linalg.record_sparse_matmul(...)`, then `operation.prepare()` | Explicit `ti.hardware.tensor.SparseMatmulRecipeProvider()` searches frozen algorithm/resource/epilogue dataflows; current A is compressed once per invocation, not cached across replays. |
 | AmgX | Explicit provider plans described below | No complete-recipe provider or general Graph recording route is currently exposed. |
 
 Prepare mathematical operations before freezing the Graph. SpMM, FFT, matmul and contraction require
@@ -647,6 +647,60 @@ Snapshot reuse and per-replay refresh have different input contracts; they
 must not be presented as interchangeable optimization candidates without a
 common explicit weight-lifetime contract.
 
+For a complete shared-current-A region, use the semantic entry instead of
+searching raw plan parameters:
+
+```python
+operation = ti.linalg.record_sparse_matmul(
+    m, n, k,
+    products=(("b0", "c0", "d0"), ("b1", "c1", "d1")),
+    alpha=0.75, beta=0.25, activation="relu",
+    absolute_tolerance=1e-3, relative_tolerance=3e-3,
+)
+preparation = operation.prepare(max_algorithms=8)
+builder = ti.graph.GraphBuilder()
+builder.append_native(operation)
+definition = builder.freeze()
+providers = (
+    *ti.graph.default_recipe_providers(),
+    ti.hardware.tensor.SparseMatmulRecipeProvider(),
+)
+# Pass providers to the usual definition.search_recipes(...), with the
+# caller's target, budget, workload and evaluation contract.
+```
+
+Each product computes `D_i = activation(alpha * A @ B_i.T + beta * C_i)`.
+All products use the same positive, multiple-of-16 M/N/K and compact scalar
+FP16 arrays, with at most `2**31-1` elements per matrix. One product is also
+allowed. A must already satisfy row-wise 2:4 sparsity; no values are inspected
+or pruned. Every invocation reads current A/B/C. Only each product's own C/D
+may alias; no output may overwrite another product's inputs or outputs.
+
+Preparation creates host descriptors only, freezes actual algorithm attributes
+and compressed/scratch/workspace sizes, and reports bounded enumeration or
+unavailable candidates. It neither measures performance nor calls vendor
+autotuning on caller data. Every materialized region owns its plan and one
+compressed-A/workspace allocation, used by ordered products. The baseline
+already uses legal compression reuse and vendor-default settings. Alternatives
+change the frozen algorithm and fused/separate ReLU dataflow, never the library
+route. Separate helpers use the known semantic extents.
+
+Save `preparation` together with the search selection artifact. A new process
+can recreate the same operation with `preparation=...`, freeze an equivalent
+definition and call `resolve_recipe(selection_artifact, providers=providers)`.
+Restoration does not repeat enumeration: it reconstructs the selected plan and
+checks component, device, actual configuration and resource facts at cold
+boundaries. It does not deserialize executable objects or reuse another
+algorithm's compressed bytes. The Forge report carries these dataflows and
+limitations; known memory excludes opaque vendor state and driver peak.
+
+This route needs the adapter's optional configured-plan execution table and
+native shared-A capture support; the legacy explicit-plan ABI remains usable
+without that extension. Development validation covers Windows, cuSPARSELt
+0.9.1 and a supported NVIDIA GPU, not every driver/library combination or
+production workload. No new steady-replay probe, validation or synchronization
+is introduced, and ordinary automatic selection is unchanged.
+
 Follow the selected release's supported GPU list and driver requirements.
 cuSPARSELt 0.8 supports CUDA 12.9/13.0; 0.9 dropped CUDA 12.9 support.
 The vendor runtime and its CUDA dependencies remain outside Forge's portable
@@ -674,16 +728,15 @@ activation: explicit
 sparsity_policy: already_valid_2_of_4
 automatic_pruning: false
 plan_cache_key: [device, library_version, dtype, shape, strides, transpose]
-algorithm_search: offline_opt_in
-min_matmuls_per_compression: 4
+candidate_preparation: descriptors_only
+weight_lifetime: explicit_snapshot_or_current_per_invocation
 fallback_owner: application
 ```
 
-Treat `min_matmuls_per_compression: 4` only as a conservative starting gate;
-qualify the exact workload and increase it when compression or setup dominates.
-Run `cusparseLtMatmulSearch()` only as offline/initialization autotuning for an
-operation that will be repeated. Do not put search, pruning, compression, or
-plan creation in the simulation step loop.
+There is no fixed minimum reuse count or universal speedup gate. Measure the
+actual compression, product and memory costs. Preparation and plan creation
+belong outside replay; compression of changing A must remain in the execution
+dataflow. Forge's semantic provider does not call `cusparseLtMatmulSearch()`.
 
 For physics workloads, automatic pruning is normally unsafe: changing a mass,
 stiffness, Jacobian, contact, or constraint matrix to satisfy 2:4 sparsity
@@ -700,9 +753,10 @@ Admission should include the full amortized cost:
 plan + prune/check + compression + repeated matmul + extra memory
 ```
 
-Require numerical acceptance first. Then require a positive worst-case timing
-result for the expected reuse count. High timing variance is acceptable only
-when the slowest qualified sample still clears the application gate.
+Require the application's numerical contract, then compare device time, host
+submission, synchronization and memory separately on its real workload.
+Retain legal physical alternatives and mark negative scopes; unexpected losses
+need implementation/timeline attribution, not a blanket family rejection.
 
 ### cuTENSOR recommended configuration
 

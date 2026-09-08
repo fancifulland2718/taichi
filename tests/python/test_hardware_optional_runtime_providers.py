@@ -308,6 +308,10 @@ def test_optional_runtime_execution_capabilities_are_explicit_host_plan_apis():
         assert descriptor.activation_mode == "explicit_hardware_api"
         assert descriptor.lifetime_policy == "provider_plan"
         assert "automatic" in " ".join(descriptor.notes).lower()
+        if operation_id == "tensor.matmul.cusparselt":
+            assert descriptor.recipe_semantic_api == "ti.linalg.record_sparse_matmul"
+            assert descriptor.recipe_provider_api == "ti.hardware.tensor.SparseMatmulRecipeProvider"
+            assert "once per Graph invocation" in " ".join(descriptor.recipe_scope)
 
 
 @pytest.mark.parametrize("module", _MODULES)

@@ -531,6 +531,14 @@ def d1_provider_operations(_operation):
                 "supported SM and exact 2:4 structured sparsity",
             ),
             public_api="ti.hardware.tensor.CusparseLtProvider / CusparseLtMatmulPlan.record",
+            recipe_semantic_api="ti.linalg.record_sparse_matmul",
+            recipe_provider_api="ti.hardware.tensor.SparseMatmulRecipeProvider",
+            recipe_scope=(
+                "CUDA compact FP16 row 2:4 A, FP32 accumulation, same M/N/K products and caller tolerance",
+                "current A compressed once per Graph invocation; ordered products share one plan and workspace",
+                "frozen algorithm/resource facts and vendor/separate ReLU dataflows; no raw algorithm search axis",
+                "selected plan reconstruction with configured adapter ABI2 and native shared-A capture capability",
+            ),
             dtypes=("A/B/C/D:f16", "accumulation:f32"),
             layouts=("row-major A/C/D", "row-major (n,k) transposed B storage"),
             numeric_contracts=("compress(A) -> D = alpha * A @ B + beta * C",),
@@ -539,7 +547,7 @@ def d1_provider_operations(_operation):
                 "The plan owns compressed-A, compression scratch, and matmul workspace Taichi ndarrays.",
                 "record() retains a compressed snapshot; record(a=...) captures compression and matmul for each replay.",
                 "Snapshot buffers cannot be overwritten while capture leases are live; new weights use a new epoch or refreshing recording.",
-                "Root CUDA Graph capture and immutable binding frames are supported; strategy search and automatic selection are separate contracts.",
+                "Complete region search uses record_sparse_matmul and SparseMatmulRecipeProvider; ordinary automatic selection is unchanged.",
             ),
         ),
         _operation(

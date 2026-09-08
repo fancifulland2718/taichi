@@ -21,7 +21,7 @@ retained-provider API，而 discovery probe 始终不执行算法。
 | cuDSS 0.8.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户提供 vendor runtime | `ti.hardware.probe("cudss", library_path=...)` | 领域级 auto/explicit 或 root Graph；不能在 kernel 内调用 |
 | OptiX ABI 93/105/118 | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户/driver 提供 vendor runtime | `ti.hardware.probe("optix", library_path=...)` | 显式 scene/launch 或 root Graph；不能在 kernel 内调用 |
 | Vulkan driver/ICD | D0 backend 依赖，不是 D1 provider | OS/GPU driver 安装 | `ti.init(arch=ti.vulkan)` 加 capability query | kernel 与已公开 native Vulkan API |
-| cuSPARSELt 0.8.x-0.9.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户安装可选包 | `ti.hardware.tensor.CusparseLtProvider` / `CusparseLtMatmulPlan.record` | FP16 2:4 plan 与 retained root Graph capture；无 kernel intrinsic 或自动 rewrite |
+| cuSPARSELt 0.8.x-0.9.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户安装可选包 | `ti.hardware.tensor.CusparseLtProvider` / `ti.linalg.record_sparse_matmul` | retained FP16 2:4 capture 与完整 shared-A matmul recipe；无 kernel intrinsic 或自动 rewrite |
 | cuTENSOR 2.0.x-2.7.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户安装可选包 | `ti.hardware.tensor.CutensorProvider` / `ti.linalg.record_contraction` | retained root Graph capture 与完整 contraction 数据流；无 kernel intrinsic 或隐式 auto rewrite |
 | AmgX stable C API | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户源码构建 | `ti.hardware.probe(...)` 或 `ti.hardware.linalg.AmgxProvider` | 显式 host-CSR solver；无 Graph/kernel/auto 路线 |
 | NCCL | 不属于 Forge 当前单 GPU 范围 | 用户安装系统包 | 没有公开 Forge probe 或执行 API | 仅外部 multi-GPU communication |
@@ -53,7 +53,7 @@ cuTENSOR、AmgX 或 NCCL 绝不会触发 compiler rewrite。
 | 其他 cuSPARSE / cuFFT / cuDSS expert operation | 既有显式 plan 和已说明的 root Graph recording | recording 本身不提供 recipe generator；cuDSS root 有序调用不能描述成 CUDA Graph capture。 |
 | cuBLASLt matmul region | `ti.linalg.record_matmul(...)`，随后 `operation.prepare()` | CUDA 紧凑 scalar-f32、固定形状及可选 strided batch。显式 `ti.hardware.linalg.MatmulRecipeProvider()` 组合冻结算法/workspace、真实输入打包、独立/融合 ReLU；专家 retained-plan API 仍为私有。 |
 | cuTENSOR contraction region | `ti.linalg.record_contraction(...)`，然后 `operation.prepare()` | 显式 `ti.hardware.tensor.ContractionRecipeProvider()` 组合真实输入重排与 vendor/separate epilogue，持有 workspace 并支持 immutable binding frames。 |
-| cuSPARSELt | 显式 plan 与 `plan.record(...)` | root Graph capture 支持压缩快照或重压缩/matmul；录制本身不构成完整策略搜索域。 |
+| cuSPARSELt shared-A region | `ti.linalg.record_sparse_matmul(...)`，然后 `operation.prepare()` | 显式 `ti.hardware.tensor.SparseMatmulRecipeProvider()` 搜索冻结的算法/资源/epilogue 数据流；当前 A 每 invocation 压缩一次，不做跨 replay 值缓存。 |
 | AmgX | 下文的显式 provider plan | 当前没有公开 complete-recipe provider 或通用 Graph recording 路线。 |
 
 先准备数学 operation，再 freeze Graph。SpMM/FFT/matmul/contraction 要求显式的 finite-input / f32 tolerance 合同，
@@ -521,6 +521,49 @@ recording 持有 plan、压缩数据和 scratch。只要 recording/Graph 的 lea
 数值变化探测或隐式算法搜索。快照复用和每 replay 重压缩的输入变化合同不同，没有共同明确的
 weight-lifetime 合同时不能把它们当成可互换的优化候选。
 
+完整的 shared-current-A region 使用语义入口，不搜索裸 plan 参数：
+
+```python
+operation = ti.linalg.record_sparse_matmul(
+    m, n, k,
+    products=(("b0", "c0", "d0"), ("b1", "c1", "d1")),
+    alpha=0.75, beta=0.25, activation="relu",
+    absolute_tolerance=1e-3, relative_tolerance=3e-3,
+)
+preparation = operation.prepare(max_algorithms=8)
+builder = ti.graph.GraphBuilder()
+builder.append_native(operation)
+definition = builder.freeze()
+providers = (
+    *ti.graph.default_recipe_providers(),
+    ti.hardware.tensor.SparseMatmulRecipeProvider(),
+)
+# 将 providers 交给已有 definition.search_recipes(...)，并由调用者给出
+# target、budget、workload 和 evaluation contract。
+```
+
+每个乘法计算 `D_i = activation(alpha * A @ B_i.T + beta * C_i)`。所有乘法使用相同且为
+16 倍数的正整数 M/N/K、compact scalar FP16 数组，每矩阵最多 `2**31-1` 个元素；也允许
+单个乘法。A 已满足按行 2:4 稀疏合同，不读取或 prune 数值。每 invocation 读取当前 A/B/C；
+只允许每个乘法自己的 C/D alias，输出不能覆盖其他乘法的输入或输出。
+
+prepare 只创建 host descriptor，冻结实际算法属性及压缩区/scratch/workspace 大小，并报告
+枚举预算和不可用候选；不测量性能，不在用户数据上运行 vendor autotuning。每个物化 region
+拥有一个计划和一套压缩区/workspace，按顺序服务组内乘法。baseline 已采用合法压缩复用和
+vendor 默认配置；候选改变冻结算法与融合/分离 ReLU 数据流，不搜索库名。分离 helper 使用
+已经明确的语义尺寸。
+
+将 `preparation` 与搜索 selection artifact 一起保存。新进程用 `preparation=...` 重建等价
+operation、freeze definition，再调用 `resolve_recipe(selection_artifact, providers=providers)`。
+恢复不重新枚举候选，而是重建选中计划，在冷边界核对 component、device、实际配置和资源。
+不反序列化 executable，不复用其他算法的 compressed bytes。Forge report 保留数据流与
+适用性说明；known memory 不包含 opaque vendor state 或 driver peak。
+
+此路径要求 adapter 的可选 configured-plan 执行表和 native shared-A capture 支持；旧显式
+plan ABI 不依赖该扩展。开发验证范围是 Windows、cuSPARSELt0.9.1 和受支持 NVIDIA GPU，
+不代表所有 driver/library 组合或生产 workload。没有新增 steady replay probe、校验或同步，
+普通 automatic selection 不变。
+
 必须按具体 release 核对支持的 GPU 列表和 driver 要求。cuSPARSELt 0.8 支持 CUDA12.9/13.0，
 0.9 已取消 CUDA12.9 支持；vendor runtime 及其 CUDA 依赖仍在 Forge portable wheel 外。
 package 可安装不等于运行兼容，见 [cuSPARSELt release notes](https://docs.nvidia.com/cuda/cusparselt/release_notes.html)。
@@ -545,15 +588,14 @@ activation: explicit
 sparsity_policy: already_valid_2_of_4
 automatic_pruning: false
 plan_cache_key: [device, library_version, dtype, shape, strides, transpose]
-algorithm_search: offline_opt_in
-min_matmuls_per_compression: 4
+candidate_preparation: descriptors_only
+weight_lifetime: explicit_snapshot_or_current_per_invocation
 fallback_owner: application
 ```
 
-`min_matmuls_per_compression: 4` 只应视为保守起始门槛；必须资格化精确 workload，并在
-compression/setup 占主导时提高门槛。`cusparseLtMatmulSearch()` 只能作为会反复执行的
-operation 的离线/初始化 autotuning；不要把 search、pruning、compression 或 plan creation
-放进 simulation step loop。
+不设置固定的最小复用次数或统一加速门槛，应测量真实 compression、乘法和显存代价。
+prepare/plan creation 位于 replay 外；变化 A 的压缩必须留在执行数据流中。
+Forge 语义 provider 不调用 `cusparseLtMatmulSearch()`。
 
 对于 physics workload，automatic pruning 通常不安全：为满足 2:4 sparsity 而修改 mass、
 stiffness、Jacobian、contact 或 constraint matrix，会改变数值 operator。只有模型或 learned
@@ -568,8 +610,8 @@ admission 必须计入完整摊销成本：
 plan + prune/check + compression + repeated matmul + extra memory
 ```
 
-先通过数值验收，再要求在预期复用次数下最差 timing 仍有正收益。只有最慢的资格化 sample
-仍通过应用门槛时，较高 timing variance 才是可接受的。
+满足应用数值合同后，分别比较真实 workload 上的 device、host 提交、同步和显存。
+保留合法物理候选并标记负 scope；意外负项应先做实现/timeline 归因，不整体否定 family。
 
 ### cuTENSOR 推荐配置
 
