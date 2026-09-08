@@ -136,6 +136,54 @@ Graph 相比共享 arena 可能消耗更多显存；报告分别列出 segment b
 retained-scan capability，仍是 fixed-resource Graph action，不代表任意 producer/consumer fusion
 或可与 binding-frame executor 组合的 region。
 
+### 分段归约两侧的认证 pointwise 值融合
+
+CUDA 默认完整 recipe discovery 可将纯 pointwise producer、consumer 或两端一起融合到
+`GraphBuilder.segmented_reduce()`。编译器认证实际值 IR，不以相邻 dispatch 名称代替语义。
+首个支持域是普通紧凑 1D ndarray 上的 scalar i32/u32 加减乘、转换、取负与位运算
+（位移量为 0--31 常量）、整数常量/标量，以及
+精确从零开始的迭代范围；不包含浮点、random/atomic、条件体、多 store、SNode、view、任意调用，
+或 debug/边界检查插桩 kernel。
+不支持的语义保留未融合路径。
+
+producer 输出必须是归约固定的 values 数组，被转发的 consumer 输入必须是归约固定的 output。
+`Graph.bind()` 在发布边界一次核对这些身份、精确迭代覆盖，以及写入与未转发读取的互不重叠。
+名字相同不等于真实数据流。所有可见 producer/reduction/consumer store 与未使用 capacity 都保留，
+不宣称消除了临时存储；候选绑定不适用时记录结构化搜索失败，不静默换回其他物理方案。
+
+provider 将值转发与 serial、warp、block、partial/finalize 归约及已有 immutable-frame 提交选项
+组合。两阶段方案仅在输入阶段映射 producer，仅在 finalize 映射 consumer；无关 prefix/suffix
+dispatch 保持顺序与语义覆盖。只支持一个有序 workspace lane。准备后的 replay 不重新查询 IR、
+验证存储或上传参数；发布新绑定仍包含准备成本。
+
+融合不保证更快：把大 map 移入少量长循环 reduction block 可能降低并行度，partial/finalize
+则用额外 scratch 恢复并行执行。合法方案保留搜索，device、host submit、同步和自有 scratch
+分别报告。CUDA event 跨度可能包含 host 供给不足，不能冒称 kernel-active 时间；没有独立测量时，
+driver Graph/allocator 显存仍为未知。本实现只有本地 Windows 证据，不代表生产或 Linux 资格，
+不改变普通 auto。
+
+### 当前完整 recipe 硬件域
+
+以下是源码支持边界，不保证任意已安装 wheel/vendor runtime 都具有所有可选能力。
+沿用 `freeze -> search_recipes -> resolve_recipe -> materialize`；表中显式 provider 与
+`ti.graph.default_recipe_providers()` 一起传入。
+
+| 域 | Provider 选择 | 物理策略与边界 |
+| --- | --- | --- |
+| 整数分段归约 | 默认 | 串行、协作、partial/finalize；固定 host 发布布局，模整数求和 |
+| 认证 pointwise 归约值 | 默认 | 上述有界 IR 的 producer/consumer 转发与 immutable 提交 |
+| Dense matmul | 显式 `ti.hardware.linalg.MatmulRecipeProvider()` | cuBLASLt 冻结选择、operand packing、等价 epilogue |
+| Contraction | 显式 `ti.hardware.tensor.ContractionRecipeProvider()` | cuTENSOR retained capture、输入置换与 epilogue dataflow |
+| Shared-A sparse matmul | 显式 `ti.hardware.tensor.SparseMatmulRecipeProvider()` | FP16 2:4，每次调用压缩后跨 product 共享；不自动剪枝 |
+| Sparse solve | 显式 `ti.hardware.linalg.SparseSolveRecipeProvider()` | 私有 cuDSS analysis/factor 生命周期与数值阶段 capture；区别于旧 root-ordered recording |
+| Vulkan FFT | 显式 `ti.hardware.fft.VulkanFftRecipeProvider()` | VkFFT batch scratch 共享和完整 Graph retained command 录制 |
+
+输入、准备/恢复、运行库依赖与数值政策见[原生算法](native_algorithms.zh.md)和
+[外部 provider 合同](external_hardware_providers.zh.md)。搜索只用维护的 **CompileIQ fork** 与
+opaque complete-recipe identity；库名、单 kernel 参数不作为搜索轴。缺少可选 native/adapter
+支持只使相关候选不可用；报告/checkpoint 保留 provider 和环境适用性。wheel 兼容按版本、ABI、
+capability 判断，不要求与源码 commit 相等。
+
 ## Dense Field 生命周期与异构 block
 
 dense scalar、vector 与 matrix Field 可作为 definition-time binding。此时内容可变，但

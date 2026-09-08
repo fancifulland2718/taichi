@@ -180,6 +180,66 @@ compilation can also cost more. This path requires the native retained-scan
 capability and remains a fixed-resource Graph action, not arbitrary
 producer/consumer fusion or a binding-frame-compatible region.
 
+### Certified pointwise values around segmented reduction
+
+On CUDA, default complete-recipe discovery can fuse a pure pointwise producer,
+consumer, or both around `GraphBuilder.segmented_reduce()`. The compiler certifies
+the actual value IR, not just adjacent dispatch labels. The first supported domain
+is scalar i32/u32 addition/subtraction/multiplication, casts, negation and bitwise
+expressions (constant shifts 0--31) over compact 1D ndarrays, integer
+constants/scalars and exact zero-based iteration domains. It excludes
+floating point, random/atomic operations, conditional bodies, multiple stores,
+SNodes, views, arbitrary calls and debug/bounds-instrumented kernels. Unsupported
+semantics retain the unfused route.
+
+Producer output must be the reduction's fixed values array; the forwarded consumer
+input must be its fixed output. `Graph.bind()` checks these identities, exact
+iteration coverage and disjoint writes/unforwarded reads once at publication.
+Names alone do not establish dataflow. All observable producer/reduction/consumer
+stores and unused capacity are preserved; this is not temporary-storage elimination.
+An incorrect candidate binding is a structured search failure, not silent fallback.
+
+The provider combines value forwarding with serial, warp, block or partial/finalize
+reduction and the existing immutable-frame submission option. Partial/finalize
+maps the producer only into the input phase and the consumer only into finalization.
+Unaffected prefix/suffix dispatches retain their order and semantic coverage. One
+ordered workspace lane is supported. Prepared replay does not rerun the compiler
+query, storage proof or argument uploads; new binding publication includes setup.
+
+Fusion is not universally faster. Moving a large map into a few long-running
+reduction blocks can reduce parallelism; partial/finalize adds scratch and restores
+parallel work. Keep these legal alternatives in search and report device time,
+host submission, synchronization and owned scratch separately. CUDA event spans
+may include host starvation and are not kernel-active time. Driver Graph/allocator
+VRAM remains unknown unless independently measured. The implementation has local
+Windows evidence, not production or Linux qualification, and does not change auto.
+
+### Current complete-recipe hardware domains
+
+These are source support boundaries, not a promise that every installed wheel or
+vendor runtime implements every optional capability. Use the ordinary
+`freeze -> search_recipes -> resolve_recipe -> materialize` workflow and supply
+explicit providers alongside `ti.graph.default_recipe_providers()` where shown.
+
+| Domain | Provider selection | Physical strategies and boundary |
+| --- | --- | --- |
+| Segmented integer reduction | Default | Serial/cooperative/partial-finalize; fixed host-published layout and modular sum |
+| Certified pointwise reduction values | Default | Producer/consumer forwarding and immutable submission within the bounded IR contract above |
+| Dense matmul | Explicit `ti.hardware.linalg.MatmulRecipeProvider()` | Frozen cuBLASLt choices, operand packing and equivalent epilogues |
+| Contraction | Explicit `ti.hardware.tensor.ContractionRecipeProvider()` | Retained cuTENSOR capture, input permutations and epilogue dataflows |
+| Shared-A sparse matmul | Explicit `ti.hardware.tensor.SparseMatmulRecipeProvider()` | FP16 2:4, per-invocation compression shared by products; no automatic pruning |
+| Sparse solve | Explicit `ti.hardware.linalg.SparseSolveRecipeProvider()` | Private cuDSS analysis/factor lifetimes and captured numerical phases; distinct from legacy root-ordered recording |
+| Vulkan FFT | Explicit `ti.hardware.fft.VulkanFftRecipeProvider()` | VkFFT batch scratch sharing and whole-Graph retained command recording |
+
+See [native algorithms](native_algorithms.en.md) and the
+[external-provider contracts](external_hardware_providers.en.md) for inputs,
+preparation, restoration, runtime dependencies and numeric policies. Search
+uses the maintained **CompileIQ fork** and opaque complete-recipe identities;
+library names and individual kernel parameters are not search axes. Missing optional
+native/adapter support makes only that candidate unavailable. Reports/checkpoints
+preserve provider and environment applicability; wheel compatibility is based on
+version/ABI/capabilities rather than equality with a source commit.
+
 ## Dense Field lifetime and heterogeneous blocks
 
 Dense scalar, vector, and matrix Fields are supported as definition-time

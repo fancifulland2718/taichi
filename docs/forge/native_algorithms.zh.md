@@ -527,7 +527,9 @@ partial 结果，精确 requested bytes 进入物理/资源报告，不冒称 dr
 
 通过 `builder.freeze().search_recipes(...)` 和已有选择/resolve 流程使用。短段可能更适合串行，长段
 可能受益于 partial/finalize 的并行度，但增加 scratch 与准备成本；不保证统一加速，不改变普通 auto，
-也不自动融合相邻 producer/consumer kernel。
+也不由该操作直接融合任意相邻 kernel。默认搜索还可发现
+[认证 pointwise 值 recipe](graph_runtime_optimization.zh.md#分段归约两侧的认证-pointwise-值融合)，
+仅处理有界 i32/u32 producer/consumer，保留所有可见 store。
 
 ## Device-side 数值检查
 

@@ -656,8 +656,10 @@ lifetime; the operation uses one workspace lane.
 Use `builder.freeze().search_recipes(...)` and the existing selection/resolve
 workflow. Short segments can favor serial execution; long segments can favor
 the extra parallelism of partial/finalize at the cost of scratch and setup.
-There is no universal speedup or implicit ordinary-auto change, and adjacent
-producer/consumer kernels are not fused by this operation.
+There is no universal speedup or implicit ordinary-auto change. The operation
+itself does not fuse arbitrary neighbors; default search can additionally discover
+[certified pointwise value recipes](graph_runtime_optimization.en.md#certified-pointwise-values-around-segmented-reduction)
+for bounded i32/u32 producers/consumers, preserving all visible stores.
 
 ## Device-side Numeric Checks
 
