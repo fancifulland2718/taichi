@@ -136,6 +136,10 @@ def test_hardware_recipe_entry_points_are_static_narrow_and_do_not_load_vendor_r
     assert "CUDA f32 CSR SparsePattern" in spmm["scope"]
     assert fft["semantic_api"] == "ti.linalg.record_fft"
     assert "CUDA batched 2D complex-f32" in fft["scope"]
+    vulkan_fft = ti.hardware.capability("fft.transform.vkfft").to_dict()["recipe_search"]
+    assert vulkan_fft["semantic_api"] == "VulkanFftPlan.record"
+    assert vulkan_fft["provider_api"] == "ti.hardware.fft.VulkanFftRecipeProvider"
+    assert "Vulkan compact in-place complex-f32, rank 1--3" in vulkan_fft["scope"]
     matmul = ti.hardware.capability("linalg.matmul.cublaslt_explicit").to_dict()["recipe_search"]
     assert matmul["semantic_api"] == "ti.linalg.record_matmul"
     assert matmul["provider_api"] == "ti.hardware.linalg.MatmulRecipeProvider"

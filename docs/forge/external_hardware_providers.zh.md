@@ -17,7 +17,7 @@ retained-provider API，而 discovery probe 始终不执行算法。
 | cuBLAS | 已注册 D1 provider | 用户 CUDA 环境 | `ti.hardware.probe("cublas")` | direct Python 或 root Graph；不能在 kernel 内调用 |
 | cuSPARSE | 已注册 D1 provider | 用户 CUDA 环境 | `ti.hardware.probe("cusparse")` | 领域级 auto/explicit 或 root Graph；不能在 kernel 内调用 |
 | cuFFT | 已注册 D1 provider | 用户 CUDA 环境 | `ti.hardware.probe("cufft")` | 显式 plan 或 root Graph；不能在 kernel 内调用 |
-| VkFFT 1.3.4 | 可选 ABI1 Vulkan JIT adapter | 当前 runtime 构建配置包含，旧产物可能没有 | `ti.hardware.probe("vkfft")` 或显式路径 | 固定存储 `VulkanFftPlan` 或 root Graph；无 FFT recipe 搜索 |
+| VkFFT 1.3.4 | 可选 ABI1 Vulkan JIT adapter | 当前 runtime 构建配置包含，旧产物可能没有 | `ti.hardware.probe("vkfft")` 或显式路径 | 固定存储计划/root Graph；匹配扩展支持显式 batch 与完整 Graph secondary recipe |
 | cuDSS 0.8.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户提供 vendor runtime | `ti.hardware.probe("cudss", library_path=...)` | 领域级 auto/explicit 或 root Graph；不能在 kernel 内调用 |
 | OptiX ABI 93/105/118 | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户/driver 提供 vendor runtime | `ti.hardware.probe("optix", library_path=...)` | 显式 scene/launch 或 root Graph；不能在 kernel 内调用 |
 | Vulkan driver/ICD | D0 backend 依赖，不是 D1 provider | OS/GPU driver 安装 | `ti.init(arch=ti.vulkan)` 加 capability query | kernel 与已公开 native Vulkan API |
@@ -49,7 +49,7 @@ cuTENSOR、AmgX 或 NCCL 绝不会触发 compiler rewrite。
 | Batched 2D complex FFT | `ti.linalg.record_fft(...)`，随后 `operation.prepare()` | CUDA complex-f32，紧凑 `(H, W, 2)` 或 `(batch, H, W, 2)` 数组，输入输出分离。显式 `ti.hardware.fft.FftRecipeProvider()` 在 whole-transform baseline 外提供逐图像列计划，以及 native 支持时的跨 batch 列计划。 |
 | Toolkit reset-monoid segmented scan | 既有 `GraphBuilder.segmented_scan()` 加 `taichi_forge.hardware.source_providers` 中的 `CubSegmentedScanRecipeProvider(manifest_path)` | 可选 source-provider addon；有界 i32/u32 sum 与不可变 segmented layout。prepared capture、workspace 和 head-bitset 生命周期形成物理 recipe；addon 不在 portable runtime wheel 内。 |
 | Driver-native segmented scan | `GraphBuilder.segmented_scan()` 与默认 recipe providers | 固定、互不重叠的 i32/u32 数组和不可变 segment；global correction 使用 retained CUDA recording 与 Graph-bound scratch，不依赖外部 Toolkit 库；仍是 fixed-resource action，不是 binding-frame region。 |
-| Vulkan VkFFT | 显式 fixed-storage plan 或 root Graph recording | Vulkan JIT/source adapter；不意味着已有内建完整 FFT recipe 搜索或 CUDA binding-frame 接入。 |
+| Vulkan VkFFT | 固定存储计划/root Graph；显式 `VulkanFftRecipeProvider` | batch scratch 复用与 Vulkan 不可变 secondary Graph；不是 CUDA binding frame 或 vendor 路由轴。 |
 | 其他 cuSPARSE / cuFFT / cuDSS expert operation | 既有显式 plan 和已说明的 root Graph recording | recording 本身不提供 recipe generator；cuDSS root 有序调用不能描述成 CUDA Graph capture。 |
 | 共享 pattern 的 sparse-solve region | `ti.linalg.record_sparse_solve(...)`，然后 `operation.prepare()` | 显式 `ti.hardware.linalg.SparseSolveRecipeProvider()` 搜索完整排序/factor 生命周期及 Graph-owned capture；与旧 cuDSS root 有序录制分开。 |
 | cuBLASLt matmul region | `ti.linalg.record_matmul(...)`，随后 `operation.prepare()` | CUDA 紧凑 scalar-f32、固定形状及可选 strided batch。显式 `ti.hardware.linalg.MatmulRecipeProvider()` 组合冻结算法/workspace、真实输入打包、独立/融合 ReLU；专家 retained-plan API 仍为私有。 |
@@ -947,10 +947,35 @@ ABI，不创建计划、不证明设备或 workload 可执行。被动状态只�
 在计划中冻结，Graph 必须绑定原 ndarray，不支持运行时替换存储。
 
 创建计划可能 JIT 并同步初始化查找表。重放执行保留的 secondary GPU 命令序列，但每个 FFT action
-仍有 root-ordered host call；不能称为整个 Graph 的原生 capture，也不等同于 `ti.linalg.record_fft()`
-的 CUDA 输入输出分离合同，不新增 CompileIQ 路由轴。关闭计划拒绝后续调用，已提交 command buffer
+默认仍有 root-ordered host call；不能称为整个 Graph 的原生 capture，也不等同于 `ti.linalg.record_fft()`
+的 CUDA 输入输出分离合同。关闭计划拒绝后续调用，已提交 command buffer
 仍保留资源。请求分配统计不含用户存储和不透明驱动对象；close 和初始化请求分配峰值均不能证明
 显存已退役或真实 device peak。这里不声明生产加速，也不保证所有驱动组合。
+
+### 显式 Vulkan FFT recipe 搜索
+
+保持原计划和 compact ndarray 未关闭，再冻结 Graph。将 `ti.hardware.fft.VulkanFftRecipeProvider()`
+与 `ti.graph.default_recipe_providers()` 一起传给 `definition.search_recipes(...)`。
+仍使用已有完整 recipe evaluator、named metrics、report、checkpoint 与 `resolve_recipe()`；
+CompileIQ 只调度完整 identity。
+
+provider 组合两类真实物理机制：
+
+- 独立 batches 分块复用 scratch，尾块需要时拥有独立 application。更多 dispatch 可能增加 device 时间；
+  小 FFT 可能根本没有 scratch 可节省。tile 选择留在 provider 内部，不成为裸配置轴。
+- 直线 buffer Graph 中的 kernel 与 FFT 可录为一个 secondary 序列，嵌入 runtime 有序 primary。
+  `Graph.bind()` 为每个已发布版本准备固定参数和命令；replay 不调用 Python FFT action、不重传参数，
+  也不为该段单独提交队列。直接传 mapping 的调用则明确包含准备成本。
+
+batch recipe 要求 adapter 的 optional recipe extension；完整录制还要求 optional inline-record symbol
+和匹配 native bridge，不能把旧 adapter 静默当作同一物理方案。支持单 workspace lane、已在发布边界确认
+稳定的 owned bindings；不覆盖 SNode/texture/host-return kernel 或设备控制 Graph 拓扑。
+父提交保留数组、参数和 FFT 资源直至退役，提前关闭已物化 Graph 不会破坏在途工作。
+
+新进程先重建等价 baseline 计划和存储，再解析所选 recipe；仅选中的分块计划在 materialize 时新建。
+这不是 FFT 二进制序列化，也不承诺零成本 baseline 恢复。调用者 baseline 分配、plan 请求的 scratch、
+每绑定参数 bytes 与未知 driver command/pipeline 内存是不同成本。当前实现证据仅为 Windows 本地测试，
+不据此声明 Linux 或生产加速；普通 runtime 默认选择不变。
 
 ## 官方参考
 

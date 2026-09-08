@@ -20,7 +20,7 @@ APIs for the bounded operations below; discovery probes remain non-executing.
 | cuBLAS | Registered D1 provider | User CUDA environment | `ti.hardware.probe("cublas")` | Direct Python or root Graph; not kernel-callable |
 | cuSPARSE | Registered D1 provider | User CUDA environment | `ti.hardware.probe("cusparse")` | Domain auto/explicit or root Graph; not kernel-callable |
 | cuFFT | Registered D1 provider | User CUDA environment | `ti.hardware.probe("cufft")` | Explicit plan or root Graph; not kernel-callable |
-| VkFFT 1.3.4 | Optional ABI1 Vulkan JIT adapter | Current runtime build configuration; older artifacts may omit it | `ti.hardware.probe("vkfft")` or explicit library path | Fixed-storage `VulkanFftPlan` or root Graph; no FFT recipe search |
+| VkFFT 1.3.4 | Optional ABI1 Vulkan JIT adapter | Current runtime build configuration; older artifacts may omit it | `ti.hardware.probe("vkfft")` or explicit library path | Fixed-storage plan/root Graph; explicit batch and whole-Graph secondary recipes with matching extensions |
 | cuDSS 0.8.x | Registered bundled-adapter ABI | Forge adapter; user vendor runtime | `ti.hardware.probe("cudss", library_path=...)` | Domain auto/explicit or root Graph; not kernel-callable |
 | OptiX ABI 93/105/118 | Registered bundled-adapter ABI | Forge adapter; user/driver vendor runtime | `ti.hardware.probe("optix", library_path=...)` | Explicit scene/launch or root Graph; not kernel-callable |
 | Vulkan driver/ICD | D0 backend dependency, not a D1 provider | OS/GPU driver installation | `ti.init(arch=ti.vulkan)` plus capability queries | Kernel and documented native Vulkan APIs |
@@ -59,7 +59,7 @@ entry is declared for that operation; it does not prohibit application providers
 | Toolkit reset-monoid segmented scan | Existing `GraphBuilder.segmented_scan()` plus `CubSegmentedScanRecipeProvider(manifest_path)` from `taichi_forge.hardware.source_providers` | Optional source-provider addon; bounded i32/u32 sum and immutable segmented layout. Prepared capture, workspace and head-bitset lifetime form the physical recipe; the addon is not part of the portable runtime wheel. |
 | Other cuSPARSE / cuFFT / cuDSS expert operations | Existing explicit plans and documented root Graph recording | Recording alone does not provide a recipe generator. cuDSS root ordering must not be described as CUDA Graph capture. |
 | Shared-pattern sparse-solve region | `ti.linalg.record_sparse_solve(...)`, then `operation.prepare()` | Explicit `ti.hardware.linalg.SparseSolveRecipeProvider()` searches complete ordering/factor lifecycles with Graph-owned capture; separate from legacy root-ordered cuDSS recording. |
-| Vulkan VkFFT | Explicit fixed-storage plan or root Graph recording | Vulkan JIT/source adapter; no built-in complete FFT-recipe search or CUDA binding-frame integration is implied. |
+| Vulkan VkFFT | Fixed-storage plan/root Graph; explicit `VulkanFftRecipeProvider` | Batch scratch reuse plus Vulkan immutable secondary Graph recording; not CUDA binding frames or a vendor route axis. |
 | cuBLASLt matmul region | `ti.linalg.record_matmul(...)`, then `operation.prepare()` | CUDA compact scalar-f32, fixed shape and optional strided batch. Explicit `ti.hardware.linalg.MatmulRecipeProvider()` composes frozen algorithm/workspace choices, real operand packing, and separate/fused ReLU. The expert retained-plan API remains private. |
 | cuTENSOR contraction region | `ti.linalg.record_contraction(...)`, then `operation.prepare()` | Explicit `ti.hardware.tensor.ContractionRecipeProvider()` composes real input permutations and vendor/separate epilogues; includes retained workspace and immutable binding frames. |
 | cuSPARSELt shared-A region | `ti.linalg.record_sparse_matmul(...)`, then `operation.prepare()` | Explicit `ti.hardware.tensor.SparseMatmulRecipeProvider()` searches frozen algorithm/resource/epilogue dataflows; current A is compressed once per invocation, not cached across replays. |
@@ -1150,12 +1150,47 @@ are frozen per plan. A Graph binding must reference the original array.
 
 Plan creation may JIT and synchronize lookup-table initialization. Replay uses a
 retained secondary GPU command sequence with one root-ordered host call per FFT
-action; this is not enclosing native Graph capture, `ti.linalg.record_fft()`'s
-CUDA out-of-place contract, or a new CompileIQ route. Closing a plan rejects
+action by default; this is not enclosing native Graph capture or
+`ti.linalg.record_fft()`'s CUDA out-of-place contract. Closing a plan rejects
 future calls but already submitted command buffers retain their resources.
 Requested allocations exclude caller storage and opaque driver objects; neither
 closing the handle nor the initialization allocation peak proves device VRAM
 retirement/peak. No production speedup or all-driver compatibility is claimed.
+
+### Explicit Vulkan FFT recipe search
+
+Keep the original plans and their compact ndarrays open while freezing a Graph
+and searching it. Add `ti.hardware.fft.VulkanFftRecipeProvider()` alongside
+`ti.graph.default_recipe_providers()` in `definition.search_recipes(...)`.
+The existing complete-recipe evaluator, named metrics, report, checkpoint and
+`resolve_recipe()` interfaces apply unchanged; CompileIQ sees only complete IDs.
+
+The provider composes two physical mechanisms:
+
+- Independent FFT batches may share one tile's scratch, with a separate tail
+  application when needed. More repeated dispatches can cost device time; small
+  transforms may have no scratch saving at all. Tile choices remain internal.
+- A mixed, straight-line buffer Graph can be recorded as one secondary sequence
+  and embedded in the runtime's ordered primary. `Graph.bind()` prepares fixed
+  argument images and native commands once per published version. Replay does
+  not invoke Python FFT actions, reupload arguments, or create a separate queue
+  submission per segment. Raw mapping calls explicitly include preparation.
+
+Batch recipes require the adapter's optional recipe extension. Whole-Graph
+recording additionally requires its optional inline-record symbol and a matching
+native bridge; an older adapter is not silently treated as that physical recipe.
+One workspace lane and publication-qualified owned bindings are supported, not
+SNode/texture/host-return kernels or device-controlled Graph topology. Native
+command ownership retains arrays, argument images and FFT resources until their
+parent submission retires, including when a materialized Graph is closed early.
+
+New processes first rebuild equivalent baseline plans and storage, then resolve
+the selected recipe. Only selected partition plans are created at materialization;
+this is not FFT binary serialization or zero-cost baseline restoration. Caller
+baseline allocations, plan-requested scratch, per-binding argument bytes and
+unknown driver command/pipeline memory are distinct costs. Windows local tests
+cover the implementation; Linux and production performance are not qualified by
+those tests. Ordinary runtime selection is unchanged.
 
 ## Official references
 

@@ -174,7 +174,9 @@ class VulkanFftPlan:
     ``TI_VKFFT_LIBRARY_PATH``. Creation can compile shaders and initialize
     lookup tables. Execution submits no readback or host wait. Root Graphs
     retain a host call per FFT action, executing a pre-recorded GPU sequence;
-    this is not enclosing Graph capture or a searchable FFT recipe family.
+    this default path is not enclosing Graph capture. Explicitly add
+    ``VulkanFftRecipeProvider`` to complete-recipe search for batch workspace
+    strategies and immutable whole-Graph secondary recording.
     """
 
     graph_runtime_lifetime_check_required = False
