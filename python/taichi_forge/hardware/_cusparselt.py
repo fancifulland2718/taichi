@@ -183,6 +183,7 @@ class CusparseLtProvider:
                 "execution_abi_version": int(execution_api.execution_abi_version),
             }
         )
+        impl.get_runtime().register_runtime_object(self)
 
     @property
     def closed(self):
@@ -209,17 +210,27 @@ class CusparseLtProvider:
                     "CusparseLtProvider cannot close while matmul plans are live"
                 )
             runtime = self._runtime
-            self._runtime = None
             if runtime_generation_matches(self):
                 self._runtime_prog.synchronize()
-                try:
-                    runtime.close()
-                except RuntimeError as exc:
-                    self._runtime = runtime
-                    raise TaichiRuntimeError(str(exc)) from exc
+            try:
+                runtime.close()
+            except RuntimeError as exc:
+                raise TaichiRuntimeError(str(exc)) from exc
+            self._runtime = None
         return None
 
     destroy = close
+
+    def _invalidate_runtime(self):
+        with self._lock:
+            if self.closed:
+                return
+            self._runtime_prog.synchronize()
+            for plan in tuple(self._plans):
+                with plan._lock:
+                    plan._close_native()
+            self._runtime.close()
+            self._runtime = None
 
     def __enter__(self):
         self._validate_lifetime()
@@ -279,6 +290,9 @@ class CusparseLtMatmulPlan:
         self._runtime_prog = provider._runtime_prog
         self._runtime_generation = provider._runtime_generation
         self.m, self.n, self.k = dimensions
+        self._alignment_bytes = alignment_bytes
+        self._capture_leases = 0
+        self._capture_mode = None
         self.compressed_bytes = int(info.compressed_bytes)
         self.compression_buffer_bytes = int(info.compression_buffer_bytes)
         self.workspace_bytes = int(info.workspace_bytes)
@@ -318,6 +332,11 @@ class CusparseLtMatmulPlan:
 
         with self.provider._lock, self._lock:
             self._validate_lifetime()
+            if self._capture_leases:
+                raise TaichiRuntimeError(
+                    "cuSPARSELt compressed snapshot cannot change while capture leases are live; "
+                    "retire the recordings or use a new plan for the new weight epoch"
+                )
             _validate_array(a, (self.m, self.k), "A")
             resources = [a, self._compressed_a]
             if self._compression_buffer is not None:
@@ -396,25 +415,46 @@ class CusparseLtMatmulPlan:
                     raise TaichiRuntimeError(str(exc)) from exc
         return d
 
+    def record(self, *, a=None, b="b", c="c", d="d", alpha=1.0, beta=0.0):
+        """Record a retained matmul, optionally preceded by compression of A.
+
+        With a=None, compress() must have established a snapshot. It cannot be
+        overwritten until all recordings/Graphs release it. With a binding name,
+        A is compressed each replay; its current values must already satisfy 2:4.
+        B/C/D remain live bindings, C/D may alias. No implicit pruning or value
+        inspection is performed. Neither bind nor capture advances the math.
+        """
+        from taichi_forge.hardware._cusparselt_capture import CusparseLtCaptureRecording
+
+        return CusparseLtCaptureRecording(
+            self, a=a, b=b, c=c, d=d, alpha=alpha, beta=beta
+        )
+
     def close(self):
         with self.provider._lock, self._lock:
             if self._handle is None:
                 return None
-            handle = self._handle
-            self._handle = None
+            if self._capture_leases:
+                raise TaichiRuntimeError(
+                    "cuSPARSELt plan cannot close while capture leases are live"
+                )
             if runtime_generation_matches(self):
                 self._runtime_prog.synchronize()
-                try:
-                    self.provider._runtime.check_result(
-                        self.provider._execution_api.destroy_matmul_plan(handle)
-                    )
-                except RuntimeError as exc:
-                    self._handle = handle
-                    raise TaichiRuntimeError(str(exc)) from exc
-            self._compressed_a = None
-            self._compression_buffer = None
-            self._workspace = None
+                self._close_native()
         return None
+
+    def _close_native(self):
+        if self._handle is None:
+            return
+        try:
+            self.provider._runtime.check_result(
+                self.provider._execution_api.destroy_matmul_plan(self._handle)
+            )
+        except RuntimeError as exc:
+            raise TaichiRuntimeError(str(exc)) from exc
+        self._handle = None
+        self._compressed_a = self._compression_buffer = self._workspace = None
+        self._compressed_ready = False
 
     destroy = close
 

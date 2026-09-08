@@ -33,6 +33,7 @@
 #include "taichi/program/cuda_scan_capture.h"
 #include "taichi/program/cuda_cublaslt_capture.h"
 #include "taichi/program/cuda_cutensor_capture.h"
+#include "taichi/program/cuda_cusparselt_capture.h"
 #include "taichi/program/extension.h"
 #include "taichi/program/ndarray.h"
 #include "taichi/program/matrix.h"
@@ -611,6 +612,24 @@ void export_lang(py::module &m) {
                      &CudaCutensorCapturePlan::output_alias_compatible)
       .def_readwrite("alpha", &CudaCutensorCapturePlan::alpha)
       .def_readwrite("beta", &CudaCutensorCapturePlan::beta);
+
+  py::class_<CudaCusparseLtCapturePlan>(m, "_CudaCusparseLtCapturePlan")
+      .def(py::init<>())
+      .def_static("supports_binding_frames", []() { return true; })
+      .def_readwrite("compress_address", &CudaCusparseLtCapturePlan::compress_address)
+      .def_readwrite("execute_address", &CudaCusparseLtCapturePlan::execute_address)
+      .def_readwrite("handle", &CudaCusparseLtCapturePlan::handle)
+      .def_readwrite("m", &CudaCusparseLtCapturePlan::m)
+      .def_readwrite("n", &CudaCusparseLtCapturePlan::n)
+      .def_readwrite("k", &CudaCusparseLtCapturePlan::k)
+      .def_readwrite("compressed_bytes", &CudaCusparseLtCapturePlan::compressed_bytes)
+      .def_readwrite("compression_buffer_bytes",
+                     &CudaCusparseLtCapturePlan::compression_buffer_bytes)
+      .def_readwrite("workspace_bytes", &CudaCusparseLtCapturePlan::workspace_bytes)
+      .def_readwrite("alignment_bytes", &CudaCusparseLtCapturePlan::alignment_bytes)
+      .def_readwrite("recompress", &CudaCusparseLtCapturePlan::recompress)
+      .def_readwrite("alpha", &CudaCusparseLtCapturePlan::alpha)
+      .def_readwrite("beta", &CudaCusparseLtCapturePlan::beta);
 
   py::register_exception<TaichiTypeError>(m, "TaichiTypeError",
                                           PyExc_TypeError);
@@ -5353,6 +5372,9 @@ void export_lang(py::module &m) {
            py::arg("program"), py::arg("plan"), py::arg("arguments"))
       .def("_dispatch_cuda_cutensor_capture_recipe",
            &GraphBuilder::dispatch_cuda_capture_cutensor,
+           py::arg("program"), py::arg("plan"), py::arg("arguments"))
+      .def("_dispatch_cuda_cusparselt_capture_recipe",
+           &GraphBuilder::dispatch_cuda_capture_cusparselt,
            py::arg("program"), py::arg("plan"), py::arg("arguments"))
       .def("compile", &GraphBuilder::compile)
       .def("_enable_two_map_composer",
