@@ -184,7 +184,7 @@ class ValueBuilder {
 
   int flat_argument(const ArgLoadStmt *stmt, bool array) const {
     if (stmt == nullptr || stmt->arg_id.size() != 1 || stmt->arg_depth != 0 ||
-        stmt->is_ptr != array) {
+        stmt->is_ptr != array || stmt->create_load == array) {
       return -1;
     }
     const int id = stmt->arg_id[0];

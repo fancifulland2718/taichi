@@ -31,6 +31,7 @@
 #include "taichi/analysis/offline_cache_util.h"
 #include "taichi/program/graph_builder.h"
 #include "taichi/program/graph_value_program.h"
+#include "taichi/program/graph_value_fusion.h"
 #include "taichi/program/cuda_scan_capture.h"
 #include "taichi/program/cuda_cublaslt_capture.h"
 #include "taichi/program/cuda_cutensor_capture.h"
@@ -580,6 +581,24 @@ py::dict primitive_workspace_snapshot_to_dict(
 }  // namespace
 
 void export_lang(py::module &m) {
+  m.def("_compile_graph_segmented_reduce_values",
+        [](lang::Program &program, lang::Kernel *reduction,
+           const std::vector<lang::aot::Arg> &reduction_args,
+           lang::Kernel *producer, const std::vector<lang::aot::Arg> &producer_args,
+           lang::Kernel *consumer, const std::vector<lang::aot::Arg> &consumer_args,
+           int consumer_input) {
+          auto tree_guard = program.acquire_snode_tree_lifecycle_read_guard();
+          TI_ERROR_IF(reduction == nullptr || reduction->program != &program,
+                      "Graph value fusion requires the active source program");
+          return lang::compile_graph_segmented_reduce_values(
+              program.compile_config(), {reduction, reduction_args},
+              {producer, producer_args}, {consumer, consumer_args}, consumer_input);
+        }, py::keep_alive<0, 1>(), py::arg("program"), py::arg("reduction"),
+        py::arg("reduction_args"), py::arg("producer") = nullptr,
+        py::arg("producer_args") = std::vector<lang::aot::Arg>{},
+        py::arg("consumer") = nullptr,
+        py::arg("consumer_args") = std::vector<lang::aot::Arg>{},
+        py::arg("consumer_input") = -1);
   m.def("_graph_pointwise_value_program", [](lang::Kernel *kernel) {
     TI_ERROR_IF(kernel == nullptr, "Value-program query received a null kernel");
     auto tree_guard = kernel->program->acquire_snode_tree_lifecycle_read_guard();
@@ -6104,6 +6123,24 @@ void export_lang(py::module &m) {
       }, py::arg("enable_diagnostics") = true);
 
   py::class_<aot::CompiledGraph>(m, "CompiledGraph")
+      .def_property_readonly(
+          "_owned_jit_dispatch_sources", [](const py::object &owner) {
+            const auto &graph = owner.cast<const aot::CompiledGraph &>();
+            py::list sources;
+            for (const auto &dispatch : graph.dispatches) {
+              const bool owned = std::any_of(
+                  graph.owned_jit_kernels.begin(), graph.owned_jit_kernels.end(),
+                  [&](const auto &kernel) { return kernel.get() == dispatch.ti_kernel; });
+              TI_ERROR_IF(!owned, "Graph dispatch does not own a synthetic JIT kernel");
+              // Recording handles retain the original CompiledGraph, which
+              // owns the synthetic IR. No executable/Python deserialization.
+              sources.append(py::make_tuple(
+                  py::cast(dispatch.ti_kernel,
+                           py::return_value_policy::reference_internal, owner),
+                  dispatch.symbolic_args));
+            }
+            return sources;
+          })
       .def_property_readonly(
           "_has_dispatch_labels",
           [](const aot::CompiledGraph &graph) {
