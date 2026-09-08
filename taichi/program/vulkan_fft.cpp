@@ -35,6 +35,8 @@ class VulkanFftPlan : public vkapi::DeviceObj {
               !recipe_api.create || !recipe_api.describe,
           "Vulkan FFT recipe extension ABI is incompatible: {}", path);
     }
+    record_inline = reinterpret_cast<TiForgeVkfftRecordInlineFn>(
+        library.load_function_optional(TI_FORGE_VKFFT_RECORD_INLINE_SYMBOL));
   }
 
   ~VulkanFftPlan() override {
@@ -46,6 +48,7 @@ class VulkanFftPlan : public vkapi::DeviceObj {
   DynamicLoader library;
   TiForgeVkfftApi api{};
   TiForgeVkfftRecipeApi recipe_api{};
+  TiForgeVkfftRecordInlineFn record_inline{nullptr};
   TiForgeVkfftPlan handle{};
   std::shared_ptr<void> storage_lease;
   vkapi::IVkBuffer buffer;
@@ -224,9 +227,15 @@ class VulkanFftGraphCommand final : public gfx::ExternalGraphCommand {
     TI_ASSERT(plan && plan->public_open);
     auto *list = static_cast<vulkan::VulkanCommandList *>(commands);
     const auto command = list->begin_external_compute(plan);
-    TI_ERROR_IF(plan->api.append(plan->handle, command) != 0,
-                "Vulkan FFT Graph command recording failed: {}",
+    const auto result = plan->record_inline
+                            ? plan->record_inline(plan->handle, command)
+                            : plan->api.append(plan->handle, command);
+    TI_ERROR_IF(result != 0, "Vulkan FFT Graph command recording failed: {}",
                 plan->api.last_error());
+  }
+  bool supports_inline_recording() const override {
+    const auto plan = plan_.lock();
+    return plan && plan->record_inline;
   }
 
  private:
@@ -263,6 +272,7 @@ Program::vulkan_fft_plan_statistics(std::uint64_t handle) {
       {"persistent_allocation_count", memory.persistent_allocation_count},
       {"temporary_buffer_bytes", memory.temporary_buffer_bytes},
       {"adapter_abi", plan->api.abi_version},
+      {"inline_recording_available", plan->record_inline ? 1 : 0},
       {"vkfft_version", plan->api.vkfft_version},
       {"glslang_major", plan->api.glslang_major},
       {"glslang_minor", plan->api.glslang_minor},

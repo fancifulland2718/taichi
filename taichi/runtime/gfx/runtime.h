@@ -86,6 +86,7 @@ struct GraphReplayStats {
   GraphReplayLastPath last_path{GraphReplayLastPath::none};
   GraphReplayFallbackReason last_fallback_reason{
       GraphReplayFallbackReason::none};
+  bool fixed_secondary{false};
 };
 
 class TI_DLL_EXPORT GraphReplayRegistration {
@@ -305,6 +306,7 @@ class TI_DLL_EXPORT GfxRuntime {
     GraphDispatch dispatch;
     // Cold-only append of an already-owned external command. Empty for kernels.
     std::function<void(Device *, CommandList *)> external;
+    bool inline_recording{false};
   };
 
   enum class GraphStructuredStrategy : std::uint32_t {
@@ -489,6 +491,9 @@ class TI_DLL_EXPORT GfxRuntime {
 
   struct GraphReplayState {
     GraphReplayExecutable executable;
+    std::function<void()> fixed_submit;
+    std::uint64_t fixed_argument_bytes{0};
+    bool fixed_secondary{false};
     uint64_t attempts{0};
     uint64_t recorded{0};
     uint64_t replayed{0};

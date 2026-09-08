@@ -103,7 +103,14 @@ typedef struct TiForgeVkfftRecipeApi {
 
 typedef int (*TiForgeVkfftRecipeQueryFn)(uint32_t,
                                          size_t,
-                                         TiForgeVkfftRecipeApi *);
+                                       TiForgeVkfftRecipeApi *);
+
+// Optional cold-only recording seam, sharing the base ABI1 plan handle. It
+// emits dispatches inline, enabling an enclosing secondary command buffer
+// without requiring Vulkan nested-command-buffer extensions. Never call from
+// replay. The caller serializes plan access and owns surrounding barriers.
+#define TI_FORGE_VKFFT_RECORD_INLINE_SYMBOL "taichi_forge_vkfft_record_inline"
+typedef int (*TiForgeVkfftRecordInlineFn)(TiForgeVkfftPlan, VkCommandBuffer);
 
 #if defined(TI_FORGE_VKFFT_PROVIDER_BUILD)
 #if defined(_WIN32)
@@ -119,6 +126,8 @@ TI_FORGE_VKFFT_EXPORT int taichi_forge_vkfft_recipe_query(
     uint32_t abi,
     size_t size,
     TiForgeVkfftRecipeApi *api);
+TI_FORGE_VKFFT_EXPORT int taichi_forge_vkfft_record_inline(TiForgeVkfftPlan plan,
+                                                         VkCommandBuffer command);
 #endif
 
 #ifdef __cplusplus

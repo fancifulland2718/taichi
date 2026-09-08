@@ -52,12 +52,16 @@ def test_vulkan_fixed_graph_preparation_does_not_execute_and_frames_are_immutabl
         native,
     ]
     bindings = {"data": data.arr, "factor": 2.0}
+    frozen_plan_facts = forward.statistics()
     first = core._prepare_vulkan_graph_recording(program, sources, bindings)
     bindings["factor"] = 3.0
     second = core._prepare_vulkan_graph_recording(program, sources, bindings)
     np.testing.assert_array_equal(data.to_numpy(), values)
     assert first.argument_bytes() > 0
     assert first.argument_bytes() == second.argument_bytes()
+    assert first.uses_secondary_commands()
+    assert second.uses_secondary_commands()
+    assert forward.statistics() == frozen_plan_facts
     argument_bytes = first.argument_bytes()
     # Recorded resources, not the mutable open-plan table or source Graph,
     # own execution. This is distinct from legacy plan.run()/root Graph.
@@ -75,10 +79,12 @@ def test_vulkan_fixed_graph_preparation_does_not_execute_and_frames_are_immutabl
     monkeypatch.setattr(_vulkan_fft.VulkanFftPlan, "statistics", unexpected)
     monkeypatch.setattr(core, "_prepare_vulkan_graph_recording", unexpected)
     first.run()
+    # A primary kernel after the embedded segment must rebind its pipeline.
+    kernel_graph.run({"data": data, "factor": 0.5})
     second.run()
     first.run()
     np.testing.assert_allclose(
-        data.to_numpy(), values * 4 * 9 * 4, atol=0.003, rtol=5e-5
+        data.to_numpy(), values * 4 * 0.5 * 9 * 4, atol=0.003, rtol=5e-5
     )
     assert first.argument_bytes() == argument_bytes
     first.close()
@@ -122,6 +128,7 @@ def test_vulkan_fixed_graph_close_retains_pending_commands_and_reset_invalidates
     recording = core._prepare_vulkan_graph_recording(
         program, sources, {"data": data.arr, "factor": 4.0}
     )
+    assert recording.uses_secondary_commands()
     recording.run()
     recording.close()
     np.testing.assert_array_equal(data.to_numpy(), values * 4)

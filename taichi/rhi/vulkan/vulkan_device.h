@@ -601,6 +601,9 @@ class VulkanCommandList : public CommandList {
   // External compute recording changes the bound pipeline. Keep the external
   // objects with the command buffer and invalidate only recording-time state.
   VkCommandBuffer begin_external_compute(vkapi::IDeviceObj owner);
+  void execute_secondary(vkapi::IVkCommandBuffer buffer);
+  std::function<void(CommandList *)> finalize_secondary(
+      std::shared_ptr<void> resource_owner) override;
 
   // Profiler support
   void begin_profiler_scope(const std::string &kernel_name) override;
@@ -783,6 +786,7 @@ class VulkanStream : public Stream {
   ~VulkanStream() override;
 
   RhiResult new_command_list(CommandList **out_cmdlist) noexcept final;
+  std::unique_ptr<CommandList> new_secondary_command_list() override;
   StreamSemaphore submit(
       CommandList *cmdlist,
       const std::vector<StreamSemaphore> &wait_semaphores = {}) override;

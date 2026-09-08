@@ -62,6 +62,10 @@ std::uint64_t FixedGraphRecording::argument_bytes() const {
              ? registration_->snapshot_stats().known_persistent_argument_bytes
              : 0;
 }
+bool FixedGraphRecording::uses_secondary_commands() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return registration_ && registration_->snapshot_stats().fixed_secondary;
+}
 }  // namespace taichi::lang::gfx
 
 namespace taichi::lang {
@@ -150,7 +154,7 @@ Program::create_vulkan_graph_recording(
       operations.push_back(
           {{}, [command](Device *device, CommandList *commands) {
              command->record(device, commands);
-           }});
+           }, command->supports_inline_recording()});
     }
   }
   auto registration =

@@ -5772,6 +5772,8 @@ void export_lang(py::module &m) {
       .def("run", &gfx::FixedGraphRecording::run, py::call_guard<py::gil_scoped_release>())
       .def("close", &gfx::FixedGraphRecording::close, py::call_guard<py::gil_scoped_release>())
       .def("argument_bytes", &gfx::FixedGraphRecording::argument_bytes,
+           py::call_guard<py::gil_scoped_release>())
+      .def("uses_secondary_commands", &gfx::FixedGraphRecording::uses_secondary_commands,
            py::call_guard<py::gil_scoped_release>());
   m.def("_prepare_vulkan_graph_recording",
         [with_graph_arguments](Program &program, const py::list &sources, const py::dict &args) {

@@ -2448,6 +2448,9 @@ GfxRuntime::GraphReplayExecutable::known_persistent_argument_bytes() const {
 }
 
 void GfxRuntime::GraphReplayState::reset() {
+  fixed_submit = {};
+  fixed_argument_bytes = 0;
+  fixed_secondary = false;
   executable.reset();
   attempts = 0;
   recorded = 0;
@@ -2570,7 +2573,8 @@ GraphReplayStats GfxRuntime::debug_graph_replay_stats(
       state.structural_fallbacks,
       state.runtime_mode_fallbacks,
       state.slot_saturation_fallbacks,
-      state.executable.known_persistent_argument_bytes(),
+      state.fixed_submit ? state.fixed_argument_bytes
+                         : state.executable.known_persistent_argument_bytes(),
       state.effect_reads,
       state.effect_writes,
       state.dependency_barriers,
@@ -2579,6 +2583,7 @@ GraphReplayStats GfxRuntime::debug_graph_replay_stats(
       state.rar_elisions,
       state.last_path,
       state.last_fallback_reason,
+      state.fixed_secondary,
   };
   state.diagnostics_enabled = true;
   return result;
@@ -2601,7 +2606,8 @@ GraphReplayStats GfxRuntime::snapshot_graph_replay_stats(
       state.structural_fallbacks,
       state.runtime_mode_fallbacks,
       state.slot_saturation_fallbacks,
-      state.executable.known_persistent_argument_bytes(),
+      state.fixed_submit ? state.fixed_argument_bytes
+                         : state.executable.known_persistent_argument_bytes(),
       state.effect_reads,
       state.effect_writes,
       state.dependency_barriers,
@@ -2610,6 +2616,7 @@ GraphReplayStats GfxRuntime::snapshot_graph_replay_stats(
       state.rar_elisions,
       state.last_path,
       state.last_fallback_reason,
+      state.fixed_secondary,
   };
 }
 
@@ -2681,8 +2688,8 @@ std::unique_ptr<GraphReplayRegistration> GfxRuntime::prepare_fixed_graph(
   GraphReplayState state;
   auto &executable = state.executable;
   executable.bind_device(device_);
-  executable.slots.resize(1);
-  auto &slot = executable.slots.front();
+  auto payload = std::make_shared<GraphReplayExecutable::Slot>();
+  auto &slot = *payload;
   slot.retained_owners = std::move(owners);
   std::vector<GraphReplayExecutable::PreparedDispatch> prepared;
   for (const auto &operation : operations) {
@@ -2748,10 +2755,21 @@ std::unique_ptr<GraphReplayRegistration> GfxRuntime::prepare_fixed_graph(
       blitter->host_to_device(*pd.any_arrays, {}, {});
     }
   }
-  auto [commands, status] =
-      device_->get_compute_stream()->new_command_list_unique();
-  TI_ERROR_IF(status != RhiResult::success,
-              "Prepared Vulkan Graph command allocation failed");
+  std::unique_ptr<CommandList> commands;
+  if (std::all_of(operations.begin(), operations.end(),
+                  [](const auto &operation) {
+                    return !operation.external || operation.inline_recording;
+                  })) {
+    commands = device_->get_compute_stream()->new_secondary_command_list();
+  }
+  state.fixed_secondary = bool(commands);
+  if (!commands) {
+    auto [primary, status] =
+        device_->get_compute_stream()->new_command_list_unique();
+    TI_ERROR_IF(status != RhiResult::success,
+                "Prepared Vulkan Graph command allocation failed");
+    commands = std::move(primary);
+  }
   commands->memory_barrier();
   std::size_t kernel_index = 0;
   for (const auto &operation : operations) {
@@ -2780,8 +2798,35 @@ std::unique_ptr<GraphReplayRegistration> GfxRuntime::prepare_fixed_graph(
       slot.resource_sets.push_back(std::move(resources));
     }
   }
-  slot.cmdlist = std::move(commands);
-  slot.recorded = true;
+  for (auto bytes : slot.args_buffer_sizes) {
+    state.fixed_argument_bytes += bytes;
+  }
+  if (state.fixed_secondary) {
+    // payload.cmdlist deliberately stays empty: commands retain the payload,
+    // never the reverse. This makes close-before-submission safe without
+    // cycles.
+    auto append = commands->finalize_secondary(std::move(payload));
+    TI_ERROR_IF(!append, "Secondary Graph command finalization is unsupported");
+    // The enclosing primary command owns the secondary and its complete
+    // resource payload until retirement. No per-replay owner allocation,
+    // fence poll, queue submit or semaphore is needed for this append.
+    state.fixed_submit = [this, append = std::move(append)] {
+      ensure_current_cmdlist();
+      insert_pending_dispatch_barriers();
+      append(current_cmdlist_.get());
+    };
+  } else {
+    slot.cmdlist = std::move(commands);
+    slot.recorded = true;
+    executable.slots.push_back(std::move(slot));
+    auto *primary_slot = &executable.slots.front();
+    state.fixed_submit = [this, primary_slot] {
+      flush_if_pending();
+      primary_slot->completion =
+          device_->get_compute_stream()->submit(primary_slot->cmdlist.get());
+      latest_compute_completion_ = primary_slot->completion;
+    };
+  }
   state.last_path = GraphReplayLastPath::record;
   graph_replay_states_.emplace(registration->replay_key(), std::move(state));
   return registration;
@@ -2789,14 +2834,11 @@ std::unique_ptr<GraphReplayRegistration> GfxRuntime::prepare_fixed_graph(
 
 void GfxRuntime::launch_prepared_graph(std::uint64_t replay_key) {
   std::lock_guard<std::recursive_mutex> lock(host_api_mutex_);
-  auto &slot = graph_replay_states_.at(replay_key).executable.slots.front();
   // Fixed argument images, commands and owners: no signature building,
   // descriptor updates, per-dispatch preparation, observation or ready-slot
   // poll. Same ordered queue permits simultaneous reuse of the immutable
   // command list.
-  flush_if_pending();
-  slot.completion = device_->get_compute_stream()->submit(slot.cmdlist.get());
-  latest_compute_completion_ = slot.completion;
+  graph_replay_states_.at(replay_key).fixed_submit();
 }
 
 bool GfxRuntime::try_launch_graph(

@@ -173,6 +173,37 @@ bool supported_size(uint64_t size) {
   return size == 1;
 }
 
+int record_plan_commands(Plan &plan, VkCommandBuffer command) {
+  const auto &config = plan.config;
+  const uint64_t tile = plan.facts.batch_tile;
+  VkFFTLaunchParams launch{};
+  launch.commandBuffer = &command;
+  for (uint64_t first = 0; first < config.batches; first += tile) {
+    const bool is_tail = config.batches - first < tile;
+    auto &application = *plan.applications[is_tail ? 1 : 0];
+    launch.bufferOffset = first * (config.buffer_bytes / config.batches);
+    const auto result =
+        VkFFTAppend(&application.fft, config.direction, &launch);
+    if (result != VKFFT_SUCCESS) {
+      return fail("VkFFTAppend during plan recording", result);
+    }
+    // Only full tiles reuse writable scratch. VkFFT already emits its own
+    // per-dispatch write-to-read barriers; disjoint slices need no extra one.
+    if (application.fft.configuration.allocateTempBuffer &&
+        (config.batches - first) / tile > 1) {
+      VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+      barrier.srcAccessMask =
+          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      barrier.dstAccessMask =
+          VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+      vkCmdPipelineBarrier(command, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &barrier,
+                           0, nullptr, 0, nullptr);
+    }
+  }
+  return 0;
+}
+
 int create_recipe_plan(const TiForgeVkfftConfig *config,
                        const TiForgeVkfftRecipeConfig *recipe,
                        TiForgeVkfftPlan *out) {
@@ -284,32 +315,8 @@ int create_recipe_plan(const TiForgeVkfftConfig *config,
     if (result != VK_SUCCESS) {
       return fail("vkBeginCommandBuffer", result);
     }
-    VkFFTLaunchParams launch{};
-    launch.commandBuffer = &plan->executable;
-    for (uint64_t first = 0; first < config->batches; first += tile) {
-      const bool is_tail = config->batches - first < tile;
-      auto &application = *plan->applications[is_tail ? 1 : 0];
-      launch.bufferOffset = first * (bytes / config->batches);
-      const auto record_result =
-          VkFFTAppend(&application.fft, config->direction, &launch);
-      if (record_result != VKFFT_SUCCESS) {
-        return fail("VkFFTAppend during plan recording", record_result);
-      }
-      // Full tiles share writable scratch; the tail owns another application.
-      // Disjoint slices without scratch need no additional GPU dependency.
-      // VkFFT already emits its own per-dispatch write-to-read barriers.
-      if (application.fft.configuration.allocateTempBuffer &&
-          (config->batches - first) / tile > 1) {
-        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-        barrier.srcAccessMask =
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        barrier.dstAccessMask =
-            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-        vkCmdPipelineBarrier(plan->executable,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
-                             &barrier, 0, nullptr, 0, nullptr);
-      }
+    if (const auto record_result = record_plan_commands(*plan, plan->executable)) {
+      return record_result;
     }
     result = vkEndCommandBuffer(plan->executable);
     if (result != VK_SUCCESS) {
@@ -393,4 +400,13 @@ int taichi_forge_vkfft_recipe_query(uint32_t abi,
   *api = {sizeof(*api), TI_FORGE_VKFFT_RECIPE_ABI_VERSION, create_recipe_plan,
           describe_plan};
   return 0;
+}
+
+int taichi_forge_vkfft_record_inline(TiForgeVkfftPlan handle,
+                                     VkCommandBuffer command) {
+  // The observation hooks are cold-only. Do not mutate the frozen plan facts
+  // when another complete Graph records the same application sequence.
+  TiForgeVkfftRecipeFacts observations{};
+  FactsScope scope(observations);
+  return record_plan_commands(*static_cast<Plan *>(handle), command);
 }

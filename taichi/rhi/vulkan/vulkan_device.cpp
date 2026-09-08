@@ -1055,6 +1055,12 @@ VulkanCommandList::VulkanCommandList(VulkanDevice *ti_device,
   info.pInheritanceInfo = nullptr;
   info.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
 
+  VkCommandBufferInheritanceInfo inheritance{
+      VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
+  if (buffer->level == VK_COMMAND_BUFFER_LEVEL_SECONDARY) {
+    info.pInheritanceInfo = &inheritance;
+  }
+
   vkBeginCommandBuffer(buffer->buffer, &info);
 }
 
@@ -1496,6 +1502,28 @@ VkCommandBuffer VulkanCommandList::begin_external_compute(
   buffer_->refs.push_back(std::move(owner));
   current_pipeline_ = nullptr;
   return buffer_->buffer;
+}
+
+void VulkanCommandList::execute_secondary(vkapi::IVkCommandBuffer buffer) {
+  buffer_->refs.push_back(buffer);
+  current_pipeline_ = nullptr;
+  vkCmdExecuteCommands(buffer_->buffer, 1, &buffer->buffer);
+}
+
+std::function<void(CommandList *)> VulkanCommandList::finalize_secondary(
+    std::shared_ptr<void> resource_owner) {
+  struct Resources : vkapi::DeviceObj {
+    std::shared_ptr<void> owner;
+  };
+  auto buffer = finalize();
+  TI_ERROR_IF(buffer->level != VK_COMMAND_BUFFER_LEVEL_SECONDARY,
+              "Only secondary commands may be finalized for embedding");
+  auto resources = std::make_shared<Resources>();
+  resources->owner = std::move(resource_owner);
+  buffer->refs.push_back(std::move(resources));
+  return [buffer = std::move(buffer)](CommandList *parent) {
+    static_cast<VulkanCommandList *>(parent)->execute_secondary(buffer);
+  };
 }
 
 void VulkanCommandList::set_next_renderpass_color_final_layout(
@@ -3219,6 +3247,13 @@ RhiResult VulkanStream::new_command_list(CommandList **out_cmdlist) noexcept {
 
   *out_cmdlist = new VulkanCommandList(&device_, this, buffer);
   return RhiResult::success;
+}
+
+std::unique_ptr<CommandList> VulkanStream::new_secondary_command_list() {
+  auto buffer = vkapi::allocate_command_buffer(
+      command_pool_, VK_COMMAND_BUFFER_LEVEL_SECONDARY);
+  TI_ERROR_IF(!buffer, "Vulkan secondary command allocation failed");
+  return std::make_unique<VulkanCommandList>(&device_, this, std::move(buffer));
 }
 
 void VulkanStream::retire_completed_cmdbuffers() {

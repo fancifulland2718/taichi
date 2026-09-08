@@ -5,6 +5,7 @@
 #include <assert.h>
 #include <cstdint>
 #include <memory>
+#include <functional>
 #include <limits>
 
 // https://gcc.gnu.org/wiki/Visibility
@@ -438,6 +439,14 @@ struct ImageBlitParams {
 
 class RHI_DLL_EXPORT CommandList {
  public:
+  // Optional cold finalization of a secondary compute command list. The
+  // returned appender records into a primary on the same device/stream family
+  // outside a render pass. Each parent retains the commands and resource owner
+  // until completion; the owner must not reference this command list.
+  virtual std::function<void(CommandList *)> finalize_secondary(
+      std::shared_ptr<void> resource_owner) {
+    return {};
+  }
   virtual ~CommandList() {
   }
 
@@ -813,6 +822,10 @@ using StreamGpuTiming = std::shared_ptr<StreamGpuTimingObject>;
 
 class RHI_DLL_EXPORT Stream {
  public:
+  // Unsupported backends return null without altering their primary path.
+  virtual std::unique_ptr<CommandList> new_secondary_command_list() {
+    return nullptr;
+  }
   virtual ~Stream() {
   }
 

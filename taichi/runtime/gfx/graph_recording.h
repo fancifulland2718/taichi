@@ -19,6 +19,9 @@ class TI_DLL_EXPORT ExternalGraphCommand {
       Program &program,
       const std::unordered_map<std::string, aot::IValue> &args) const = 0;
   virtual void record(Device *device, CommandList *commands) const = 0;
+  virtual bool supports_inline_recording() const {
+    return false;
+  }
 };
 
 struct GraphRecordingSource {
@@ -35,6 +38,7 @@ class TI_DLL_EXPORT FixedGraphRecording {
   void run();
   void close();
   std::uint64_t argument_bytes() const;
+  bool uses_secondary_commands() const;
 
  private:
   Program *program_;
