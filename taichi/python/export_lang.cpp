@@ -5391,6 +5391,10 @@ void export_lang(py::module &m) {
            &GraphBuilder::dispatch_cuda_capture_cudss,
            py::arg("program"), py::arg("handle"), py::arg("numeric_phase"),
            py::arg("arguments"))
+      .def("_dispatch_cuda_cudss_capture_group",
+           &GraphBuilder::dispatch_cuda_capture_cudss,
+           py::arg("program"), py::arg("handle"), py::arg("numeric_phase"),
+           py::arg("arguments"))
       .def("compile", &GraphBuilder::compile)
       .def("_enable_two_map_composer",
            &GraphBuilder::enable_two_map_composer)

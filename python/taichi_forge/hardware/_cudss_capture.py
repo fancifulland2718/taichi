@@ -53,7 +53,12 @@ class _CaptureRecipe(_CudaGraphCaptureRecipe):
 
         plan = self.lease.plan
         plan._ensure_open()
-        builder._dispatch_cuda_cudss_capture_recipe(
+        dispatch = (
+            builder._dispatch_cuda_cudss_capture_group
+            if len(self.names) > (2 if self.phase == "solve" else 3)
+            else builder._dispatch_cuda_cudss_capture_recipe
+        )
+        dispatch(
             program,
             plan._handle,
             _PHASES[self.phase],
@@ -92,7 +97,14 @@ class CudssCaptureRecording(BackendCommandRecording):
     )
 
     def __init__(
-        self, plan, *, phase, values="matrix_values", rhs="rhs", solution="solution"
+        self,
+        plan,
+        *,
+        phase,
+        values="matrix_values",
+        rhs="rhs",
+        solution="solution",
+        _rhs_pairs=None,
     ):
         if not isinstance(plan, CudssPlan) or phase not in _PHASES:
             raise TypeError("cuDSS capture needs a prepared plan and numerical phase")
@@ -100,7 +112,22 @@ class CudssCaptureRecording(BackendCommandRecording):
             raise TaichiRuntimeError(
                 "cuDSS capture requires native Graph-owned plan support"
             )
-        names = (rhs, solution) if phase == "solve" else (values, rhs, solution)
+        pairs = (
+            ((rhs, solution),)
+            if _rhs_pairs is None
+            else tuple(tuple(p) for p in _rhs_pairs)
+        )
+        if not pairs or any(len(p) != 2 for p in pairs):
+            raise ValueError("cuDSS capture requires RHS/solution binding pairs")
+        if len(pairs) > 1 and not hasattr(
+            core.GraphBuilder, "_dispatch_cuda_cudss_capture_group"
+        ):
+            raise TaichiRuntimeError(
+                "cuDSS shared-factor groups require native group capture support"
+            )
+        names = (() if phase == "solve" else (values,)) + tuple(
+            name for p in pairs for name in p
+        )
         if any(not isinstance(name, str) or not name for name in names) or len(
             set(names)
         ) != len(names):
@@ -108,12 +135,13 @@ class CudssCaptureRecording(BackendCommandRecording):
         super().__init__(
             backend="cuda",
             binding_names=names,
-            command_count=1 if phase == "solve" else 2,
+            command_count=len(pairs) + (phase != "solve"),
             workspace_ownership="provider_generation",
             replay_mode="stream_capture",
         )
         object.__setattr__(self, "plan", plan)
         object.__setattr__(self, "phase", phase)
+        object.__setattr__(self, "_rhs_pairs", pairs)
         object.__setattr__(self, "_lease", _PlanLease(plan))
         object.__setattr__(self, "_cuda_capture_recipe", _CaptureRecipe(self))
         identity = make_retained_plan_identity(
@@ -129,6 +157,8 @@ class CudssCaptureRecording(BackendCommandRecording):
             },
             execution_scope={
                 "numeric_phase": phase,
+                "rhs_count": len(pairs),
+                "factor_reuse": "all_rhs_in_region",
                 "plan_handle": plan._handle,
                 "configuration": plan._configuration_report()["configuration"],
                 "capture": "retained_private_snapshot",
@@ -155,16 +185,13 @@ class CudssCaptureRecording(BackendCommandRecording):
 
     @property
     def resource_effects(self):
+        outputs = {pair[1] for pair in self._rhs_pairs}
         return tuple(
             ResourceEffect(
                 name,
-                (
-                    GraphAccess.WRITE
-                    if i == len(self.binding_names) - 1
-                    else GraphAccess.READ
-                ),
+                (GraphAccess.WRITE if name in outputs else GraphAccess.READ),
             )
-            for i, name in enumerate(self.binding_names)
+            for name in self.binding_names
         ) + (static_resource_effect(self.plan._effect_name, GraphAccess.READ_WRITE),)
 
     def _graph_provider_memory_identity(self):

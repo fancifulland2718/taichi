@@ -5,6 +5,7 @@ from taichi_forge.linalg._fft import record_fft
 from taichi_forge.linalg._matmul import record_matmul
 from taichi_forge.linalg._contraction import record_contraction
 from taichi_forge.linalg._sparse_matmul import record_sparse_matmul
+from taichi_forge.linalg._sparse_solve import record_sparse_solve
 from taichi_forge.linalg._runtime import (
     LinearOperator,
     OperatorCapabilities,

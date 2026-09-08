@@ -739,7 +739,8 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
                     void *values,
                     void *rhs,
                     void *solution,
-                    void *stream) {
+                    void *stream,
+                    bool update_factors = true) {
     std::lock_guard<std::mutex> lock(mutex_);
     TI_ERROR_IF(closed_ || !graph_owned_ || !factorized_ ||
                     graph_numeric_phase_ != phase,
@@ -758,7 +759,7 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
                                 phase ? values : seed_buffers_[2]),
           "capture matrix binding");
       bind_dense_vectors(rhs, solution);
-      if (phase) {
+      if (phase && update_factors) {
         require_cudss_success(api.execute(runtime, context_, phase, config_,
                                           data_, matrix_, solution_, rhs_),
                               "captured numerical factorization");
@@ -1035,8 +1036,10 @@ class CudaCudssCaptureCommand final : public aot::CudaGraphCaptureCommand {
       : program_(program), phase_(phase), arguments_(arguments) {
     TI_ERROR_IF(!program || program->compile_config().arch != Arch::cuda,
                 "cuDSS capture requires a CUDA Program.");
-    TI_ERROR_IF(arguments.size() != (phase ? 3 : 2),
-                "cuDSS capture bindings do not match the numerical phase.");
+    const std::size_t offset = phase ? 1 : 0;
+    TI_ERROR_IF(
+        arguments.size() < offset + 2 || (arguments.size() - offset) % 2,
+        "cuDSS capture bindings do not match the numerical phase.");
     for (std::size_t i = 0; i < arguments.size(); ++i) {
       const auto &arg = arguments[i];
       TI_ERROR_IF(arg.tag != aot::ArgKind::kNdarray ||
@@ -1112,20 +1115,26 @@ class CudaCudssCaptureCommand final : public aot::CudaGraphCaptureCommand {
     auto &driver = CUDADriver::get_instance();
     driver.stream_get_capture_info_v2(stream, &capture_status, nullptr, &graph,
                                       nullptr, nullptr);
-    const auto previous =
-        capture_status == 1 ? graph_nodes(graph) : std::vector<void *>{};
-    const std::unordered_set<void *> previous_nodes(previous.begin(),
-                                                    previous.end());
     const auto pointer = [&](std::size_t i) {
       return reinterpret_cast<void *>(
           program.get_ndarray_data_ptr_as_int(array(i, args)));
     };
-    owner_->record_graph(phase_, phase_ ? pointer(0) : nullptr,
-                         pointer(phase_ ? 1 : 0), pointer(phase_ ? 2 : 1),
-                         stream);
     if (capture_status == 1) {
       capture_inputs_ =
           std::make_shared<std::vector<std::vector<std::uint8_t>>>();
+    }
+    const std::size_t offset = phase_ ? 1 : 0;
+    for (std::size_t i = offset; i < arguments_.size(); i += 2) {
+      const auto previous =
+          capture_status == 1 ? graph_nodes(graph) : std::vector<void *>{};
+      const std::unordered_set<void *> previous_nodes(previous.begin(),
+                                                      previous.end());
+      owner_->record_graph(phase_, phase_ ? pointer(0) : nullptr, pointer(i),
+                           pointer(i + 1), stream, i == offset);
+      if (capture_status != 1)
+        continue;
+      // Freeze each RHS's vendor staging before recording the next one.
+      // One numerical update serves every RHS in this complete region.
       for (auto *node : graph_nodes(graph)) {
         if (previous_nodes.count(node))
           continue;

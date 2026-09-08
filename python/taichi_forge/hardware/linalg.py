@@ -3,6 +3,7 @@
 from taichi_forge.hardware._amgx import AmgxProvider, AmgxSolver
 from taichi_forge.hardware._spmm_recipe import SparseSpmmRecipeProvider
 from taichi_forge.hardware._matmul_recipe import MatmulRecipeProvider
+from taichi_forge.hardware._sparse_solve_recipe import SparseSolveRecipeProvider
 from taichi_forge.hardware._linalg import (
     CudssPlan,
     CudssRefactorSolveRecording,
@@ -30,6 +31,7 @@ __all__ = [
     "AmgxProvider",
     "AmgxSolver",
     "SparseSpmmRecipeProvider",
+    "SparseSolveRecipeProvider",
     "MatmulRecipeProvider",
     "CudssPlan",
     "CudssRefactorSolveRecording",
