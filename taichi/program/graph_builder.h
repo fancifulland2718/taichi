@@ -13,6 +13,7 @@ class Kernel;
 class GraphBuilder;
 class SparseMatrix;
 class CuSparseMatrix;
+struct CudaCublasLtCapturePlan;
 
 class Node {
  public:
@@ -235,6 +236,11 @@ class GraphBuilder {
       const std::vector<aot::Arg> &arguments);
 
   Sequential *seq() const;
+
+  void dispatch_cuda_capture_cublaslt(
+      Program *program,
+      const CudaCublasLtCapturePlan &plan,
+      const std::vector<aot::Arg> &arguments);
 
   void dispatch_cuda_capture_scan(Program *program,
                                   const aot::Arg &values,

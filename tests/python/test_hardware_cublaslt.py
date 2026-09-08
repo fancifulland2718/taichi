@@ -1,4 +1,6 @@
 import os
+import gc
+import weakref
 
 import numpy as np
 import pytest
@@ -162,14 +164,121 @@ def test_cublaslt_retained_strided_batch_and_transpose():
 def test_cublaslt_reset_closes_runtime_handle_and_plan():
     provider = _provider_or_skip()
     plan = provider.plan(8, 8, 8)
+    another = provider.plan(4, 4, 4)
+    capture = another._capture()
     a = ti.ndarray(ti.f32, shape=(8, 8))
     b = ti.ndarray(ti.f32, shape=(8, 8))
     output = ti.ndarray(ti.f32, shape=(8, 8))
     plan.run(a=a, b=b, output=output)
 
+    # Distinct resource owners can have identical inherited recording fields.
+    # Both must remain in the provider's weak registry.
+    assert len(provider._plans) == 2
+    plan.close()
+    with pytest.raises(RuntimeError, match="plans are live"):
+        provider.close()
+
     ti.reset()
 
     assert plan.closed
+    assert another.closed and capture.plan.closed
     assert provider.closed
     with pytest.raises(RuntimeError, match="previous Taichi runtime generation"):
         plan.run(a=a, b=b, output=output)
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+@pytest.mark.parametrize("batch", (1, 3))
+def test_cublaslt_capture_feedback_and_plan_leases(batch, monkeypatch):
+    from taichi_forge.hardware._cublaslt_capture import _MatmulCaptureRecipe
+
+    provider = _provider_or_skip()
+    rows, columns, inner = (512, 512, 512) if batch == 1 else (17, 9, 13)
+    plan = provider.plan(
+        rows, columns, inner, batch_count=batch, transpose_a=True, alpha=0.75, beta=0.25
+    )
+    rng = np.random.default_rng(781)
+    av = rng.standard_normal(plan.a_shape).astype(np.float32)
+    bv = rng.standard_normal(plan.b_shape).astype(np.float32)
+    initial = rng.standard_normal(plan.output_shape).astype(np.float32)
+    a, b, output = [
+        ti.ndarray(ti.f32, shape=shape)
+        for shape in (plan.a_shape, plan.b_shape, plan.output_shape)
+    ]
+    a.from_numpy(av)
+    b.from_numpy(bv)
+    output.from_numpy(initial)
+    recording = plan._capture()
+    builder = ti.graph.GraphBuilder()
+    builder.append_native(recording)
+    graph = builder.compile()
+    bindings = graph.bind(dict(a=a, b=b, output=output))
+    assert graph._spec.runtime_lifetime_leases == ()
+    np.testing.assert_array_equal(output.to_numpy(), initial)
+
+    def reject_python_dispatch(*_args, **_kwargs):
+        raise AssertionError("replay must not perform Python provider work")
+
+    with monkeypatch.context() as replay:
+        replay.setattr(type(plan), "execute", reject_python_dispatch)
+        replay.setattr(type(plan), "_validate_array", reject_python_dispatch)
+        replay.setattr(type(recording), "execute", reject_python_dispatch)
+        replay.setattr(type(provider), "_validate_lifetime", reject_python_dispatch)
+        replay.setattr(_MatmulCaptureRecipe, "append_to_graph", reject_python_dispatch)
+        for _ in range(4):
+            graph.run(bindings)
+    # Use an independent higher-precision reference; a second f32 BLAS
+    # reduction can differ near cancellation on the larger workspace case.
+    expected = initial.astype(np.float64)
+    product = 0.75 * (
+        np.swapaxes(av.astype(np.float64), -1, -2) @ bv.astype(np.float64)
+    )
+    for _ in range(4):
+        expected = product + 0.25 * expected
+    np.testing.assert_allclose(output.to_numpy(), expected, rtol=2e-5, atol=2e-5)
+    stats = graph._graph_stats[0]
+    assert stats["last_path"] == "cuda_exact_replay"
+    assert stats["last_fallback_reason"] == "none"
+    with pytest.raises(RuntimeError, match="capture leases"):
+        plan.close()
+    with pytest.raises(RuntimeError, match="plans are live"):
+        provider.close()
+    plan_ref = weakref.ref(plan)
+    del plan, recording, builder
+    gc.collect()
+    assert plan_ref() is not None  # The compiled Graph retains the real plan.
+    graph.run(bindings)
+    np.testing.assert_allclose(
+        output.to_numpy(), product + 0.25 * expected, rtol=2e-5, atol=2e-5
+    )
+    retained = plan_ref()
+    del graph, bindings
+    gc.collect()
+    assert retained._capture_leases == 0
+    retained.close()
+    provider.close()
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_cublaslt_capture_rejects_bad_bindings_and_reset_invalidates():
+    provider = _provider_or_skip()
+    plan = provider.plan(8, 8, 8)
+    recording = plan._capture()
+    builder = ti.graph.GraphBuilder()
+    builder.append_native(recording)
+    graph = builder.compile()
+    values = ti.ndarray(ti.f32, (8, 8))
+    output = ti.ndarray(ti.f32, (8, 8))
+    values.from_numpy(np.eye(8, dtype=np.float32))
+    # Read/read alias is legal, but output alias and shape mismatch are not.
+    with pytest.raises(RuntimeError):
+        graph.run(dict(a=values, b=values, output=values))
+    wrong = ti.ndarray(ti.f32, (4, 16))
+    with pytest.raises(RuntimeError):
+        graph.run(dict(a=wrong, b=values, output=output))
+    graph.run(dict(a=values, b=values, output=output))
+    np.testing.assert_array_equal(output.to_numpy(), np.eye(8, dtype=np.float32))
+    ti.reset()
+    assert plan.closed and provider.closed
+    with pytest.raises(RuntimeError):
+        graph.run(dict(a=values, b=values, output=output))

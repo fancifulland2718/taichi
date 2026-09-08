@@ -31,6 +31,7 @@
 #include "taichi/analysis/offline_cache_util.h"
 #include "taichi/program/graph_builder.h"
 #include "taichi/program/cuda_scan_capture.h"
+#include "taichi/program/cuda_cublaslt_capture.h"
 #include "taichi/program/extension.h"
 #include "taichi/program/ndarray.h"
 #include "taichi/program/matrix.h"
@@ -576,6 +577,23 @@ py::dict primitive_workspace_snapshot_to_dict(
 
 void export_lang(py::module &m) {
   m.def("_cuda_scan_capture_workspace_bytes", &lang::cuda_scan_capture_workspace_bytes);
+  py::class_<lang::CudaCublasLtCapturePlan>(m, "_CudaCublasLtCapturePlan")
+      .def(py::init<>())
+      .def_readwrite("matmul_address", &lang::CudaCublasLtCapturePlan::matmul_address)
+      .def_readwrite("handle", &lang::CudaCublasLtCapturePlan::handle)
+      .def_readwrite("descriptor", &lang::CudaCublasLtCapturePlan::descriptor)
+      .def_readwrite("layouts", &lang::CudaCublasLtCapturePlan::layouts)
+      .def_property("algorithm",
+                    [](const lang::CudaCublasLtCapturePlan &plan) {
+                      return py::bytes(plan.algorithm);
+                    },
+                    [](lang::CudaCublasLtCapturePlan &plan, py::bytes data) {
+                      plan.algorithm = data;
+                    })
+      .def_readwrite("shapes", &lang::CudaCublasLtCapturePlan::shapes)
+      .def_readwrite("workspace_bytes", &lang::CudaCublasLtCapturePlan::workspace_bytes)
+      .def_readwrite("alpha", &lang::CudaCublasLtCapturePlan::alpha)
+      .def_readwrite("beta", &lang::CudaCublasLtCapturePlan::beta);
   using namespace taichi::lang;
   using namespace std::placeholders;
 
@@ -5315,6 +5333,9 @@ void export_lang(py::module &m) {
            &GraphBuilder::dispatch_cuda_capture_scan,
            py::arg("program"), py::arg("values"), py::arg("workspace"),
            py::arg("num_items"), py::arg("value_type"))
+      .def("_dispatch_cuda_cublaslt_capture_recipe",
+           &GraphBuilder::dispatch_cuda_capture_cublaslt,
+           py::arg("program"), py::arg("plan"), py::arg("arguments"))
       .def("compile", &GraphBuilder::compile)
       .def("_enable_two_map_composer",
            &GraphBuilder::enable_two_map_composer)

@@ -2,6 +2,7 @@
 #include "taichi/program/graph_kernel_composer.h"
 #include "taichi/program/cuda_addon_capture.h"
 #include "taichi/program/cuda_scan_capture.h"
+#include "taichi/program/cuda_cublaslt_capture.h"
 #include "taichi/program/ndarray.h"
 #include "taichi/program/program.h"
 #include "taichi/program/sparse_matrix.h"
@@ -1100,6 +1101,19 @@ void GraphBuilder::dispatch_cuda_capture_addon(
   auto command = make_cuda_addon_capture_command(
       program, invoke_address, payload, stream_offset, arguments, pointer_offsets,
       scalar_counts, writable, error_address);
+  for (const auto &argument : arguments) {
+    register_arg(argument);
+  }
+  all_nodes_.push_back(std::make_unique<CudaCaptureCommandDispatch>(
+      std::move(command), arguments));
+  seq()->append(all_nodes_.back().get());
+}
+
+void GraphBuilder::dispatch_cuda_capture_cublaslt(
+    Program *program,
+    const CudaCublasLtCapturePlan &plan,
+    const std::vector<aot::Arg> &arguments) {
+  auto command = make_cuda_cublaslt_capture_command(program, plan, arguments);
   for (const auto &argument : arguments) {
     register_arg(argument);
   }

@@ -512,6 +512,11 @@ class CublasLtProvider:
 class CublasLtMatmulPlan(BackendCommandRecording):
     """Retained row-major f32 single or strided-batched matmul plan."""
 
+    # Live resource owners use identity, not the inherited recording fields:
+    # otherwise WeakSet merges distinct descriptors with equal binding names.
+    __eq__ = object.__eq__
+    __hash__ = object.__hash__
+
     def __init__(
         self,
         provider,
@@ -573,6 +578,7 @@ class CublasLtMatmulPlan(BackendCommandRecording):
         self._matmul_desc = None
         self._layouts = []
         self.workspace = None
+        self._capture_leases = 0
         try:
             self._create_native_plan()
         except Exception:
@@ -864,6 +870,11 @@ class CublasLtMatmulPlan(BackendCommandRecording):
     def run(self, **bindings):
         return self.execute(bindings)
 
+    def _capture(self, *, workspace="__cublaslt_workspace"):
+        from taichi_forge.hardware._cublaslt_capture import CublasLtCaptureRecording
+
+        return CublasLtCaptureRecording(self, workspace=workspace)
+
     def _as_graph_native_node(self):
         return native_recording_node(
             self,
@@ -901,6 +912,10 @@ class CublasLtMatmulPlan(BackendCommandRecording):
         with self.provider._lock, self._lock:
             if self.closed:
                 return None
+            if self._capture_leases:
+                raise TaichiRuntimeError(
+                    "cuBLASLt plan cannot close while Graph capture leases are live"
+                )
             if runtime_generation_matches(self):
                 self._runtime_prog.synchronize()
             self._close_native()

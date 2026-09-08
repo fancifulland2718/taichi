@@ -75,6 +75,7 @@ class HardwareRecordingExecutable(NativeGraphExecutable):
         runtime_bindings,
         lifetime_leases,
         debug_info,
+        fixed_bindings=None,
         publish_time_binding_validation_stable=False,
     ):
         if not isinstance(publish_time_binding_validation_stable, bool):
@@ -96,7 +97,7 @@ class HardwareRecordingExecutable(NativeGraphExecutable):
         validate_retained_execution_contract(
             recording, tuple(_resolve(lifetime_leases, recording))
         )
-        self._action = BackendCommandGraphAction(recording)
+        self._action = BackendCommandGraphAction(recording, fixed_bindings=fixed_bindings)
 
     def run(self, runtime_args):
         return self._recording.execute(runtime_args)
