@@ -32,6 +32,7 @@
 #include "taichi/program/graph_builder.h"
 #include "taichi/program/cuda_scan_capture.h"
 #include "taichi/program/cuda_cublaslt_capture.h"
+#include "taichi/program/cuda_cutensor_capture.h"
 #include "taichi/program/extension.h"
 #include "taichi/program/ndarray.h"
 #include "taichi/program/matrix.h"
@@ -597,6 +598,19 @@ void export_lang(py::module &m) {
       .def_readwrite("beta", &lang::CudaCublasLtCapturePlan::beta);
   using namespace taichi::lang;
   using namespace std::placeholders;
+
+  py::class_<CudaCutensorCapturePlan>(m, "_CudaCutensorCapturePlan")
+      .def(py::init<>())
+      .def_static("supports_binding_frames", []() { return true; })
+      .def_readwrite("execute_address", &CudaCutensorCapturePlan::execute_address)
+      .def_readwrite("handle", &CudaCutensorCapturePlan::handle)
+      .def_readwrite("shapes", &CudaCutensorCapturePlan::shapes)
+      .def_readwrite("workspace_bytes", &CudaCutensorCapturePlan::workspace_bytes)
+      .def_readwrite("alignment_bytes", &CudaCutensorCapturePlan::alignment_bytes)
+      .def_readwrite("output_alias_compatible",
+                     &CudaCutensorCapturePlan::output_alias_compatible)
+      .def_readwrite("alpha", &CudaCutensorCapturePlan::alpha)
+      .def_readwrite("beta", &CudaCutensorCapturePlan::beta);
 
   py::register_exception<TaichiTypeError>(m, "TaichiTypeError",
                                           PyExc_TypeError);
@@ -5336,6 +5350,9 @@ void export_lang(py::module &m) {
            py::arg("num_items"), py::arg("value_type"))
       .def("_dispatch_cuda_cublaslt_capture_recipe",
            &GraphBuilder::dispatch_cuda_capture_cublaslt,
+           py::arg("program"), py::arg("plan"), py::arg("arguments"))
+      .def("_dispatch_cuda_cutensor_capture_recipe",
+           &GraphBuilder::dispatch_cuda_capture_cutensor,
            py::arg("program"), py::arg("plan"), py::arg("arguments"))
       .def("compile", &GraphBuilder::compile)
       .def("_enable_two_map_composer",

@@ -217,6 +217,7 @@ class CutensorProvider:
                 "execution_abi_version": int(execution_api.execution_abi_version),
             }
         )
+        impl.get_runtime().register_runtime_object(self)
 
     @property
     def closed(self):
@@ -272,17 +273,29 @@ class CutensorProvider:
                     "CutensorProvider cannot close while contraction plans are live"
                 )
             runtime = self._runtime
-            self._runtime = None
             if runtime_generation_matches(self):
                 self._runtime_prog.synchronize()
-                try:
-                    runtime.close()
-                except RuntimeError as exc:
-                    self._runtime = runtime
-                    raise TaichiRuntimeError(str(exc)) from exc
+            try:
+                runtime.close()
+            except RuntimeError as exc:
+                raise TaichiRuntimeError(str(exc)) from exc
+            self._runtime = None
         return None
 
     destroy = close
+
+    def _invalidate_runtime(self):
+        # Retire native plans before Program.finalize() destroys their device.
+        # Graphs from this generation are invalidated by the same cold boundary.
+        with self._lock:
+            if self.closed:
+                return
+            self._runtime_prog.synchronize()
+            for plan in tuple(self._plans):
+                with plan._lock:
+                    plan._close_native()
+            self._runtime.close()
+            self._runtime = None
 
     def __enter__(self):
         self._validate_lifetime()
@@ -383,6 +396,10 @@ class CutensorContractionPlan:
         self._runtime_prog = provider._runtime_prog
         self._runtime_generation = provider._runtime_generation
         self._shapes = tuple(item[0] for item in tensors)
+        self._tensors = tensors
+        self._alignment_bytes = alignment_bytes
+        self._compute = compute
+        self._capture_leases = 0
         self.workspace_estimate_bytes = int(info.workspace_estimate_bytes)
         self.workspace_required_bytes = int(info.workspace_required_bytes)
         try:
@@ -445,23 +462,54 @@ class CutensorContractionPlan:
                     raise TaichiRuntimeError(str(exc)) from exc
         return d
 
+    def record(
+        self,
+        *,
+        a="a",
+        b="b",
+        c="c",
+        d="d",
+        workspace="cutensor_workspace",
+        alpha=1.0,
+        beta=0.0,
+    ):
+        """Record this fixed plan into a root CUDA Graph.
+
+        Arrays are supplied at Graph.bind(), and may change values each replay.
+        The recording retains this plan and workspace until all Graphs retire.
+        C/D may alias only with identical shapes, strides and modes. Capturing
+        does not execute the contraction or advance beta*C feedback.
+        """
+        from taichi_forge.hardware._cutensor_capture import CutensorCaptureRecording
+
+        return CutensorCaptureRecording(
+            self, a=a, b=b, c=c, d=d, workspace=workspace, alpha=alpha, beta=beta
+        )
+
     def close(self):
         with self.provider._lock, self._lock:
             if self._handle is None:
                 return None
-            handle = self._handle
-            self._handle = None
+            if self._capture_leases:
+                raise TaichiRuntimeError(
+                    "cuTENSOR plan cannot close while capture leases are live"
+                )
             if runtime_generation_matches(self):
                 self._runtime_prog.synchronize()
-                try:
-                    self.provider._runtime.check_result(
-                        self.provider._execution_api.destroy_contraction_plan(handle)
-                    )
-                except RuntimeError as exc:
-                    self._handle = handle
-                    raise TaichiRuntimeError(str(exc)) from exc
-            self._workspace = None
+                self._close_native()
         return None
+
+    def _close_native(self):
+        if self._handle is None:
+            return
+        try:
+            self.provider._runtime.check_result(
+                self.provider._execution_api.destroy_contraction_plan(self._handle)
+            )
+        except RuntimeError as exc:
+            raise TaichiRuntimeError(str(exc)) from exc
+        self._handle = None
+        self._workspace = None
 
     destroy = close
 

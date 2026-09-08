@@ -14,6 +14,7 @@ class GraphBuilder;
 class SparseMatrix;
 class CuSparseMatrix;
 struct CudaCublasLtCapturePlan;
+struct CudaCutensorCapturePlan;
 
 class Node {
  public:
@@ -247,6 +248,11 @@ class GraphBuilder {
                                   const aot::Arg &workspace,
                                   int num_items,
                                   int value_type);
+
+  void dispatch_cuda_capture_cutensor(
+      Program *program,
+      const CudaCutensorCapturePlan &plan,
+      const std::vector<aot::Arg> &arguments);
 
   void dispatch_cuda_capture_addon(
       Program *program,
