@@ -39,6 +39,7 @@ from taichi_forge.hardware._native_adapter import (
 )
 from taichi_forge.lang import impl
 from taichi_forge.lang.exception import TaichiRuntimeError
+from taichi_forge.linalg._packing_kernels import TILED_PACKING_IMPLEMENTATION
 from taichi_forge.types.primitive_types import f32
 
 
@@ -52,6 +53,7 @@ def _component(provider):
         "version": _version_string(provider.version),
         "library": provider._library.candidate,
         "configuration_schema": "documented-algo-config-v1",
+        "forge_packing_implementation": TILED_PACKING_IMPLEMENTATION,
     }
 
 
@@ -180,7 +182,10 @@ class _MatmulCatalog:
             shape = _shapes(physical)[0 if name == "a" else 1]
             packed = builder.private_ndarray(f"{prefix}_{name}", f32, shape)
             builder.dispatch(
-                packing_kernel(shape),
+                packing_kernel(
+                    shape,
+                    tiled=config["packing_lowering"] == TILED_PACKING_IMPLEMENTATION,
+                ),
                 Arg(ArgKind.NDARRAY, semantics[name], f32, ndim=rank),
                 packed,
             )
@@ -494,21 +499,31 @@ class MatmulOperation(NativeGraphNode):
                             continue
                         try:
                             for choice in description.choices:
-                                config = {
+                                base_config = {
                                     "packed_inputs": packed,
                                     "epilogue": epilogue,
                                     "algorithm": choice.to_dict(),
                                     "submission": "enclosing_graph",
                                     "workspace_lifetime": "retained_plan",
                                 }
-                                key = "matmul:" + _digest(config)
-                                choices[key] = config
-                                if (
-                                    baseline is None
-                                    and not packed
-                                    and epilogue == epilogues[0]
-                                ):
-                                    baseline = key
+                                lowerings = (
+                                    ("direct-f32-v1", TILED_PACKING_IMPLEMENTATION)
+                                    if packed
+                                    else (None,)
+                                )
+                                for lowering in lowerings:
+                                    config = {
+                                        **base_config,
+                                        "packing_lowering": lowering,
+                                    }
+                                    key = "matmul:" + _digest(config)
+                                    choices[key] = config
+                                    if (
+                                        baseline is None
+                                        and not packed
+                                        and epilogue == epilogues[0]
+                                    ):
+                                        baseline = key
                         finally:
                             description.close()
             if baseline is None:
@@ -551,6 +566,7 @@ class MatmulOperation(NativeGraphNode):
         for key, config in choices.items():
             if not isinstance(config, dict) or set(config) != {
                 "packed_inputs",
+                "packing_lowering",
                 "epilogue",
                 "algorithm",
                 "submission",
@@ -559,6 +575,13 @@ class MatmulOperation(NativeGraphNode):
                 raise ValueError("Invalid frozen matmul physical configuration")
             if tuple(config["packed_inputs"]) not in ((), _packing(self.semantics)):
                 raise ValueError("Invalid frozen operand packing")
+            allowed_lowerings = (
+                ("direct-f32-v1", TILED_PACKING_IMPLEMENTATION)
+                if config["packed_inputs"]
+                else (None,)
+            )
+            if config["packing_lowering"] not in allowed_lowerings:
+                raise ValueError("Matmul packing lowering drifted")
             allowed = (
                 ("separate", "fused")
                 if self.semantics["activation"] == "relu"

@@ -95,6 +95,27 @@ def _no_cold_work(*_args, **_kwargs):
 
 
 @test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_matmul_packing_preserves_partial_tiles_and_grid_stride():
+    from taichi_forge.linalg._matmul_kernels import packing_kernel
+
+    # The last shape exceeds the CUDA range grid cap, reusing a block's tile.
+    # Small/non-square and existing batch inputs exercise both boundary masks.
+    rng = np.random.default_rng(141)
+    for shape in ((3, 17), (65, 97), (2, 49, 97), (4097, 513)):
+        source_shape = (*shape[:-2], shape[-1], shape[-2])
+        source = ti.ndarray(ti.f32, shape=source_shape)
+        destination = ti.ndarray(ti.f32, shape=shape)
+        pack = packing_kernel(shape, tiled=True)
+        for _ in range(2):
+            data = rng.standard_normal(source_shape).astype(np.float32)
+            source.from_numpy(data)
+            pack(source, destination)
+            np.testing.assert_array_equal(
+                destination.to_numpy(), np.swapaxes(data, -1, -2)
+            )
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
 @pytest.mark.parametrize("batch", (1, 2))
 def test_matmul_complete_strategies_refresh_inputs_and_retire_storage(
     batch, monkeypatch
@@ -128,10 +149,19 @@ def test_matmul_complete_strategies_refresh_inputs_and_retire_storage(
         )
         config = configs[key]
         selected.setdefault(
-            (tuple(config["packed_inputs"]), config["epilogue"]), (recipe, config)
+            (
+                tuple(config["packed_inputs"]),
+                config["epilogue"],
+                config["packing_lowering"],
+            ),
+            (recipe, config),
         )
-    assert ((), "separate") in selected and ((), "fused") in selected
-    assert (("a", "b"), "separate") in selected and (("a", "b"), "fused") in selected
+    assert ((), "separate", None) in selected and ((), "fused", None) in selected
+    from taichi_forge.linalg._packing_kernels import TILED_PACKING_IMPLEMENTATION
+
+    for lowering in ("direct-f32-v1", TILED_PACKING_IMPLEMENTATION):
+        assert (("a", "b"), "separate", lowering) in selected
+        assert (("a", "b"), "fused", lowering) in selected
     identities, resources = set(), []
     operation.close()  # Frozen semantics, not the source operation, own reconstruction.
     for recipe, config in selected.values():
@@ -190,7 +220,7 @@ def test_matmul_complete_strategies_refresh_inputs_and_retire_storage(
         del plans, frame, graph, materialized, context
         gc.collect()
         assert not tuple(owner._plans)
-    assert len(identities) == 4
+    assert len(identities) == len(selected)
     assert all(reference() is None for reference in resources)
     owner.close()
 
@@ -270,6 +300,11 @@ def test_matmul_public_search_resolves_frozen_choices_without_heuristics(monkeyp
 def test_matmul_rejects_drift_and_public_alias_before_replay(monkeypatch):
     operation = _operation(monkeypatch, size=(8, 8, 8), batch=1)
     artifact = operation.prepare(heuristic_limit=1)
+    # A vendor ABI match must not reuse observations of the old pack lowering.
+    corrupt = json.loads(json.dumps(artifact))
+    del corrupt["component"]["forge_packing_implementation"]
+    with pytest.raises(ValueError, match="drifted"):
+        _operation(monkeypatch, size=(8, 8, 8), batch=1, preparation=corrupt)
     for field in ("semantics", "device", "component"):
         corrupt = json.loads(json.dumps(artifact))
         corrupt[field] = {}

@@ -5,12 +5,16 @@ from functools import lru_cache
 from taichi_forge.lang import ops
 from taichi_forge.lang._ndrange import ndrange
 from taichi_forge.lang.kernel_impl import kernel
+from taichi_forge.linalg._packing_kernels import tiled_permutation_kernel
 from taichi_forge.types import ndarray
 from taichi_forge.types.primitive_types import f32
 
 
 @lru_cache(maxsize=128)
-def packing_kernel(shape):
+def packing_kernel(shape, *, tiled=False):
+    if tiled:
+        permutation = (1, 0) if len(shape) == 2 else (0, 2, 1)
+        return tiled_permutation_kernel(shape, permutation)
     if len(shape) == 2:
         rows, columns = shape
 

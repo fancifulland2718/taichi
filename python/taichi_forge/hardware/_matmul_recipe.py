@@ -63,7 +63,11 @@ class MatmulRecipeProvider(GraphRuntimeFragmentProvider):
                             f"{path}:pack:{name}",
                             "matmul_operand_pack",
                             depends_on=(tasks[-1].task_id,) if tasks else (),
-                            physical={"operand": name, "transpose": True},
+                            physical={
+                                "operand": name,
+                                "transpose": True,
+                                "lowering": config["packing_lowering"],
+                            },
                         )
                     )
                 tasks.append(
