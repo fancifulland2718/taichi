@@ -9,6 +9,7 @@ import weakref
 from taichi_forge.graph._ir import GraphAccess, ResourceEffect
 from taichi_forge.graph._native import BackendCommandRecording
 from taichi_forge.graph._recipes.definition import _digest
+from taichi_forge.graph._recipes.deferred import FrozenNativeRecipeSource
 from taichi_forge.hardware._bundled_runtime_provider import (
     _binary_sha256,
     _runtime_package_roots,
@@ -295,12 +296,19 @@ class VulkanFftPlan:
                 "Vulkan FFT plan is closed or belongs to a previous runtime generation"
             )
 
-    def record(self, *, data="data"):
-        """Return a root-Graph node; bind ``data`` to this plan's original array."""
+    def record(self, *, data="data", recipe_owned=False):
+        """Return a root-Graph node bound to this plan's original array.
+
+        With ``recipe_owned=True``, freeze retains plan facts, not this plan.
+        The caller may close it after freeze; each materialized Graph creates
+        only its selected plans. Default recordings keep caller-owned lifetime.
+        """
         self.validate_graph_lifetime()
         if not isinstance(data, str) or not data:
             raise ValueError("Vulkan FFT binding name must be a nonempty string")
-        return _Recording(self, data).as_node()
+        if not isinstance(recipe_owned, bool):
+            raise TypeError("Vulkan FFT recipe_owned must be a bool")
+        return _Recording(self, data, recipe_owned=recipe_owned).as_node()
 
     def statistics(self):
         """Cold-plan requested allocations and build/device facts, not device peak."""
@@ -337,11 +345,9 @@ class VulkanFftPlan:
                     resident=valid,
                 ),
             ),
-            lifecycle_state="closed"
-            if self.closed
-            else "ready"
-            if valid
-            else "runtime_invalid",
+            lifecycle_state=(
+                "closed" if self.closed else "ready" if valid else "runtime_invalid"
+            ),
             ownership_scope="plan capacity excluding caller storage; close does not observe command retirement",
         )
 
@@ -370,7 +376,7 @@ class VulkanFftPlan:
 
 
 class _Recording(BackendCommandRecording):
-    def __init__(self, plan, data):
+    def __init__(self, plan, data, *, recipe_owned=False):
         super().__init__(
             backend="vulkan",
             binding_names=(data,),
@@ -380,8 +386,16 @@ class _Recording(BackendCommandRecording):
         )
         object.__setattr__(self, "plan", plan)
         object.__setattr__(self, "data", data)
+        object.__setattr__(self, "_recipe_owned", recipe_owned)
         object.__setattr__(self, "_graph_semantic_fingerprint", plan._semantic_id)
         object.__setattr__(self, "_graph_physical_plan_id", plan._physical_id)
+
+    @property
+    def source(self):
+        return self.plan
+
+    def _freeze_graph_recipe_source(self):
+        return _FrozenVulkanFftSource(self) if self._recipe_owned else None
 
     @property
     def resource_effects(self):
@@ -413,3 +427,71 @@ class _Recording(BackendCommandRecording):
             },
             publish_time_binding_validation_stable=True,
         )
+
+
+def _recreate_recording(source, data, *, batch_tile=None):
+    """Recreate just one cold selection; do not retain the source plan."""
+    source.validate_graph_lifetime()
+    replacement = VulkanFftPlan(
+        source._data,
+        source.dimensions,
+        batch_count=source.batch_count,
+        direction=source.direction,
+        normalization=source.normalization,
+        adapter_path=source._adapter_path,
+        _batch_tile=batch_tile,
+    )
+    try:
+        if replacement._adapter_sha256 != source._adapter_sha256:
+            raise ValueError("Vulkan FFT adapter changed since the Graph was frozen")
+        return replacement.record(data=data, recipe_owned=True).compile()
+    except BaseException:
+        replacement.close()
+        raise
+
+
+class _FrozenVulkanFftSource(FrozenNativeRecipeSource):
+    """Process-local storage and immutable expected facts, no native plan lease."""
+
+    def __init__(self, recording):
+        plan = recording.plan
+        plan.validate_graph_lifetime()
+        # Copy only value facts and the caller's storage/generation. In
+        # particular, neither _submit nor a bound method of plan may escape.
+        for name in (
+            "_data",
+            "_runtime_prog",
+            "_runtime_generation",
+            "dimensions",
+            "batch_count",
+            "direction",
+            "normalization",
+            "_adapter_path",
+            "_adapter_sha256",
+            "_semantic_id",
+            "_physical_id",
+        ):
+            setattr(self, name, getattr(plan, name))
+        self._statistics = dict(plan._statistics)
+        self.data = recording.data
+        self.resource_effects = recording.resource_effects
+
+    _recording = property(lambda self: self)
+    source = property(lambda self: self)
+
+    def validate_graph_lifetime(self):
+        if not runtime_generation_matches(self):
+            raise TaichiRuntimeError(
+                "Vulkan FFT source belongs to a previous runtime generation"
+            )
+
+    def materialize(self):
+        executable = _recreate_recording(
+            self, self.data, batch_tile=self._statistics.get("batch_tile")
+        )
+        if executable._recording.plan._physical_id != self._physical_id:
+            executable._recording.plan.close()
+            raise ValueError(
+                "Recreated Vulkan FFT baseline differs from its frozen physical facts"
+            )
+        return executable

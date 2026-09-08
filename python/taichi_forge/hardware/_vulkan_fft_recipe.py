@@ -10,7 +10,7 @@ from taichi_forge.graph._recipes.fragments import GraphFragmentTask
 
 def _sources(definition):
     from taichi_forge.graph._graph import _CompiledNativeGraphNode
-    from taichi_forge.hardware._vulkan_fft import _Recording
+    from taichi_forge.hardware._vulkan_fft import _FrozenVulkanFftSource, _Recording
 
     if definition.backend != "vulkan":
         return
@@ -18,7 +18,7 @@ def _sources(definition):
     for index, node in enumerate(definition._runtime_spec.nodes):
         if isinstance(node, _CompiledNativeGraphNode):
             recording = getattr(node.executable, "_recording", None)
-            if isinstance(recording, _Recording):
+            if isinstance(recording, (_Recording, _FrozenVulkanFftSource)):
                 path = f"graph/{index}:{node.ir_node.kind}"
                 yield index, path, regions[path], recording
 
@@ -40,8 +40,8 @@ class VulkanFftRecipeProvider(GraphRuntimeFragmentProvider):
     Batch partitions trade repeated dispatches for reusable scratch; they do
     not choose library routes. A separate composable submission fragment embeds
     the complete mixed Graph in an immutable secondary command sequence.
-    Caller-owned baseline plans/storage remain live while constructing recipes;
-    each selected replacement owns only its requested plan. No global plan
+    Default recordings retain caller-owned baseline plans. Recipe-owned
+    recordings freeze descriptions and recreate only selected plans. No global plan
     cache, pre-generation of vendor candidates, or replay discovery is added.
     """
 
@@ -52,7 +52,7 @@ class VulkanFftRecipeProvider(GraphRuntimeFragmentProvider):
             "batch-workspace-reuse",
             "whole-graph-secondary-recording",
         ),
-        domain_version="vulkan-fft-batch-and-submission-v1",
+        domain_version="vulkan-fft-batch-and-submission-v2",
         semantic_fingerprint="compact-f32-c2c-finite-rank1-3-v1",
     )
 
@@ -62,7 +62,7 @@ class VulkanFftRecipeProvider(GraphRuntimeFragmentProvider):
         result = []
         sources = tuple(_sources(definition))
         for _, path, region, recording in sources:
-            plan = recording.plan
+            plan = recording.source
             plan.validate_graph_lifetime()
             for tile in _strategies(plan):
                 result.append(
@@ -133,7 +133,7 @@ class VulkanFftRecipeProvider(GraphRuntimeFragmentProvider):
         from taichi_forge.graph._recipes.vulkan_binding_frames import (
             VulkanBindingFrameExecutor,
         )
-        from taichi_forge.hardware._vulkan_fft import VulkanFftPlan
+        from taichi_forge.hardware._vulkan_fft import _recreate_recording
 
         if (
             selection.source_key == "whole-graph-bindings"
@@ -146,32 +146,14 @@ class VulkanFftRecipeProvider(GraphRuntimeFragmentProvider):
             for row in _sources(assembly.definition)
             if row[1] == selection.source_key
         )
-        plan = recording.plan
+        plan = recording.source
         choices = {f"batch-tile-{tile}": tile for tile in _strategies(plan)}
         tile = choices[selection.materialization_choice]
 
         def rewrite(node):
-            plan.validate_graph_lifetime()
-            replacement = VulkanFftPlan(
-                plan._data,
-                plan.dimensions,
-                batch_count=plan.batch_count,
-                direction=plan.direction,
-                normalization=plan.normalization,
-                adapter_path=plan._adapter_path,
-                _batch_tile=tile,
+            return _CompiledNativeGraphNode(
+                _recreate_recording(plan, recording.data, batch_tile=tile)
             )
-            try:
-                if replacement._adapter_sha256 != plan._adapter_sha256:
-                    raise ValueError(
-                        "Vulkan FFT adapter changed since the Graph was frozen"
-                    )
-                return _CompiledNativeGraphNode(
-                    replacement.record(data=recording.data).compile()
-                )
-            except BaseException:
-                replacement.close()
-                raise
 
         assembly.rewrite_node(index, rewrite)
 
@@ -190,11 +172,23 @@ class VulkanFftRecipeProvider(GraphRuntimeFragmentProvider):
         }
 
     def describe(self, definition, fragment_key):
+        from taichi_forge.hardware._vulkan_fft import _FrozenVulkanFftSource
+
         fragment = self.resolve(definition, fragment_key)
         choice = fragment.provider_metadata["family_selection"]
         embedded = choice["source_key"] == "whole-graph-bindings"
+        ownership = {
+            path: (
+                "recipe_owned_frozen_description"
+                if isinstance(recording, _FrozenVulkanFftSource)
+                else "caller_owned_open_plan"
+            )
+            for _, path, _, recording in _sources(definition)
+            if embedded or path == choice["source_key"]
+        }
         return {
             **fragment.provider_metadata,
+            "source_plan_ownership": ownership,
             "changes": (
                 ("record kernels and FFT regions as one immutable secondary Graph",)
                 if embedded
@@ -204,9 +198,10 @@ class VulkanFftRecipeProvider(GraphRuntimeFragmentProvider):
             ),
             "selected_physical_plan": tuple(task.physical for task in fragment.tasks),
             "limitations": (
-                "caller keeps the original compact ndarray and baseline plan open for recipe construction",
-                "new process rebuilds equivalent baseline plans/storage before resolving the selected recipe",
-                "selected partitions alone are created at materialization; baseline allocations are caller-owned",
+                "original compact ndarray remains caller-owned; default recordings also require the baseline plan open",
+                "record(recipe_owned=True) freezes expected facts, permitting caller plan close before search/resolve",
+                "new process rebuilds equivalent facts/storage; frozen sources do not serialize Python or native executables",
+                "recipe-owned sources create only selected plans at materialization; pending commands may retain retired allocations",
                 "finite complex-f32 inputs; no bitwise reproducibility or production tolerance qualification",
                 "small transforms can be slower with no scratch benefit; measured trade-offs decide selection",
                 "use Graph.bind for upload-free replay; raw mappings include argument preparation",

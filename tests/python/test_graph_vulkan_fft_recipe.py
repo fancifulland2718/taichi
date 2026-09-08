@@ -16,7 +16,7 @@ def _scale(data: ti.types.ndarray(dtype=ti.f32), factor: ti.f32):
         data[index] *= factor
 
 
-def _definition(data, dimensions, batches):
+def _definition(data, dimensions, batches, *, recipe_owned=False):
     plans = [
         ti.hardware.fft.VulkanFftPlan(
             data, dimensions, batch_count=batches, adapter_path=_adapter()
@@ -34,7 +34,7 @@ def _definition(data, dimensions, batches):
     factor = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "factor", ti.f32)
     builder.dispatch(_scale, arg, factor)
     for plan in plans:
-        builder.append_native(plan.record())
+        builder.append_native(plan.record(recipe_owned=recipe_owned))
     builder.dispatch(_scale, arg, factor)
     return builder.freeze(), plans
 
@@ -147,7 +147,9 @@ def test_vulkan_fft_binding_mismatch_is_cold_and_close_retires_pending_graph():
 @test_utils.test(arch=ti.vulkan, offline_cache=False)
 def test_vulkan_fft_public_search_report_and_equivalent_graph_resolution():
     data, original = _input((262144,), 4)
-    definition, plans = _definition(data, (262144,), 4)
+    definition, plans = _definition(data, (262144,), 4, recipe_owned=True)
+    for plan in plans:
+        plan.close()
     observed = set()
 
     def evaluate(graph, recipe):
@@ -183,7 +185,11 @@ def test_vulkan_fft_public_search_report_and_equivalent_graph_resolution():
     assert len(observed) >= 6
     assert decision.selection.recipe_id != definition.baseline_recipe.recipe_id
     restored_data, _ = _input((262144,), 4)
-    restored, restored_plans = _definition(restored_data, (262144,), 4)
+    restored, restored_plans = _definition(
+        restored_data, (262144,), 4, recipe_owned=True
+    )
+    for plan in restored_plans:
+        plan.close()
     assert restored.semantic_graph_id == definition.semantic_graph_id
     artifact = json.loads(json.dumps(decision.selection_artifact.to_dict()))
     resolved = restored.resolve_recipe(artifact, providers=_providers())
@@ -203,3 +209,124 @@ def test_vulkan_fft_public_search_report_and_equivalent_graph_resolution():
     assert "vulkan_fft" in report.to_json()
     for plan in (*plans, *restored_plans, *wrong_plans):
         plan.close()
+
+
+@test_utils.test(arch=ti.vulkan, offline_cache=False)
+def test_vulkan_fft_detached_sources_materialize_only_selected_plans(monkeypatch):
+    import gc
+    import weakref
+
+    from taichi_forge.hardware import _vulkan_fft as fft
+
+    data, original = _input((64,), 5)
+    definition, plans = _definition(data, (64,), 5, recipe_owned=True)
+    references = tuple(weakref.ref(plan) for plan in plans)
+    for plan in plans:
+        plan.close()
+    del plan, plans
+    gc.collect()
+    assert all(reference() is None for reference in references)
+    assert not definition._runtime_spec.provider_memory_reports()
+    # Discovery and equivalent freezing remain descriptive after source close.
+    with monkeypatch.context() as cold:
+        cold.setattr(fft.VulkanFftPlan, "__init__", _forbidden)
+        catalog = definition.recipe_catalog(providers=_providers())
+    frame = next(
+        f for f in catalog.fragments if f.fragment_key.endswith(":secondary-frames")
+    )
+    tiles = tuple(
+        f for f in catalog.fragments if f.fragment_key.endswith(":batch-tile-2")
+    )
+    recipes = (
+        catalog.baseline.recipe,
+        catalog.compose((tiles[0].fragment_id,), stage="partial").recipe,
+        catalog.compose(
+            tuple(f.fragment_id for f in (*tiles, frame)), stage="complete"
+        ).recipe,
+    )
+    create = fft.VulkanFftPlan.__init__
+    created = []
+
+    def counted(plan, *args, **kwargs):
+        create(plan, *args, **kwargs)
+        created.append(weakref.ref(plan))
+
+    monkeypatch.setattr(fft.VulkanFftPlan, "__init__", counted)
+    for recipe in recipes:
+        data.from_numpy(original)
+        created.clear()
+        with definition.materialize(recipe, providers=_providers()) as selected:
+            graph = selected.executor
+            assert len(created) == 2  # Partial replacement must not build 3 plans.
+            assert len(graph._spec.provider_memory_reports()) == 2
+            binding = graph.bind({"data": data, "factor": -1.0})
+            with monkeypatch.context() as replay:
+                replay.setattr(fft, "_recreate_recording", _forbidden)
+                replay.setattr(
+                    fft._FrozenVulkanFftSource, "validate_graph_lifetime", _forbidden
+                )
+                graph.run(binding)
+            # Closing before a readback must keep pending native command leases.
+        np.testing.assert_allclose(data.to_numpy(), original, atol=2e-5, rtol=5e-5)
+        del graph, binding, selected
+        gc.collect()
+        assert all(reference() is None for reference in created)
+    # A baseline compile and a selected graph own independent plans. Releasing
+    # one must not break the other or require source reconstruction on replay.
+    baseline = definition.compile()
+    with definition.materialize(recipes[-1], providers=_providers()) as selected:
+        baseline.run(baseline.bind({"data": data, "factor": -1.0}))
+        del baseline
+        gc.collect()
+        selected.executor.run(selected.executor.bind({"data": data, "factor": -1.0}))
+        np.testing.assert_allclose(data.to_numpy(), original, atol=3e-5, rtol=5e-5)
+
+
+@test_utils.test(arch=ti.vulkan, offline_cache=False)
+def test_vulkan_fft_detached_source_drift_and_rollback_are_cold(monkeypatch):
+    import gc
+    import weakref
+
+    from taichi_forge.hardware import _vulkan_fft as fft
+
+    data, _ = _input((64,), 3)
+    definition, plans = _definition(data, (64,), 3, recipe_owned=True)
+    for plan in plans:
+        plan.close()
+    create = fft.VulkanFftPlan.__init__
+    created = []
+
+    def fail_second(plan, *args, **kwargs):
+        if created:
+            raise RuntimeError("injected second plan failure")
+        create(plan, *args, **kwargs)
+        created.append(weakref.ref(plan))
+
+    with monkeypatch.context() as failure:
+        failure.setattr(fft.VulkanFftPlan, "__init__", fail_second)
+        with pytest.raises(RuntimeError, match="second plan failure"):
+            definition.compile()
+    gc.collect()
+    assert created[0]() is None
+    with monkeypatch.context() as drift:
+        drift.setattr(fft, "_binary_sha256", lambda path: "different-adapter")
+        with pytest.raises(ValueError, match="adapter changed"):
+            definition.compile()
+
+    def changed_facts(plan, *args, **kwargs):
+        create(plan, *args, **kwargs)
+        plan._physical_id = "different-shader-or-workspace-facts"
+
+    with monkeypatch.context() as drift:
+        drift.setattr(fft.VulkanFftPlan, "__init__", changed_facts)
+        with pytest.raises(ValueError, match="frozen physical facts"):
+            definition.compile()
+    assert fft.passive_status()["native_facts"]["open_plan_count"] == 0
+    # Neither a drift nor rollback poisons the source description.
+    graph = definition.compile()
+    graph.run(graph.bind({"data": data, "factor": 1.0}))
+    ti.sync()
+    ti.reset()
+    ti.init(arch=ti.vulkan, offline_cache=False)
+    with pytest.raises(RuntimeError, match="previous runtime"):
+        definition.compile()

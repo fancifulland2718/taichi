@@ -5457,6 +5457,28 @@ class _CompiledNativeGraphNode:
         return info
 
 
+class _FrozenNativeGraphNode(_CompiledNativeGraphNode):
+    """Root native metadata without the executable or its resource owners.
+
+    Only an explicit provider freeze hook can produce this node. It is replaced
+    at compile/materialization, never dispatched or lazily restored at replay.
+    """
+
+    def __init__(self, node, source):
+        self.__dict__.update(node.__dict__)
+        self._frozen_debug_info = node.debug_info
+        self.executable = source
+        self.recordable_action = None
+        self.lifetime_leases = ()
+
+    @property
+    def debug_info(self):
+        return dict(self._frozen_debug_info)
+
+    def materialize(self):
+        return _CompiledNativeGraphNode(self.executable.materialize())
+
+
 _OBSERVATION_PACK_KERNELS = {}
 
 
@@ -10750,6 +10772,26 @@ class _GraphSpec:
         nodes = []
         changed = False
         for node in self.nodes:
+            if isinstance(node, _CompiledNativeGraphNode) and not isinstance(
+                node, _FrozenNativeGraphNode
+            ):
+                freeze = getattr(node.executable, "_freeze_graph_recipe_source", None)
+                source = None if freeze is None else freeze()
+                if source is not None:
+                    if not isinstance(source, FrozenNativeRecipeSource):
+                        raise TypeError(
+                            "native recipe freeze requires a cold reconstruction source"
+                        )
+                    if (
+                        node.fixed_runtime_args
+                        or node.temporary_actions
+                        or node.derived_runtime_arg_names
+                    ):
+                        raise ValueError(
+                            "detachable native recipes cannot retain private Graph bindings"
+                        )
+                    node = _FrozenNativeGraphNode(node, source)
+                    changed = True
             if not isinstance(node, _CompiledCGraphNode):
                 nodes.append(node)
                 continue
@@ -10791,14 +10833,20 @@ class _GraphSpec:
 
     def materialize_baseline_sources(self, definition):
         """Reconstruct detached segments only at the explicit compile boundary."""
-        if not any(getattr(node, "_requires_recipe_materialization", False) for node in self.nodes):
+        if not any(
+            isinstance(node, _FrozenNativeGraphNode)
+            or getattr(node, "_requires_recipe_materialization", False)
+            for node in self.nodes
+        ):
             return self
         from taichi_forge.graph._recipes.runtime_assembly import GraphRuntimeRecipeAssembly
 
         assembly = GraphRuntimeRecipeAssembly(definition)
         nodes = []
         for node in self.nodes:
-            if getattr(node, "_requires_recipe_materialization", False):
+            if isinstance(node, _FrozenNativeGraphNode):
+                node = node.materialize()
+            elif getattr(node, "_requires_recipe_materialization", False):
                 groups = tuple(
                     tuple(int(item.split(":")[1]) for item in group)
                     for group in node.composer_source_groups
@@ -11293,6 +11341,8 @@ class _GraphSpec:
             node_rewriter = assembly.node_rewriter(node_index)
             if node_rewriter is not None:
                 node = node_rewriter(node)
+            elif isinstance(node, _FrozenNativeGraphNode):
+                node = node.materialize()
             nodes.append(node)
             node_source_regions.append(source_regions)
 

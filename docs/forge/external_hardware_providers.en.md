@@ -1169,8 +1169,15 @@ retirement/peak. No production speedup or all-driver compatibility is claimed.
 
 ### Explicit Vulkan FFT recipe search
 
-Keep the original plans and their compact ndarrays open while freezing a Graph
-and searching it. Add `ti.hardware.fft.VulkanFftRecipeProvider()` alongside
+Default `plan.record()` nodes require the original plans and compact ndarrays
+to remain open during search. For recipe-owned plans, append
+`plan.record(recipe_owned=True)`, freeze the Graph, then close the original plans.
+The frozen definition retains expected plan facts and caller storage, not native
+FFT plans. Baseline compile, partial replacements and complete recipes recreate
+only their selected plans at materialization; adapter and baseline physical facts
+are checked there, never at replay. Existing live recordings are not detached or
+closed implicitly, and ordinary `record()` lifetime semantics are unchanged.
+Add `ti.hardware.fft.VulkanFftRecipeProvider()` alongside
 `ti.graph.default_recipe_providers()` in `definition.search_recipes(...)`.
 The existing complete-recipe evaluator, named metrics, report, checkpoint and
 `resolve_recipe()` interfaces apply unchanged; CompileIQ sees only complete IDs.
@@ -1194,9 +1201,12 @@ SNode/texture/host-return kernels or device-controlled Graph topology. Native
 command ownership retains arrays, argument images and FFT resources until their
 parent submission retires, including when a materialized Graph is closed early.
 
-New processes first rebuild equivalent baseline plans and storage, then resolve
-the selected recipe. Only selected partition plans are created at materialization;
-this is not FFT binary serialization or zero-cost baseline restoration. Caller
+New processes first rebuild equivalent baseline facts and storage, then resolve
+the selected recipe. Obtaining these facts still requires initial plan creation;
+recipe-owned recordings allow those source plans to be closed after freeze and
+before search/resolve. This is not FFT binary serialization, a global plan cache,
+or zero-cost baseline restoration. Concurrent materialized Graphs own independent
+plans; close/drop unused Graph owners to release their plan leases. Caller
 baseline allocations, plan-requested scratch, per-binding argument bytes and
 unknown driver command/pipeline memory are distinct costs. Windows local tests
 cover the implementation; Linux and production performance are not qualified by

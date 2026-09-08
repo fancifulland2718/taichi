@@ -7,7 +7,7 @@ import weakref
 def eligible(spec, backend):
     from taichi_forge._lib import core
     from taichi_forge.graph._graph import _CompiledCGraphNode, _CompiledNativeGraphNode
-    from taichi_forge.hardware._vulkan_fft import _Recording
+    from taichi_forge.hardware._vulkan_fft import _FrozenVulkanFftSource, _Recording
     from taichi_forge.lang import impl
 
     config = impl.current_cfg()
@@ -35,8 +35,8 @@ def eligible(spec, backend):
         elif isinstance(node, _CompiledNativeGraphNode):
             recording = getattr(node.executable, "_recording", None)
             if not isinstance(
-                recording, _Recording
-            ) or not recording.plan._statistics.get("inline_recording_available"):
+                recording, (_Recording, _FrozenVulkanFftSource)
+            ) or not recording.source._statistics.get("inline_recording_available"):
                 return False
         else:
             return False

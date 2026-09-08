@@ -960,7 +960,11 @@ ABI，不创建计划、不证明设备或 workload 可执行。被动状态只�
 
 ### 显式 Vulkan FFT recipe 搜索
 
-保持原计划和 compact ndarray 未关闭，再冻结 Graph。将 `ti.hardware.fft.VulkanFftRecipeProvider()`
+默认 `plan.record()` 要求搜索期间保持原计划和 compact ndarray 未关闭。若希望 recipe 拥有执行计划，
+使用 `plan.record(recipe_owned=True)`，freeze 后即可显式关闭原计划。冻结定义只保留预期事实和调用者存储，
+不持有原 FFT plan。baseline compile、部分替换和完整 recipe 均在物化时仅创建所选计划；adapter 与 baseline
+物理事实在该冷边界核对，不进入 replay。已有 live recording 不会被隐式分离或关闭，普通 `record()` 的生命周期不变。
+将 `ti.hardware.fft.VulkanFftRecipeProvider()`
 与 `ti.graph.default_recipe_providers()` 一起传给 `definition.search_recipes(...)`。
 仍使用已有完整 recipe evaluator、named metrics、report、checkpoint 与 `resolve_recipe()`；
 CompileIQ 只调度完整 identity。
@@ -978,8 +982,10 @@ batch recipe 要求 adapter 的 optional recipe extension；完整录制还要�
 稳定的 owned bindings；不覆盖 SNode/texture/host-return kernel 或设备控制 Graph 拓扑。
 父提交保留数组、参数和 FFT 资源直至退役，提前关闭已物化 Graph 不会破坏在途工作。
 
-新进程先重建等价 baseline 计划和存储，再解析所选 recipe；仅选中的分块计划在 materialize 时新建。
-这不是 FFT 二进制序列化，也不承诺零成本 baseline 恢复。调用者 baseline 分配、plan 请求的 scratch、
+新进程先重建等价 baseline 事实和存储，再解析所选 recipe。获取事实仍需初始计划创建；recipe-owned recording
+允许在 freeze 后、搜索/解析前关闭这些原计划。这不是 FFT 二进制序列化、全局 plan cache，也不承诺零成本
+baseline 恢复。并存的已物化 Graph 各自拥有独立计划；关闭/释放不用的 Graph owner 才会释放其 plan lease。
+调用者 baseline 分配、plan 请求的 scratch、
 每绑定参数 bytes 与未知 driver command/pipeline 内存是不同成本。当前实现证据仅为 Windows 本地测试，
 不据此声明 Linux 或生产加速；普通 runtime 默认选择不变。
 
