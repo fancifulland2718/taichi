@@ -1,10 +1,12 @@
 #include "taichi/program/program.h"
 
 #include "taichi/program/ndarray.h"
+#include "taichi/runtime/gfx/graph_recording.h"
 
 #ifdef TI_WITH_VULKAN
 #include "taichi/common/dynamic_loader.h"
 #include "taichi/rhi/vulkan/vulkan_device.h"
+#include "taichi/program/storage_view.h"
 #include "taichi/vkfft/forge_vkfft_provider.h"
 
 namespace taichi::lang {
@@ -47,6 +49,10 @@ class VulkanFftPlan : public vkapi::DeviceObj {
   TiForgeVkfftPlan handle{};
   std::shared_ptr<void> storage_lease;
   vkapi::IVkBuffer buffer;
+  DeviceAllocation allocation;
+  Program *program{nullptr};
+  std::vector<int> shape;
+  bool public_open{true};
   uint32_t vendor_id{0};
   uint32_t device_id{0};
   uint32_t driver_version{0};
@@ -110,6 +116,9 @@ std::uint64_t Program::create_vulkan_fft_recipe_plan(
   plan->api_version = properties.apiVersion;
   plan->storage_lease = std::move(leases);
   plan->buffer = device->get_vkbuffer(allocation);
+  plan->allocation = allocation;
+  plan->program = this;
+  plan->shape = shape;
   TiForgeVkfftConfig config{};
   config.struct_size = sizeof(config);
   config.rank = static_cast<uint32_t>(dimensions.size());
@@ -167,6 +176,77 @@ void Program::vulkan_fft_execute(std::uint64_t handle) {
   mark_runtime_submission_pending();
 }
 
+namespace {
+class VulkanFftGraphCommand final : public gfx::ExternalGraphCommand {
+ public:
+  VulkanFftGraphCommand(std::shared_ptr<VulkanFftPlan> plan, std::string name)
+      : plan_(plan), name_(std::move(name)), rank_(plan->shape.size()) {
+  }
+  std::vector<aot::Arg> arguments() const override {
+    return {aot::Arg(aot::ArgKind::kNdarray, name_, PrimitiveType::f32, rank_)};
+  }
+  void validate(
+      Program &program,
+      const std::unordered_map<std::string, aot::IValue> &args) const override {
+    const auto plan = plan_.lock();
+    TI_ERROR_IF(!plan || !plan->public_open,
+                "Vulkan FFT source command is closed");
+    TI_ERROR_IF(plan->program != &program,
+                "Vulkan FFT command belongs to another runtime");
+    auto found = args.find(name_);
+    TI_ERROR_IF(found == args.end() ||
+                    found->second.tag != aot::ArgKind::kNdarray ||
+                    !found->second.val,
+                "Vulkan FFT command requires its original ndarray binding");
+    const auto &value = found->second;
+    const auto *array = reinterpret_cast<const Ndarray *>(value.val);
+    program.validate_ndarrays_for_external_submission(&array, 1);
+    TI_ERROR_IF(array->get_device_allocation() != plan->allocation ||
+                    array->shape != plan->shape ||
+                    array->dtype != PrimitiveType::f32,
+                "Vulkan FFT command requires its original compact storage");
+    if (value.runtime_storage) {
+      const auto resolved =
+          program.resolve_runtime_storage_argument_under_graph_guard(
+              *value.runtime_storage);
+      TI_ERROR_IF(!resolved.valid || resolved.allocation != plan->allocation ||
+                      resolved.byte_offset != 0 ||
+                      resolved.byte_size !=
+                          array->get_nelement() * array->get_element_size(),
+                  "Vulkan FFT command cannot bind a sliced storage view");
+    }
+  }
+  void record(Device *, CommandList *commands) const override {
+    // Source tokens do not extend a Vulkan device lifetime. Only the recorded
+    // command-buffer refs acquire ownership, and the runtime retires those
+    // before device destruction. Validation and this append share its guard.
+    const auto plan = plan_.lock();
+    TI_ASSERT(plan && plan->public_open);
+    auto *list = static_cast<vulkan::VulkanCommandList *>(commands);
+    const auto command = list->begin_external_compute(plan);
+    TI_ERROR_IF(plan->api.append(plan->handle, command) != 0,
+                "Vulkan FFT Graph command recording failed: {}",
+                plan->api.last_error());
+  }
+
+ private:
+  std::weak_ptr<VulkanFftPlan> plan_;
+  std::string name_;
+  std::size_t rank_;
+};
+}  // namespace
+
+std::shared_ptr<gfx::ExternalGraphCommand> Program::vulkan_fft_graph_command(
+    std::uint64_t handle,
+    const std::string &binding_name) {
+  std::lock_guard<std::recursive_mutex> lock(
+      runtime_resource_submission_mutex_);
+  auto found = vulkan_fft_plans_.find(handle);
+  TI_ERROR_IF(found == vulkan_fft_plans_.end() || binding_name.empty(),
+              "Vulkan FFT command requires an open plan and a binding name");
+  return std::make_shared<VulkanFftGraphCommand>(found->second, binding_name);
+}
+
 std::unordered_map<std::string, std::uint64_t>
 Program::vulkan_fft_plan_statistics(std::uint64_t handle) {
   std::lock_guard<std::recursive_mutex> lock(
@@ -209,12 +289,19 @@ void Program::destroy_vulkan_fft_plan(std::uint64_t handle) {
   std::lock_guard<std::recursive_mutex> lock(
       runtime_resource_submission_mutex_);
   // In-flight and cached command buffers retain their own plan/storage lease.
+  const auto found = vulkan_fft_plans_.find(handle);
+  if (found != vulkan_fft_plans_.end()) {
+    found->second->public_open = false;
+  }
   vulkan_fft_plans_.erase(handle);
 }
 
 void Program::vulkan_clear_fft_plans() {
   std::lock_guard<std::recursive_mutex> lock(
       runtime_resource_submission_mutex_);
+  for (const auto &[handle, plan] : vulkan_fft_plans_) {
+    plan->public_open = false;
+  }
   vulkan_fft_plans_.clear();
 }
 }  // namespace taichi::lang
@@ -248,6 +335,11 @@ Program::vulkan_fft_plan_statistics(std::uint64_t) {
 void Program::destroy_vulkan_fft_plan(std::uint64_t) {
 }
 void Program::vulkan_clear_fft_plans() {
+}
+std::shared_ptr<gfx::ExternalGraphCommand> Program::vulkan_fft_graph_command(
+    std::uint64_t,
+    const std::string &) {
+  TI_ERROR("Vulkan FFT is unavailable in this build.");
 }
 }  // namespace taichi::lang
 #endif

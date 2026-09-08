@@ -61,6 +61,7 @@
 #include "taichi/program/sparse_device_minres.h"
 #include "taichi/aot/graph_data.h"
 #include "taichi/runtime/gfx/runtime.h"
+#include "taichi/runtime/gfx/graph_recording.h"
 #include "taichi/ir/mesh.h"
 
 #include "taichi/program/kernel_profiler.h"
@@ -3163,6 +3164,8 @@ void export_lang(py::module &m) {
            py::arg("batch_tile"), py::call_guard<py::gil_scoped_release>())
       .def("_vulkan_fft_plan_statistics", &Program::vulkan_fft_plan_statistics,
            py::arg("handle"))
+      .def("_vulkan_fft_graph_command", &Program::vulkan_fft_graph_command,
+           py::arg("handle"), py::arg("binding_name"))
       .def("_destroy_vulkan_fft_plan",
            tracked_native_program_method(&Program::destroy_vulkan_fft_plan),
            py::arg("handle"), py::call_guard<py::gil_scoped_release>())
@@ -5760,6 +5763,32 @@ void export_lang(py::module &m) {
       return true;
     });
   };
+
+#if defined(TI_WITH_VULKAN)
+  py::class_<gfx::ExternalGraphCommand, std::shared_ptr<gfx::ExternalGraphCommand>>(
+      m, "_GfxExternalGraphCommand");
+  py::class_<gfx::FixedGraphRecording, std::shared_ptr<gfx::FixedGraphRecording>>(
+      m, "_VulkanFixedGraphRecording")
+      .def("run", &gfx::FixedGraphRecording::run, py::call_guard<py::gil_scoped_release>())
+      .def("close", &gfx::FixedGraphRecording::close, py::call_guard<py::gil_scoped_release>())
+      .def("argument_bytes", &gfx::FixedGraphRecording::argument_bytes,
+           py::call_guard<py::gil_scoped_release>());
+  m.def("_prepare_vulkan_graph_recording",
+        [with_graph_arguments](Program &program, const py::list &sources, const py::dict &args) {
+          std::vector<gfx::GraphRecordingSource> native_sources;
+          for (const auto &source : sources) {
+            if (py::isinstance<aot::CompiledGraph>(source)) {
+              native_sources.push_back({source.cast<aot::CompiledGraph *>()});
+            } else {
+              native_sources.push_back({source.cast<std::shared_ptr<gfx::ExternalGraphCommand>>()});
+            }
+          }
+          auto schema = gfx::graph_recording_argument_schema(native_sources);
+          return with_graph_arguments(&schema, args, [&](const auto &converted) {
+            return program.create_vulkan_graph_recording(native_sources, converted);
+          });
+        }, py::keep_alive<0, 1>());
+#endif
 
 #if defined(TI_WITH_CUDA)
   py::class_<cuda::GraphBindingFrame, std::shared_ptr<cuda::GraphBindingFrame>>(

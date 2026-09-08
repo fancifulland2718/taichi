@@ -51,6 +51,12 @@ namespace cuda::detail {
 enum class CudaAsyncTileAdmissionReason : std::uint8_t;
 }
 
+namespace gfx {
+class ExternalGraphCommand;
+class FixedGraphRecording;
+struct GraphRecordingSource;
+}
+
 struct VulkanSparseAssemblyDispatchInfo {
   std::size_t radix_sort_workspace_bytes{0};
   std::size_t scan_workspace_bytes{0};
@@ -1325,6 +1331,11 @@ class TI_DLL_EXPORT Program {
   vulkan_fft_plan_statistics(std::uint64_t handle);
   void destroy_vulkan_fft_plan(std::uint64_t handle);
   void vulkan_clear_fft_plans();
+  std::shared_ptr<gfx::ExternalGraphCommand> vulkan_fft_graph_command(
+      std::uint64_t handle, const std::string &binding_name);
+  std::shared_ptr<gfx::FixedGraphRecording> create_vulkan_graph_recording(
+      const std::vector<gfx::GraphRecordingSource> &sources,
+      const std::unordered_map<std::string, aot::IValue> &args);
 
   std::uint64_t create_cuda_cufft_plan_1d(std::size_t length,
                                           std::size_t batch_count,

@@ -865,6 +865,12 @@ class GraphReplayRegistry {
     return runtime_->snapshot_graph_replay_stats(replay_key);
   }
 
+  void launch_prepared(uint64_t replay_key) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    TI_ERROR_IF(runtime_ == nullptr, "Prepared Vulkan Graph belongs to a closed runtime");
+    runtime_->launch_prepared_graph(replay_key);
+  }
+
  private:
   std::mutex mutex_;
   GfxRuntime *runtime_{nullptr};
@@ -896,6 +902,10 @@ GraphReplayStats GraphReplayRegistration::snapshot_stats() const {
     return {};
   }
   return registry_->snapshot_stats(replay_key_);
+}
+
+void GraphReplayRegistration::launch_prepared() const {
+  registry_->launch_prepared(replay_key_);
 }
 
 constexpr size_t kGtmpBufferSize = 1024 * 1024;
@@ -2603,6 +2613,192 @@ GraphReplayStats GfxRuntime::snapshot_graph_replay_stats(
   };
 }
 
+namespace {
+bool bind_graph_task(GfxRuntime::GraphReplayExecutable::PreparedDispatch &pd,
+                     int task_index,
+                     ShaderResourceSet *bindings,
+                     bool patch_existing) {
+  for (const auto &bind : pd.kernel->buffer_binding_plan(task_index)) {
+    if (bind.binding < 0) {
+      continue;
+    }
+    switch (bind.kind) {
+      case CompiledTaichiKernel::BufferBindingKind::Skip:
+        break;
+      case CompiledTaichiKernel::BufferBindingKind::StaticRw:
+        bindings->rw_buffer(bind.binding, bind.static_alloc
+                                              ? *bind.static_alloc
+                                              : kDeviceNullAllocation);
+        break;
+      case CompiledTaichiKernel::BufferBindingKind::StaticLookupRw: {
+        auto *allocation = pd.kernel->get_buffer_bind(bind.buffer);
+        bindings->rw_buffer(bind.binding,
+                            allocation ? *allocation : kDeviceNullAllocation);
+        break;
+      }
+      case CompiledTaichiKernel::BufferBindingKind::ExtArrRw:
+        if (pd.host_ctx->device_allocation_type[bind.buffer.root_id] ==
+            LaunchContextBuilder::DevAllocType::kDenseStorage) {
+          const auto &binding =
+              pd.host_ctx->get_resolved_dense_storage(bind.buffer.root_id);
+          if (binding.byte_size == 0) {
+            bindings->rw_buffer(bind.binding, binding.allocation);
+          } else {
+            bindings->rw_buffer(bind.binding, binding.device_ptr(),
+                                binding.byte_size);
+          }
+        } else {
+          bindings->rw_buffer(bind.binding,
+                              pd.any_arrays->at(bind.buffer.root_id));
+        }
+        break;
+      case CompiledTaichiKernel::BufferBindingKind::Args:
+        bindings->buffer(bind.binding, pd.args_buffer ? *pd.args_buffer
+                                                      : kDeviceNullAllocation);
+        break;
+      case CompiledTaichiKernel::BufferBindingKind::ArgPack:
+      case CompiledTaichiKernel::BufferBindingKind::RetsRw:
+      case CompiledTaichiKernel::BufferBindingKind::ChunkedRwArray:
+        TI_NOT_IMPLEMENTED;
+    }
+  }
+  return bindings->prepare_for_replay(patch_existing) == RhiResult::success;
+}
+}  // namespace
+
+std::unique_ptr<GraphReplayRegistration> GfxRuntime::prepare_fixed_graph(
+    const std::vector<GraphRecordingOperation> &operations,
+    std::vector<std::shared_ptr<void>> owners) {
+  // On a cold failure release the host API lock before registration retirement
+  // (registry -> runtime is also the order used by reset and late destruction).
+  auto registration = register_graph_replay(1);
+  std::lock_guard<std::recursive_mutex> lock(host_api_mutex_);
+  TI_ERROR_IF(
+      operations.empty() || profiler_ || dispatch_cache_,
+      "Prepared Vulkan Graph requires nonempty uninstrumented commands");
+  // Build transactionally before publishing a registration. No mathematical
+  // dispatch or queue submission occurs during argument/descriptor preparation.
+  GraphReplayState state;
+  auto &executable = state.executable;
+  executable.bind_device(device_);
+  executable.slots.resize(1);
+  auto &slot = executable.slots.front();
+  slot.retained_owners = std::move(owners);
+  std::vector<GraphReplayExecutable::PreparedDispatch> prepared;
+  for (const auto &operation : operations) {
+    if (operation.external) {
+      continue;
+    }
+    const auto &dispatch = operation.dispatch;
+    auto found = ti_kernels_.find(dispatch.handle.get_launch_id());
+    TI_ERROR_IF(!dispatch.host_ctx || found == ti_kernels_.end() ||
+                    dispatch.indirect_dispatch != kDeviceNullPtr,
+                "Prepared Vulkan Graph requires fixed kernel dispatches");
+    auto *kernel = found->second.get();
+    TI_ERROR_IF(kernel->get_ret_buffer_size() ||
+                    !kernel->runtime_argpack_args().empty(),
+                "Prepared Vulkan Graph cannot retain host returns or ArgPacks");
+    for (const auto &array : kernel->runtime_array_args()) {
+      const auto kind =
+          dispatch.host_ctx->device_allocation_type[array.indices];
+      TI_ERROR_IF(kind != LaunchContextBuilder::DevAllocType::kNdarray &&
+                      kind != LaunchContextBuilder::DevAllocType::kDenseStorage,
+                  "Prepared Vulkan Graph requires owned device arrays");
+    }
+    const auto &tasks = kernel->ti_kernel_attribs().tasks_attribs;
+    for (std::size_t i = 0; i < tasks.size(); ++i) {
+      TI_ERROR_IF(
+          !tasks[i].texture_binds.empty() ||
+              !tasks[i].acceleration_structure_binds.empty() ||
+              tasks[i].task_type == OffloadedTaskType::listgen ||
+              tasks[i].may_mutate_sparse_topology ||
+              kernel->task_uses_listgen_buffer(i),
+          "Prepared Vulkan Graph requires topology-stable buffer tasks");
+      for (const auto &bind : kernel->buffer_binding_plan(i)) {
+        TI_ERROR_IF(
+            bind.kind == CompiledTaichiKernel::BufferBindingKind::ArgPack ||
+                bind.kind == CompiledTaichiKernel::BufferBindingKind::RetsRw ||
+                bind.kind ==
+                    CompiledTaichiKernel::BufferBindingKind::ChunkedRwArray,
+            "Unsupported prepared Vulkan Graph resource binding");
+      }
+    }
+    prepared.push_back({kernel, dispatch.host_ctx});
+  }
+  executable.refresh_prepared_cache({1}, prepared);
+  slot.args_buffers.resize(prepared.size());
+  slot.args_buffer_sizes.resize(prepared.size());
+  for (std::size_t i = 0; i < prepared.size(); ++i) {
+    auto &pd = prepared[i];
+    const auto size = pd.kernel->get_args_buffer_size();
+    if (size) {
+      auto [buffer, status] = device_->allocate_memory_unique(
+          {size, true, false, false, AllocUsage::Uniform});
+      TI_ERROR_IF(status != RhiResult::success,
+                  "Prepared Vulkan Graph argument allocation failed");
+      slot.args_buffers[i] = std::move(buffer);
+      slot.args_buffer_sizes[i] = size;
+    }
+    pd.args_buffer = slot.args_buffers[i].get();
+    auto blitter = HostDeviceContextBlitter::maybe_make(
+        &pd.kernel->ti_kernel_attribs().ctx_attribs,
+        &pd.kernel->runtime_array_args(), *pd.host_ctx, device_, pd.args_buffer,
+        nullptr);
+    if (blitter) {
+      blitter->host_to_device(*pd.any_arrays, {}, {});
+    }
+  }
+  auto [commands, status] =
+      device_->get_compute_stream()->new_command_list_unique();
+  TI_ERROR_IF(status != RhiResult::success,
+              "Prepared Vulkan Graph command allocation failed");
+  commands->memory_barrier();
+  std::size_t kernel_index = 0;
+  for (const auto &operation : operations) {
+    if (operation.external) {
+      operation.external(device_, commands.get());
+      commands->memory_barrier();
+      continue;
+    }
+    auto &pd = prepared[kernel_index++];
+    const auto &tasks = pd.kernel->ti_kernel_attribs().tasks_attribs;
+    for (std::size_t i = 0; i < tasks.size(); ++i) {
+      auto resources = device_->create_resource_set_unique();
+      TI_ERROR_IF(!bind_graph_task(pd, i, resources.get(), false),
+                  "Prepared Vulkan Graph descriptor preparation failed");
+      commands->bind_pipeline(pd.kernel->get_pipeline(i));
+      TI_ERROR_IF(commands->bind_shader_resources(resources.get()) !=
+                      RhiResult::success,
+                  "Prepared Vulkan Graph resource binding failed");
+      const auto &task = tasks[i];
+      const int groups = (task.advisory_total_num_threads +
+                          task.advisory_num_threads_per_group - 1) /
+                         task.advisory_num_threads_per_group;
+      TI_ERROR_IF(commands->dispatch(groups) != RhiResult::success,
+                  "Prepared Vulkan Graph dispatch recording failed");
+      commands->memory_barrier();
+      slot.resource_sets.push_back(std::move(resources));
+    }
+  }
+  slot.cmdlist = std::move(commands);
+  slot.recorded = true;
+  state.last_path = GraphReplayLastPath::record;
+  graph_replay_states_.emplace(registration->replay_key(), std::move(state));
+  return registration;
+}
+
+void GfxRuntime::launch_prepared_graph(std::uint64_t replay_key) {
+  std::lock_guard<std::recursive_mutex> lock(host_api_mutex_);
+  auto &slot = graph_replay_states_.at(replay_key).executable.slots.front();
+  // Fixed argument images, commands and owners: no signature building,
+  // descriptor updates, per-dispatch preparation, observation or ready-slot
+  // poll. Same ordered queue permits simultaneous reuse of the immutable
+  // command list.
+  flush_if_pending();
+  slot.completion = device_->get_compute_stream()->submit(slot.cmdlist.get());
+  latest_compute_completion_ = slot.completion;
+}
+
 bool GfxRuntime::try_launch_graph(
     const std::vector<GraphDispatch> &dispatches,
     uint64_t replay_key,
@@ -3348,53 +3544,7 @@ bool GfxRuntime::try_launch_graph(
   auto update_task_bindings = [&](PreparedDispatch &pd, int task_index,
                                   ShaderResourceSet *bindings,
                                   bool patch_existing) {
-    for (const auto &bind : pd.kernel->buffer_binding_plan(task_index)) {
-      if (bind.binding < 0) {
-        continue;
-      }
-      switch (bind.kind) {
-        case CompiledTaichiKernel::BufferBindingKind::Skip:
-          break;
-        case CompiledTaichiKernel::BufferBindingKind::StaticRw:
-          bindings->rw_buffer(bind.binding,
-                              bind.static_alloc ? *bind.static_alloc
-                                                : kDeviceNullAllocation);
-          break;
-        case CompiledTaichiKernel::BufferBindingKind::StaticLookupRw: {
-          DeviceAllocation *alloc = pd.kernel->get_buffer_bind(bind.buffer);
-          bindings->rw_buffer(bind.binding,
-                              alloc ? *alloc : kDeviceNullAllocation);
-          break;
-        }
-        case CompiledTaichiKernel::BufferBindingKind::ExtArrRw:
-          if (pd.host_ctx->device_allocation_type[bind.buffer.root_id] ==
-              LaunchContextBuilder::DevAllocType::kDenseStorage) {
-            const auto &binding =
-                pd.host_ctx->get_resolved_dense_storage(bind.buffer.root_id);
-            if (binding.byte_size == 0) {
-              bindings->rw_buffer(bind.binding, binding.allocation);
-            } else {
-              bindings->rw_buffer(bind.binding, binding.device_ptr(),
-                                  binding.byte_size);
-            }
-          } else {
-            bindings->rw_buffer(bind.binding,
-                                pd.any_arrays->at(bind.buffer.root_id));
-          }
-          break;
-        case CompiledTaichiKernel::BufferBindingKind::Args:
-          bindings->buffer(bind.binding,
-                           pd.args_buffer ? *pd.args_buffer
-                                          : kDeviceNullAllocation);
-          break;
-        case CompiledTaichiKernel::BufferBindingKind::ArgPack:
-        case CompiledTaichiKernel::BufferBindingKind::RetsRw:
-        case CompiledTaichiKernel::BufferBindingKind::ChunkedRwArray:
-          TI_NOT_IMPLEMENTED;
-      }
-    }
-    return bindings->prepare_for_replay(patch_existing) ==
-           RhiResult::success;
+    return bind_graph_task(pd, task_index, bindings, patch_existing);
   };
 
   auto patch_all_task_bindings = [&]() {

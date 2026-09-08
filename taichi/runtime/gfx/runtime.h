@@ -100,6 +100,9 @@ class TI_DLL_EXPORT GraphReplayRegistration {
   }
   GraphReplayStats debug_stats() const;
   GraphReplayStats snapshot_stats() const;
+  // Only registrations returned by prepare_fixed_graph() expose this private
+  // native entry. Its command/argument images are immutable until retirement.
+  void launch_prepared() const;
 
  private:
   friend class GfxRuntime;
@@ -298,6 +301,12 @@ class TI_DLL_EXPORT GfxRuntime {
     std::uint32_t source_dispatch_count{1};
   };
 
+  struct GraphRecordingOperation {
+    GraphDispatch dispatch;
+    // Cold-only append of an already-owned external command. Empty for kernels.
+    std::function<void(Device *, CommandList *)> external;
+  };
+
   enum class GraphStructuredStrategy : std::uint32_t {
     automatic = 0,
     compact = 1,
@@ -416,6 +425,7 @@ class TI_DLL_EXPORT GfxRuntime {
       std::vector<std::unique_ptr<DeviceAllocationGuard>> args_buffers;
       std::vector<size_t> args_buffer_sizes;
       std::vector<std::unique_ptr<ShaderResourceSet>> resource_sets;
+      std::vector<std::shared_ptr<void>> retained_owners;
       std::unique_ptr<DeviceAllocationGuard> structured_control_buffer;
       std::unique_ptr<DeviceAllocationGuard> structured_observation_buffer;
       std::size_t structured_control_bytes{0};
@@ -516,6 +526,10 @@ class TI_DLL_EXPORT GfxRuntime {
       uint64_t replay_token);
   bool owns_graph_replay_registration(
       const GraphReplayRegistration &registration) const;
+  std::unique_ptr<GraphReplayRegistration> prepare_fixed_graph(
+      const std::vector<GraphRecordingOperation> &operations,
+      std::vector<std::shared_ptr<void>> owners);
+  void launch_prepared_graph(std::uint64_t replay_key);
 
   void buffer_copy(DevicePtr dst, DevicePtr src, size_t size);
   void copy_image(DeviceAllocation dst,
