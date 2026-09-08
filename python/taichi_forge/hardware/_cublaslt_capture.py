@@ -116,7 +116,14 @@ class _CaptureExecutable(HardwareRecordingExecutable):
                 if plan.workspace_bytes
                 else {}
             ),
+            publish_time_binding_validation_stable=getattr(
+                recording, "graph_publish_time_binding_validation_stable", False
+            ),
         )
+        if not callable(getattr(recording, "validate_graph_bindings", None)):
+            # The typed native command checks these bindings at capture. Do
+            # not install a no-op Python validator on every replay.
+            self.validate_graph_bindings = None
 
 
 class _CaptureNode(NativeGraphNode):

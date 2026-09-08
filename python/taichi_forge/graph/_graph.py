@@ -10538,7 +10538,8 @@ def _replay_recipe_cgraph_node(
                 from taichi_forge.graph._recipes.deferred import FrozenNativeRecipeSource
 
                 if isinstance(executable, FrozenNativeRecipeSource):
-                    executable = executable.materialize()
+                    executable.append_to_graph(builder, admission=admission)
+                    continue
                 builder._append_native_executable(executable, admission=admission)
             else:
                 rewriter(builder, operation)

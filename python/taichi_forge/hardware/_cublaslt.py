@@ -286,9 +286,12 @@ class _CublasLtLibrary:
             value = self.status_string(status)
             if value:
                 detail = ": " + value.decode("utf-8", errors="replace")
-        raise TaichiRuntimeError(
+        error = TaichiRuntimeError(
             f"cuBLASLt {operation} failed with status {status}{detail}"
         )
+        error.vendor_status = status
+        error.vendor_operation = operation
+        raise error
 
 
 _LIBRARY_LOCK = threading.RLock()

@@ -2,6 +2,7 @@
 
 from taichi_forge.linalg import experimental
 from taichi_forge.linalg._fft import record_fft
+from taichi_forge.linalg._matmul import record_matmul
 from taichi_forge.linalg._runtime import (
     LinearOperator,
     OperatorCapabilities,
