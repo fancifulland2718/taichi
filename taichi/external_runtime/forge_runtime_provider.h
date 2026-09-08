@@ -238,6 +238,38 @@ typedef struct TiForgeCusparseLtExecutionApi {
   TiForgeCusparseLtDestroyPlanFn destroy_matmul_plan;
 } TiForgeCusparseLtExecutionApi;
 
+// Optional cuSPARSELt-specific extension. ABI 1 remains available unchanged.
+// These are provider-private materializer facts, not public optimizer axes.
+#define TI_FORGE_CUSPARSELT_CONFIG_EXECUTION_ABI_VERSION 2u
+#define TI_FORGE_CUSPARSELT_ATTRIBUTE_DEFAULT INT32_MIN
+
+typedef struct TiForgeCusparseLtMatmulConfig {
+  uint32_t struct_size;
+  int32_t algorithm_id;  // -1 selects the vendor default at creation.
+  int32_t split_k;       // ATTRIBUTE_DEFAULT leaves an attribute untouched.
+  int32_t split_k_mode;
+  int32_t split_k_buffers;
+  uint32_t relu;
+} TiForgeCusparseLtMatmulConfig;
+
+typedef TiForgeRuntimeProviderResult (*TiForgeCusparseLtCreateConfiguredPlanFn)(
+    TiForgeRuntimeProviderRuntime runtime,
+    const TiForgeCusparseLtMatmulPlanDesc *desc,
+    const TiForgeCusparseLtMatmulConfig *configuration,
+    TiForgeCusparseLtMatmulPlan *out_plan,
+    TiForgeCusparseLtMatmulPlanInfo *out_info);
+typedef TiForgeRuntimeProviderResult (*TiForgeCusparseLtGetConfigurationFn)(
+    TiForgeCusparseLtMatmulPlan plan,
+    TiForgeCusparseLtMatmulConfig *out_configuration,
+    int32_t *out_algorithm_count);
+
+typedef struct TiForgeCusparseLtConfiguredExecutionApi {
+  uint32_t struct_size;
+  uint32_t execution_abi_version;
+  TiForgeCusparseLtCreateConfiguredPlanFn create_matmul_plan;
+  TiForgeCusparseLtGetConfigurationFn get_configuration;
+} TiForgeCusparseLtConfiguredExecutionApi;
+
 typedef void *TiForgeAmgxSolver;
 
 typedef enum TiForgeAmgxValueType {

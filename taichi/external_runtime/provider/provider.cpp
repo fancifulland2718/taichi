@@ -41,7 +41,7 @@ constexpr char kProviderId[] = "cusparselt";
 constexpr char kProviderName[] = "NVIDIA cuSPARSELt";
 constexpr char kSupportedVersionFamily[] = "0.8.x-0.9.x";
 constexpr char kBuildIdentity[] =
-    "forge-runtime-provider-abi2-cusparselt-api-0.8-0.9";
+    "forge-runtime-provider-abi2-cusparselt-api-0.8-0.9-configured-plan-v1";
 constexpr const char *kWindowsCandidates[] = {"cusparseLt64_0.dll",
                                               "cusparseLt.dll"};
 constexpr const char *kLinuxCandidates[] = {"libcusparseLt.so.0",
@@ -526,6 +526,18 @@ using CusparseLtMatmulFn =
                                     int32_t);
 using CusparseLtGetErrorStringFn =
     const char *(TI_FORGE_CUSPARSELT_CALL *)(int);
+using CusparseLtSetAttributeFn =
+    int(TI_FORGE_CUSPARSELT_CALL *)(const CusparseLtOpaque *,
+                                    CusparseLtOpaque *,
+                                    int,
+                                    const void *,
+                                    size_t);
+using CusparseLtGetAttributeFn =
+    int(TI_FORGE_CUSPARSELT_CALL *)(const CusparseLtOpaque *,
+                                    const CusparseLtOpaque *,
+                                    int,
+                                    void *,
+                                    size_t);
 
 struct CusparseLtPlan {
   Runtime *runtime{nullptr};
@@ -552,6 +564,8 @@ struct CusparseLtPlan {
   CusparseLtCompressFn compress{nullptr};
   CusparseLtMatmulFn execute{nullptr};
   CusparseLtGetErrorStringFn error_string{nullptr};
+  CusparseLtGetAttributeFn get_algorithm_attribute{nullptr};
+  bool relu{false};
   std::mutex mutex;
 };
 
@@ -592,9 +606,10 @@ void cleanup_cusparselt_plan(CusparseLtPlan &plan) {
   }
 }
 
-TiForgeRuntimeProviderResult cusparselt_create_plan(
+TiForgeRuntimeProviderResult cusparselt_create_plan_impl(
     TiForgeRuntimeProviderRuntime runtime_value,
     const TiForgeCusparseLtMatmulPlanDesc *desc,
+    const TiForgeCusparseLtMatmulConfig *configuration,
     TiForgeCusparseLtMatmulPlan *out_plan,
     TiForgeCusparseLtMatmulPlanInfo *out_info) {
   if (runtime_value == nullptr || desc == nullptr || out_plan == nullptr ||
@@ -607,6 +622,12 @@ TiForgeRuntimeProviderResult cusparselt_create_plan(
                 "invalid cuSPARSELt FP16 2:4 matmul plan description");
   }
   *out_plan = nullptr;
+  if (configuration &&
+      (configuration->struct_size < sizeof(*configuration) ||
+       configuration->algorithm_id < -1 || configuration->relu > 1)) {
+    return fail(TI_FORGE_RUNTIME_PROVIDER_ERROR_INVALID_ARGUMENT,
+                "invalid cuSPARSELt physical configuration");
+  }
   auto *runtime = static_cast<Runtime *>(runtime_value);
   auto plan =
       std::unique_ptr<CusparseLtPlan>(new (std::nothrow) CusparseLtPlan());
@@ -647,6 +668,17 @@ TiForgeRuntimeProviderResult cusparselt_create_plan(
       reinterpret_cast<CusparseLtMatmulFn>(symbol("cusparseLtMatmul"));
   plan->error_string = reinterpret_cast<CusparseLtGetErrorStringFn>(
       symbol("cusparseLtGetErrorString"));
+  auto set_algorithm = reinterpret_cast<CusparseLtSetAttributeFn>(
+      symbol("cusparseLtMatmulAlgSetAttribute"));
+  auto set_matmul = reinterpret_cast<CusparseLtSetAttributeFn>(
+      symbol("cusparseLtMatmulDescSetAttribute"));
+  plan->get_algorithm_attribute = reinterpret_cast<CusparseLtGetAttributeFn>(
+      symbol("cusparseLtMatmulAlgGetAttribute"));
+  if (configuration &&
+      (!set_algorithm || !set_matmul || !plan->get_algorithm_attribute)) {
+    return fail(TI_FORGE_RUNTIME_PROVIDER_ERROR_EXECUTION_UNSUPPORTED,
+                "cuSPARSELt configured-plan attributes are unavailable");
+  }
 
   auto checked = [&](int status, const char *operation) {
     return status == 0 ? TI_FORGE_RUNTIME_PROVIDER_SUCCESS
@@ -690,14 +722,52 @@ TiForgeRuntimeProviderResult cusparselt_create_plan(
   if (checked(
           matmul_init(&plan->handle, &plan->matmul, kNonTranspose, kTranspose,
                       &plan->a, &plan->b, &plan->c, &plan->c, kCompute32F),
-          "matmul descriptor creation") != TI_FORGE_RUNTIME_PROVIDER_SUCCESS ||
-      checked(algorithm_init(&plan->handle, &plan->algorithm, &plan->matmul, 0),
+          "matmul descriptor creation") != TI_FORGE_RUNTIME_PROVIDER_SUCCESS) {
+    cleanup_cusparselt_plan(*plan);
+    return TI_FORGE_RUNTIME_PROVIDER_ERROR_VENDOR_CALL;
+  }
+  if (configuration && configuration->relu) {
+    const int32_t enabled = 1;
+    // CUSPARSELT_MATMUL_ACTIVATION_RELU = 0, int32, in supported 0.8/0.9
+    // headers.
+    if (checked(set_matmul(&plan->handle, &plan->matmul, 0, &enabled,
+                           sizeof(enabled)),
+                "ReLU epilogue configuration") !=
+        TI_FORGE_RUNTIME_PROVIDER_SUCCESS) {
+      cleanup_cusparselt_plan(*plan);
+      return TI_FORGE_RUNTIME_PROVIDER_ERROR_VENDOR_CALL;
+    }
+    plan->relu = true;
+  }
+  if (checked(algorithm_init(&plan->handle, &plan->algorithm, &plan->matmul, 0),
               "algorithm selection creation") !=
-          TI_FORGE_RUNTIME_PROVIDER_SUCCESS) {
+      TI_FORGE_RUNTIME_PROVIDER_SUCCESS) {
     cleanup_cusparselt_plan(*plan);
     return TI_FORGE_RUNTIME_PROVIDER_ERROR_VENDOR_CALL;
   }
   plan->algorithm_live = true;
+  if (configuration) {
+    // Algorithm attributes 0/3/4/5 are stable across the supported 0.8/0.9 ABI.
+    // No vendor search is performed, and a live plan is never mutated.
+    const std::pair<int, int32_t> attributes[] = {
+        {0, configuration->algorithm_id < 0
+                ? TI_FORGE_CUSPARSELT_ATTRIBUTE_DEFAULT
+                : configuration->algorithm_id},
+        {3, configuration->split_k},
+        {4, configuration->split_k_mode},
+        {5, configuration->split_k_buffers}};
+    for (const auto &attribute : attributes) {
+      if (attribute.second == TI_FORGE_CUSPARSELT_ATTRIBUTE_DEFAULT)
+        continue;
+      if (checked(
+              set_algorithm(&plan->handle, &plan->algorithm, attribute.first,
+                            &attribute.second, sizeof(attribute.second)),
+              "algorithm configuration") != TI_FORGE_RUNTIME_PROVIDER_SUCCESS) {
+        cleanup_cusparselt_plan(*plan);
+        return TI_FORGE_RUNTIME_PROVIDER_ERROR_VENDOR_CALL;
+      }
+    }
+  }
   if (checked(plan_init(&plan->handle, &plan->plan, &plan->matmul,
                         &plan->algorithm),
               "matmul plan creation") != TI_FORGE_RUNTIME_PROVIDER_SUCCESS) {
@@ -723,6 +793,66 @@ TiForgeRuntimeProviderResult cusparselt_create_plan(
                workspace_bytes};
   runtime->live_execution_resources.fetch_add(1);
   *out_plan = plan.release();
+  return TI_FORGE_RUNTIME_PROVIDER_SUCCESS;
+}
+
+TiForgeRuntimeProviderResult cusparselt_create_plan(
+    TiForgeRuntimeProviderRuntime runtime,
+    const TiForgeCusparseLtMatmulPlanDesc *desc,
+    TiForgeCusparseLtMatmulPlan *out_plan,
+    TiForgeCusparseLtMatmulPlanInfo *out_info) {
+  return cusparselt_create_plan_impl(runtime, desc, nullptr, out_plan,
+                                     out_info);
+}
+
+TiForgeRuntimeProviderResult cusparselt_create_configured_plan(
+    TiForgeRuntimeProviderRuntime runtime,
+    const TiForgeCusparseLtMatmulPlanDesc *desc,
+    const TiForgeCusparseLtMatmulConfig *configuration,
+    TiForgeCusparseLtMatmulPlan *out_plan,
+    TiForgeCusparseLtMatmulPlanInfo *out_info) {
+  if (!configuration) {
+    return fail(TI_FORGE_RUNTIME_PROVIDER_ERROR_INVALID_ARGUMENT,
+                "cuSPARSELt configured plan requires configuration");
+  }
+  return cusparselt_create_plan_impl(runtime, desc, configuration, out_plan,
+                                     out_info);
+}
+
+TiForgeRuntimeProviderResult cusparselt_get_configuration(
+    TiForgeCusparseLtMatmulPlan plan_value,
+    TiForgeCusparseLtMatmulConfig *out_configuration,
+    int32_t *out_algorithm_count) {
+  auto *plan = static_cast<CusparseLtPlan *>(plan_value);
+  if (!plan || !out_configuration || !out_algorithm_count ||
+      out_configuration->struct_size < sizeof(*out_configuration)) {
+    return fail(TI_FORGE_RUNTIME_PROVIDER_ERROR_INVALID_ARGUMENT,
+                "cuSPARSELt configuration output is null or truncated");
+  }
+  if (!plan->get_algorithm_attribute) {
+    return fail(TI_FORGE_RUNTIME_PROVIDER_ERROR_EXECUTION_UNSUPPORTED,
+                "cuSPARSELt algorithm configuration query is unavailable");
+  }
+  std::lock_guard<std::mutex> lock(plan->mutex);
+  TiForgeCusparseLtMatmulConfig configuration{};
+  configuration.struct_size = sizeof(configuration);
+  configuration.relu = plan->relu;
+  int32_t count = 0;
+  const std::pair<int, int32_t *> attributes[] = {
+      {0, &configuration.algorithm_id},
+      {1, &count},
+      {3, &configuration.split_k},
+      {4, &configuration.split_k_mode},
+      {5, &configuration.split_k_buffers}};
+  for (const auto &attribute : attributes) {
+    const auto status = plan->get_algorithm_attribute(
+        &plan->handle, &plan->algorithm, attribute.first, attribute.second,
+        sizeof(int32_t));
+    if (status != 0)
+      return cusparselt_fail(plan, status, "algorithm configuration query");
+  }
+  *out_configuration = configuration;
+  *out_algorithm_count = count;
   return TI_FORGE_RUNTIME_PROVIDER_SUCCESS;
 }
 
@@ -807,14 +937,39 @@ TiForgeRuntimeProviderResult query_execution_api(
     size_t api_size,
     void *out_api) {
   if (runtime == nullptr || out_api == nullptr ||
-      api_size < sizeof(TiForgeCusparseLtExecutionApi)) {
+      api_size < sizeof(uint32_t) * 2) {
     return fail(TI_FORGE_RUNTIME_PROVIDER_ERROR_INVALID_ARGUMENT,
                 "cuSPARSELt execution API output is null or truncated");
+  }
+  if (requested_execution_abi_version ==
+      TI_FORGE_CUSPARSELT_CONFIG_EXECUTION_ABI_VERSION) {
+    if (api_size < sizeof(TiForgeCusparseLtConfiguredExecutionApi)) {
+      return fail(TI_FORGE_RUNTIME_PROVIDER_ERROR_INVALID_ARGUMENT,
+                  "cuSPARSELt configured execution API is truncated");
+    }
+    const auto library = static_cast<Runtime *>(runtime)->library;
+    for (const auto *name :
+         {"cusparseLtMatmulAlgSetAttribute", "cusparseLtMatmulAlgGetAttribute",
+          "cusparseLtMatmulDescSetAttribute"}) {
+      if (!load_symbol(library, name)) {
+        return fail(
+            TI_FORGE_RUNTIME_PROVIDER_ERROR_EXECUTION_UNSUPPORTED,
+            std::string("cuSPARSELt configured execution is missing ") + name);
+      }
+    }
+    auto *api = static_cast<TiForgeCusparseLtConfiguredExecutionApi *>(out_api);
+    *api = {sizeof(*api), TI_FORGE_CUSPARSELT_CONFIG_EXECUTION_ABI_VERSION,
+            cusparselt_create_configured_plan, cusparselt_get_configuration};
+    return TI_FORGE_RUNTIME_PROVIDER_SUCCESS;
   }
   if (requested_execution_abi_version !=
       TI_FORGE_RUNTIME_PROVIDER_EXECUTION_ABI_VERSION) {
     return fail(TI_FORGE_RUNTIME_PROVIDER_ERROR_ABI_MISMATCH,
                 "unsupported cuSPARSELt execution ABI");
+  }
+  if (api_size < sizeof(TiForgeCusparseLtExecutionApi)) {
+    return fail(TI_FORGE_RUNTIME_PROVIDER_ERROR_INVALID_ARGUMENT,
+                "cuSPARSELt execution API output is truncated");
   }
   auto *api = static_cast<TiForgeCusparseLtExecutionApi *>(out_api);
   *api = {

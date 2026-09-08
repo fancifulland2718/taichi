@@ -177,12 +177,12 @@ class BundledRuntime:
             raise RuntimeError(f"{self.definition.provider_name} runtime has been closed")
         return self._handle
 
-    def query_execution_api(self, api_type):
+    def query_execution_api(self, api_type, *, version=EXECUTION_ABI_VERSION):
         output = api_type()
         result = int(
             self.loaded.api.query_execution_api(
                 self.handle,
-                EXECUTION_ABI_VERSION,
+                version,
                 ctypes.sizeof(api_type),
                 ctypes.byref(output),
             )
@@ -191,7 +191,7 @@ class BundledRuntime:
             raise _ProviderRuntimeError(result, _provider_error(self.loaded.api, self.definition))
         if output.struct_size < ctypes.sizeof(api_type):
             raise RuntimeError(f"{self.definition.provider_name} returned a truncated execution API")
-        if output.execution_abi_version != EXECUTION_ABI_VERSION:
+        if output.execution_abi_version != version:
             raise RuntimeError(f"{self.definition.provider_name} returned a mismatched execution ABI")
         return output
 

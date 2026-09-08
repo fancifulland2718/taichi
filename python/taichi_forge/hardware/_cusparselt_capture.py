@@ -30,6 +30,10 @@ class _PlanLease:
         mode = "refresh" if recompress else "snapshot"
         with plan.provider._lock, plan._lock:
             plan._validate_lifetime()
+            if plan._preparation_only:
+                raise TaichiRuntimeError(
+                    "cuSPARSELt preparation descriptions cannot be captured"
+                )
             if plan._capture_leases and plan._capture_mode != mode:
                 raise TaichiRuntimeError(
                     "cuSPARSELt cannot mix snapshot and refreshing recordings on one plan"

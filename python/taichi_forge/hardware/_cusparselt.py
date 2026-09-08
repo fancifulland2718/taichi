@@ -250,7 +250,19 @@ class CusparseLtProvider:
 class CusparseLtMatmulPlan:
     """Reusable row-major FP16 2:4 A times transposed-storage B matmul."""
 
-    def __init__(self, provider, m, n, k, *, alignment_bytes):
+    def __init__(
+        self,
+        provider,
+        m,
+        n,
+        k,
+        *,
+        alignment_bytes,
+        _configuration=None,
+        _preparation_only=False,
+        _expected_resources=None,
+        _expected_configuration=None,
+    ):
         if not isinstance(provider, CusparseLtProvider):
             raise TypeError("provider must be a CusparseLtProvider")
         dimensions = (m, n, k)
@@ -272,14 +284,25 @@ class CusparseLtMatmulPlan:
         info = _PlanInfo()
         info.struct_size = ctypes.sizeof(_PlanInfo)
         try:
-            provider._runtime.check_result(
-                provider._execution_api.create_matmul_plan(
+            if _configuration is None:
+                result = provider._execution_api.create_matmul_plan(
                     provider._runtime.handle,
                     ctypes.byref(desc),
                     ctypes.byref(handle),
                     ctypes.byref(info),
                 )
-            )
+            else:
+                from taichi_forge.hardware._cusparselt_config import _api, _encode
+
+                configuration = _encode(_configuration)
+                result = _api(provider).create_matmul_plan(
+                    provider._runtime.handle,
+                    ctypes.byref(desc),
+                    ctypes.byref(configuration),
+                    ctypes.byref(handle),
+                    ctypes.byref(info),
+                )
+            provider._runtime.check_result(result)
         except RuntimeError as exc:
             raise TaichiRuntimeError(str(exc)) from exc
         if not handle.value:
@@ -293,19 +316,46 @@ class CusparseLtMatmulPlan:
         self._alignment_bytes = alignment_bytes
         self._capture_leases = 0
         self._capture_mode = None
+        self._preparation_only = _preparation_only
+        self._configuration = None
+        self._algorithm_count = None
         self.compressed_bytes = int(info.compressed_bytes)
         self.compression_buffer_bytes = int(info.compression_buffer_bytes)
         self.workspace_bytes = int(info.workspace_bytes)
         try:
-            self._compressed_a = ScalarNdarray(u8, (self.compressed_bytes,))
+            if _configuration is not None:
+                from taichi_forge.hardware._cusparselt_config import _read
+
+                self._configuration, self._algorithm_count = _read(provider, handle)
+            if (
+                _expected_configuration is not None
+                and self._configuration != _expected_configuration
+            ):
+                raise TaichiRuntimeError(
+                    "cuSPARSELt restored plan configuration drifted"
+                )
+            actual_resources = (
+                self.compressed_bytes,
+                self.compression_buffer_bytes,
+                self.workspace_bytes,
+            )
+            if _expected_resources is not None and actual_resources != tuple(
+                _expected_resources
+            ):
+                raise TaichiRuntimeError("cuSPARSELt restored plan resources drifted")
+            self._compressed_a = (
+                ScalarNdarray(u8, (self.compressed_bytes,))
+                if not _preparation_only
+                else None
+            )
             self._compression_buffer = (
                 ScalarNdarray(u8, (self.compression_buffer_bytes,))
-                if self.compression_buffer_bytes
+                if self.compression_buffer_bytes and not _preparation_only
                 else None
             )
             self._workspace = (
                 ScalarNdarray(u8, (self.workspace_bytes,))
-                if self.workspace_bytes
+                if self.workspace_bytes and not _preparation_only
                 else None
             )
             self._compressed_ready = False
@@ -439,7 +489,8 @@ class CusparseLtMatmulPlan:
                     "cuSPARSELt plan cannot close while capture leases are live"
                 )
             if runtime_generation_matches(self):
-                self._runtime_prog.synchronize()
+                if not self._preparation_only:
+                    self._runtime_prog.synchronize()
                 self._close_native()
         return None
 
