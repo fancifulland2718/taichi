@@ -46,6 +46,44 @@ def configured_plan(matrix, configuration, *, _graph_owned=False, **kwargs):
         raise
 
 
+def _factor_statistics(facts):
+    """Snapshot-only facts; absent optional native/adapter support is allowed."""
+    queried = facts.get("factor_statistics_queries", 0)
+    bridge_status = facts.get("factor_statistics_result", -1)
+    values = {}
+    for name, native in (
+        ("lu_nonzeros", "factor_lu_nonzeros"),
+        ("superpanels", "factor_superpanels"),
+        ("factor_flops", "factor_flops"),
+    ):
+        status = facts.get(f"{native}_status") if queried else None
+        value = facts.get(native, -1)
+        available = bridge_status == 0 and status == 0 and value >= 0
+        values[name] = {
+            "value": value if available else None,
+            "vendor_status": status if bridge_status == 0 else None,
+            "written_bytes": (
+                facts.get(f"{native}_written_bytes", 0) if bridge_status == 0 else 0
+            ),
+        }
+    count = sum(value["value"] is not None for value in values.values())
+    if not queried:
+        result_status = "unavailable" if facts.get("graph_owned", 0) else "not_queried"
+    elif count == len(values):
+        result_status = "available"
+    else:
+        result_status = "partial" if count else "unavailable"
+    return {
+        "source": "vendor_query_not_gpu_counters",
+        "scope": "initial_private_graph_snapshot_not_current_replay_values",
+        "status": result_status,
+        "adapter_abi": facts.get("factor_statistics_abi", 0),
+        "bridge_status": bridge_status if queried else None,
+        "collection_count": queried,
+        **values,
+    }
+
+
 def configuration_report(facts):
     """Translate cached analysis estimates, never manufacture observed memory."""
     facts = dict(facts)
@@ -69,6 +107,7 @@ def configuration_report(facts):
     return {
         "configuration": configuration,
         "resolved_default_algorithm": None,
+        "preparation_factor_statistics": _factor_statistics(facts),
         "analysis_memory_estimates": {
             "kind": "vendor_estimate_not_observation",
             "scope": "analyzed_pattern_frozen_configuration_single_rhs",

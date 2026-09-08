@@ -234,6 +234,24 @@ class CudssProviderRuntime {
     return result;
   }
 
+  TiForgeCudssFactorStatisticsApi factor_statistics_api() const {
+    auto *symbol = loader_->load_function_optional(
+        TI_FORGE_CUDSS_FACTOR_STATISTICS_QUERY_SYMBOL);
+    TiForgeCudssFactorStatisticsApi result{};
+    if (!symbol) {
+      return result;
+    }
+    const auto query =
+        reinterpret_cast<TiForgeCudssFactorStatisticsQueryFn>(symbol);
+    // Diagnostics must not become a new execution requirement for old adapters.
+    if (query(1, sizeof(result), &result) != TI_FORGE_CUDSS_SUCCESS ||
+        result.struct_size != sizeof(result) || result.abi_version != 1 ||
+        !result.read_i32) {
+      return {};
+    }
+    return result;
+  }
+
   const TiForgeCudssRuntimeInfo &runtime_info() const {
     return runtime_info_;
   }
@@ -796,30 +814,48 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
         memory_estimates_written_ >= 6 * sizeof(std::int64_t);
     const auto allocation =
         allocator_ ? allocator_->observation() : std::array<std::uint64_t, 3>{};
-    return {{"configuration_abi", configuration_api_.abi_version},
-            {"graph_owned", graph_owned_ ? 1 : 0},
-            {"capture_parameters_device_resident", graph_owned_ ? 1 : 0},
-            {"allocator_live_requested_bytes",
-             static_cast<std::int64_t>(allocation[0])},
-            {"allocator_peak_requested_bytes",
-             static_cast<std::int64_t>(allocation[1])},
-            {"sealed_allocation_rejections",
-             static_cast<std::int64_t>(allocation[2])},
-            {"graph_snapshot_bytes",
-             static_cast<std::int64_t>(graph_snapshot_bytes_)},
-            {"reordering", reordering_},
-            {"solve", solve_algorithm_},
-            {"memory_estimates_status", memory_estimates_status_},
-            {"memory_estimates_written_bytes",
-             static_cast<std::int64_t>(memory_estimates_written_)},
-            {"estimated_device_persistent_bytes",
-             estimates_valid ? memory_estimates_[0] : -1},
-            {"estimated_device_peak_bytes",
-             estimates_valid ? memory_estimates_[1] : -1},
-            {"estimated_host_persistent_bytes",
-             estimates_valid ? memory_estimates_[2] : -1},
-            {"estimated_host_peak_bytes",
-             estimates_valid ? memory_estimates_[3] : -1}};
+    return {
+        {"configuration_abi", configuration_api_.abi_version},
+        {"graph_owned", graph_owned_ ? 1 : 0},
+        {"capture_parameters_device_resident", graph_owned_ ? 1 : 0},
+        {"allocator_live_requested_bytes",
+         static_cast<std::int64_t>(allocation[0])},
+        {"allocator_peak_requested_bytes",
+         static_cast<std::int64_t>(allocation[1])},
+        {"sealed_allocation_rejections",
+         static_cast<std::int64_t>(allocation[2])},
+        {"graph_snapshot_bytes",
+         static_cast<std::int64_t>(graph_snapshot_bytes_)},
+        {"reordering", reordering_},
+        {"solve", solve_algorithm_},
+        {"factor_statistics_abi", factor_statistics_abi_},
+        {"factor_statistics_result", factor_statistics_result_},
+        {"factor_statistics_queries", factor_statistics_queries_},
+        {"factor_lu_nonzeros", factor_statistics_.lu_nonzeros.value},
+        {"factor_lu_nonzeros_status",
+         factor_statistics_.lu_nonzeros.vendor_status},
+        {"factor_lu_nonzeros_written_bytes",
+         factor_statistics_.lu_nonzeros.written_bytes},
+        {"factor_superpanels", factor_statistics_.superpanels.value},
+        {"factor_superpanels_status",
+         factor_statistics_.superpanels.vendor_status},
+        {"factor_superpanels_written_bytes",
+         factor_statistics_.superpanels.written_bytes},
+        {"factor_flops", factor_statistics_.factor_flops.value},
+        {"factor_flops_status", factor_statistics_.factor_flops.vendor_status},
+        {"factor_flops_written_bytes",
+         factor_statistics_.factor_flops.written_bytes},
+        {"memory_estimates_status", memory_estimates_status_},
+        {"memory_estimates_written_bytes",
+         static_cast<std::int64_t>(memory_estimates_written_)},
+        {"estimated_device_persistent_bytes",
+         estimates_valid ? memory_estimates_[0] : -1},
+        {"estimated_device_peak_bytes",
+         estimates_valid ? memory_estimates_[1] : -1},
+        {"estimated_host_persistent_bytes",
+         estimates_valid ? memory_estimates_[2] : -1},
+        {"estimated_host_peak_bytes",
+         estimates_valid ? memory_estimates_[3] : -1}};
   }
 
   void claim_graph_phase(int phase) {
@@ -990,6 +1026,15 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
     // Finish initial factors before publishing a captured owner.
     CUDADriver::get_instance().stream_synchronize(graph_stream_);
     factorized_ = true;
+    const auto diagnostics = provider_->factor_statistics_api();
+    factor_statistics_abi_ = diagnostics.abi_version;
+    if (diagnostics.read_i32) {
+      // DataGet can synchronize. Collect only this completed private snapshot,
+      // never on factor/solve replay or on a passive configuration report.
+      ++factor_statistics_queries_;
+      factor_statistics_result_ =
+          diagnostics.read_i32(runtime, context_, data_, &factor_statistics_);
+    }
     allocator_->seal(true);
   }
 
@@ -1082,6 +1127,10 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
   std::array<std::int64_t, 16> memory_estimates_{};
   std::int64_t memory_estimates_status_{-1};
   std::size_t memory_estimates_written_{0};
+  TiForgeCudssFactorStatistics factor_statistics_{};
+  std::int64_t factor_statistics_abi_{0};
+  std::int64_t factor_statistics_result_{-1};
+  std::int64_t factor_statistics_queries_{0};
   std::size_t nonzeros_{0};
   const bool graph_owned_{false};
   int graph_numeric_phase_{-1};

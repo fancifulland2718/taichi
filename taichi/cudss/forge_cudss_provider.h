@@ -229,6 +229,46 @@ taichi_forge_cudss_configuration_query(uint32_t requested_abi_version,
                                        size_t api_size,
                                        TiForgeCudssConfigurationApi *out_api);
 
+// Optional cold diagnostics. Do not extend the published execution/config
+// tables.
+#define TI_FORGE_CUDSS_FACTOR_STATISTICS_QUERY_SYMBOL \
+  "taichi_forge_cudss_factor_statistics_query"
+
+typedef struct TiForgeCudssFactorStatistic {
+  int64_t value;
+  uint32_t vendor_status;
+  uint32_t written_bytes;
+} TiForgeCudssFactorStatistic;
+
+typedef struct TiForgeCudssFactorStatistics {
+  TiForgeCudssFactorStatistic lu_nonzeros;
+  TiForgeCudssFactorStatistic superpanels;
+  TiForgeCudssFactorStatistic factor_flops;
+} TiForgeCudssFactorStatistics;
+
+typedef struct TiForgeCudssFactorStatisticsApi {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  // Synchronous vendor queries, only after private preparation completes.
+  // The sparse matrix must have i32 indices. Each field has its own status;
+  // values are unavailable (-1) on vendor failure or a returned-size mismatch.
+  TiForgeCudssResult (*read_i32)(TiForgeCudssRuntime runtime,
+                                 void *handle,
+                                 void *data,
+                                 TiForgeCudssFactorStatistics *out_statistics);
+} TiForgeCudssFactorStatisticsApi;
+
+typedef TiForgeCudssResult (*TiForgeCudssFactorStatisticsQueryFn)(
+    uint32_t,
+    size_t,
+    TiForgeCudssFactorStatisticsApi *);
+
+TI_FORGE_CUDSS_EXPORT TiForgeCudssResult
+taichi_forge_cudss_factor_statistics_query(
+    uint32_t requested_abi_version,
+    size_t api_size,
+    TiForgeCudssFactorStatisticsApi *out_api);
+
 #ifdef __cplusplus
 }
 #endif

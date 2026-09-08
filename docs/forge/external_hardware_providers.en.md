@@ -560,6 +560,16 @@ clears and device copies still execute. Known memory distinguishes shared plan
 payload, the source's numeric snapshot, and Graph-owned per-binding parameters;
 vendor estimates and opaque driver pool/residency are not measured VRAM peaks.
 
+Preparation observations can also contain `preparation_factor_statistics`:
+vendor-reported factor nonzeros, superpanel count, and factorization FLOPS from
+the initial private snapshot. The optional adapter extension queries these once
+at cold preparation; reports read cached facts, never query the solver during
+replay. These are not GPU counters or statistics for later changed matrix values.
+Missing support and failed individual queries remain unavailable rather than
+zero, and do not disable execution with an older adapter. Fewer factor nonzeros
+or FLOPS alone do not imply faster execution. See NVIDIA's
+[cuDSS data types](https://docs.nvidia.com/cuda/cudss/types.html) for their meaning.
+
 The caller declares finite, nonsingular inputs and the matrix class. Each RHS
 must satisfy `||Ax-b||inf <= atol + rtol*||b||inf` in the evaluator; this is not a
 per-replay residual check or a promise for arbitrary ill-conditioned inputs.

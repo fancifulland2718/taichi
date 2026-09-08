@@ -445,6 +445,12 @@ Graph 自有每-binding 参数；vendor estimate 和未知 driver pool/residency
 本轮 Windows 合同覆盖 SPD/一般非对称的变化数值、固定 SPD 与交错绑定；不泛化为所有对称不定/
 pivot 情形、Linux 部署或生产 workload 资格。
 
+准备观测可包含 `preparation_factor_statistics`：vendor 返回的初始私有快照 factor 非零数、
+superpanel 数及 factorization FLOPS。可选 adapter 扩展只在冷准备阶段采集一次，报告读取缓存，
+不在 replay 查询。这不是 GPU 计数器，也不代表后续数值变化后的 factor；缺失支持或单项查询失败
+明确保留 unavailable，不填零，也不阻止旧 adapter 执行。更少的非零数或 FLOPS 不保证更快。
+字段含义见 NVIDIA 的 [cuDSS 数据类型文档](https://docs.nvidia.com/cuda/cudss/types.html)。
+
 preparation/selection 复用只保存 JSON 事实，不保存 CSR 数据或 vendor factors。新进程重新提供
 相同 pattern、初始数值及语义，以 `preparation=...` 恢复描述，解析保存的 selection 后只重建选中
 数值计划。provider/device/seed/resource 漂移明确报告；不会反序列化 Python executable 或 CUDA Graph。

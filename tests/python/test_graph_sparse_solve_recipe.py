@@ -122,6 +122,22 @@ def test_sparse_solve_lifecycles_shared_rhs_and_binding_frames(
     problem = _problem(kind)
     operation = _operation(problem, kind, fixed)
     artifact = operation.prepare(max_plans=2)
+    for observation in artifact["preparation"]["observations"]:
+        statistics = observation["preparation_factor_statistics"]
+        assert (
+            statistics["scope"]
+            == "initial_private_graph_snapshot_not_current_replay_values"
+        )
+        assert statistics["source"] == "vendor_query_not_gpu_counters"
+        if statistics["adapter_abi"] == 1:
+            assert statistics["collection_count"] == 1
+            assert statistics["status"] == "available"
+            assert statistics["lu_nonzeros"]["value"] >= problem[2].shape[0]
+            assert statistics["superpanels"]["written_bytes"] == 4
+            assert statistics["factor_flops"]["written_bytes"] == 8
+        else:
+            assert statistics["status"] == "unavailable"
+            assert statistics["collection_count"] == 0
     definition = _freeze(operation, producer=not fixed)
     catalog = definition.recipe_catalog(providers=_providers())
     frame_fragment = next(

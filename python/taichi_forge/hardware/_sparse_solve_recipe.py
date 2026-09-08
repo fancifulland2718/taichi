@@ -189,6 +189,7 @@ class SparseSolveRecipeProvider(GraphRuntimeFragmentProvider):
                 "per-binding resident parameter bytes are reported by Graph execution memory, not counted as shared plan workspace",
                 "known requested payload includes private and catalog numeric snapshots, excludes caller inputs and opaque driver pool residency",
                 "ordering defaults remain vendor policy; kernel topology and resolved default algorithm are unobserved",
+                "factor statistics describe the initial private preparation snapshot, not later replay values or GPU counters",
                 "restoration rebuilds selected configuration and factors, never serializes an executable",
             ),
         }

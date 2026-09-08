@@ -31,7 +31,7 @@ thread_local std::string probed_library_path;
 
 constexpr char kProviderName[] = "taichi-forge-cudss";
 constexpr char kBuildIdentity[] =
-    "forge-cudss-provider-abi1-cudss-0.8-configured-plan-v1";
+    "forge-cudss-provider-abi1-cudss-0.8-configured-plan-factor-statistics-v1";
 constexpr uint64_t kFeatures = TI_FORGE_CUDSS_FEATURE_CSR |
                                TI_FORGE_CUDSS_FEATURE_DENSE_VECTOR |
                                TI_FORGE_CUDSS_FEATURE_STAGED_EXECUTION |
@@ -463,6 +463,42 @@ uint32_t analysis_memory_estimates(TiForgeCudssRuntime runtime,
       CUDSS_DATA_MEMORY_ESTIMATES, estimates, capacity_bytes, written_bytes);
 }
 
+template <typename T>
+TiForgeCudssFactorStatistic read_factor_statistic(Runtime &runtime,
+                                                  void *handle,
+                                                  void *data,
+                                                  cudssDataParam_t parameter) {
+  T value{-1};
+  size_t written = 0;
+  const auto status = runtime.data_get(
+      static_cast<cudssHandle_t>(handle), static_cast<cudssData_t>(data),
+      parameter, &value, sizeof(value), &written);
+  return {status == CUDSS_STATUS_SUCCESS && written == sizeof(value)
+              ? static_cast<int64_t>(value)
+              : -1,
+          static_cast<uint32_t>(status), static_cast<uint32_t>(written)};
+}
+
+TiForgeCudssResult read_factor_statistics_i32(
+    TiForgeCudssRuntime runtime,
+    void *handle,
+    void *data,
+    TiForgeCudssFactorStatistics *out_statistics) {
+  auto *owner = checked(runtime);
+  if (!owner || !handle || !data || !out_statistics) {
+    return TI_FORGE_CUDSS_ERROR_INVALID_ARGUMENT;
+  }
+  if (!owner->data_get) {
+    return TI_FORGE_CUDSS_ERROR_RUNTIME_INCOMPATIBLE;
+  }
+  *out_statistics = {
+      read_factor_statistic<int64_t>(*owner, handle, data, CUDSS_DATA_LU_NNZ),
+      read_factor_statistic<int32_t>(*owner, handle, data,
+                                     CUDSS_DATA_NSUPERPANELS),
+      read_factor_statistic<int64_t>(*owner, handle, data, CUDSS_DATA_FLOPS)};
+  return TI_FORGE_CUDSS_SUCCESS;
+}
+
 size_t get_last_error(char *destination, size_t destination_size) {
   const std::size_t required = last_error.size() + 1;
   if (destination != nullptr && destination_size > 0) {
@@ -572,5 +608,20 @@ taichi_forge_cudss_allocator_query(uint32_t requested_abi_version,
     return TI_FORGE_CUDSS_ERROR_ABI_MISMATCH;
   }
   *out_api = {sizeof(*out_api), 1, set_allocator};
+  return TI_FORGE_CUDSS_SUCCESS;
+}
+
+extern "C" TI_FORGE_CUDSS_EXPORT TiForgeCudssResult
+taichi_forge_cudss_factor_statistics_query(
+    uint32_t requested_abi_version,
+    size_t api_size,
+    TiForgeCudssFactorStatisticsApi *out_api) {
+  if (!out_api || api_size < sizeof(*out_api)) {
+    return TI_FORGE_CUDSS_ERROR_INVALID_ARGUMENT;
+  }
+  if (requested_abi_version != 1) {
+    return TI_FORGE_CUDSS_ERROR_ABI_MISMATCH;
+  }
+  *out_api = {sizeof(*out_api), 1, read_factor_statistics_i32};
   return TI_FORGE_CUDSS_SUCCESS;
 }
