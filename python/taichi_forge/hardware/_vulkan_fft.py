@@ -188,6 +188,7 @@ class VulkanFftPlan:
         direction="forward",
         normalization="none",
         adapter_path=None,
+        _batch_tile=None,
     ):
         self._closed = True
         self._dimensions = tuple(dimensions)
@@ -203,6 +204,10 @@ class VulkanFftPlan:
                     "Vulkan FFT dimensions must have prime factors at most 13"
                 )
         self._batch_count = _positive_int(batch_count, "batch_count")
+        if _batch_tile is not None:
+            _positive_int(_batch_tile, "private batch tile")
+            if _batch_tile > batch_count:
+                raise ValueError("Vulkan FFT private batch tile exceeds batch_count")
         if direction not in ("forward", "inverse"):
             raise ValueError("Vulkan FFT direction must be 'forward' or 'inverse'")
         if normalization not in ("none", "inverse"):
@@ -229,7 +234,12 @@ class VulkanFftPlan:
         self._data = data
         self._adapter_path = _adapter_path(adapter_path)
         self._adapter_sha256 = _binary_sha256(self._adapter_path)
-        create_plan = getattr(program, "_create_vulkan_fft_plan", None)
+        create_name = (
+            "_create_vulkan_fft_plan"
+            if _batch_tile is None
+            else "_create_vulkan_fft_recipe_plan"
+        )
+        create_plan = getattr(program, create_name, None)
         if create_plan is None:
             raise TaichiRuntimeError(
                 "Vulkan FFT native bridge is unavailable in this runtime build"
@@ -241,6 +251,7 @@ class VulkanFftPlan:
             batch_count,
             -1 if direction == "forward" else 1,
             normalization == "inverse",
+            *((_batch_tile,) if _batch_tile is not None else ()),
         )
         self._closed = False
         try:

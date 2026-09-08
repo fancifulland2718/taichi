@@ -67,6 +67,44 @@ typedef struct TiForgeVkfftApi {
 
 typedef int (*TiForgeVkfftQueryFn)(uint32_t, size_t, TiForgeVkfftApi *);
 
+// Optional materializer extension. The base ABI1 remains usable without this
+// symbol. These are complete batched transforms, not runtime tuning knobs.
+#define TI_FORGE_VKFFT_RECIPE_ABI_VERSION 1u
+#define TI_FORGE_VKFFT_RECIPE_QUERY_SYMBOL "taichi_forge_vkfft_recipe_query"
+
+typedef struct TiForgeVkfftRecipeConfig {
+  uint32_t struct_size;
+  uint32_t reserved;
+  // Independent transforms per retained VkFFT application. Must be in
+  // [1, config.batches]. A non-divisible tail owns a second application.
+  uint64_t batch_tile;
+} TiForgeVkfftRecipeConfig;
+
+typedef struct TiForgeVkfftRecipeFacts {
+  uint64_t batch_tile;
+  uint64_t application_count;
+  uint64_t shader_module_count;
+  uint64_t dispatch_count;
+  // Deterministic FNV-1a over ordered SPIR-V words / recorded dispatch grids.
+  // Diagnostic physical evidence, not cryptographic artifact provenance.
+  uint64_t shader_fingerprint;
+  uint64_t dispatch_fingerprint;
+} TiForgeVkfftRecipeFacts;
+
+typedef struct TiForgeVkfftRecipeApi {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  int (*create)(const TiForgeVkfftConfig *,
+                const TiForgeVkfftRecipeConfig *,
+                TiForgeVkfftPlan *);
+  // Cold immutable observations, valid for plans created by either table.
+  void (*describe)(TiForgeVkfftPlan, TiForgeVkfftRecipeFacts *);
+} TiForgeVkfftRecipeApi;
+
+typedef int (*TiForgeVkfftRecipeQueryFn)(uint32_t,
+                                         size_t,
+                                         TiForgeVkfftRecipeApi *);
+
 #if defined(TI_FORGE_VKFFT_PROVIDER_BUILD)
 #if defined(_WIN32)
 #define TI_FORGE_VKFFT_EXPORT __declspec(dllexport)
@@ -77,6 +115,10 @@ TI_FORGE_VKFFT_EXPORT int taichi_forge_vkfft_provider_query(
     uint32_t abi,
     size_t size,
     TiForgeVkfftApi *api);
+TI_FORGE_VKFFT_EXPORT int taichi_forge_vkfft_recipe_query(
+    uint32_t abi,
+    size_t size,
+    TiForgeVkfftRecipeApi *api);
 #endif
 
 #ifdef __cplusplus

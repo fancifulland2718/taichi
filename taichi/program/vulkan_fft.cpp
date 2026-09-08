@@ -19,10 +19,20 @@ class VulkanFftPlan : public vkapi::DeviceObj {
     TI_ERROR_IF(query(TI_FORGE_VKFFT_ABI_VERSION, sizeof(api), &api) != 0 ||
                     api.struct_size != sizeof(api) ||
                     api.abi_version != TI_FORGE_VKFFT_ABI_VERSION ||
-                    api.vkfft_version != 10304 ||
-                    !api.create || !api.append || !api.memory || !api.destroy ||
-                    !api.last_error,
+                    api.vkfft_version != 10304 || !api.create || !api.append ||
+                    !api.memory || !api.destroy || !api.last_error,
                 "Vulkan FFT adapter ABI is incompatible: {}", path);
+    auto recipe_query = reinterpret_cast<TiForgeVkfftRecipeQueryFn>(
+        library.load_function_optional(TI_FORGE_VKFFT_RECIPE_QUERY_SYMBOL));
+    if (recipe_query) {
+      TI_ERROR_IF(
+          recipe_query(TI_FORGE_VKFFT_RECIPE_ABI_VERSION, sizeof(recipe_api),
+                       &recipe_api) != 0 ||
+              recipe_api.struct_size != sizeof(recipe_api) ||
+              recipe_api.abi_version != TI_FORGE_VKFFT_RECIPE_ABI_VERSION ||
+              !recipe_api.create || !recipe_api.describe,
+          "Vulkan FFT recipe extension ABI is incompatible: {}", path);
+    }
   }
 
   ~VulkanFftPlan() override {
@@ -33,6 +43,7 @@ class VulkanFftPlan : public vkapi::DeviceObj {
 
   DynamicLoader library;
   TiForgeVkfftApi api{};
+  TiForgeVkfftRecipeApi recipe_api{};
   TiForgeVkfftPlan handle{};
   std::shared_ptr<void> storage_lease;
   vkapi::IVkBuffer buffer;
@@ -49,6 +60,18 @@ std::uint64_t Program::create_vulkan_fft_plan(
     int batches,
     int direction,
     bool normalize_inverse) {
+  return create_vulkan_fft_recipe_plan(adapter_path, data, dimensions, batches,
+                                       direction, normalize_inverse, 0);
+}
+
+std::uint64_t Program::create_vulkan_fft_recipe_plan(
+    const std::string &adapter_path,
+    Ndarray *data,
+    const std::vector<int> &dimensions,
+    int batches,
+    int direction,
+    bool normalize_inverse,
+    int batch_tile) {
   std::lock_guard<std::recursive_mutex> lock(
       runtime_resource_submission_mutex_);
   TI_ERROR_IF(compile_config().arch != Arch::vulkan,
@@ -58,6 +81,9 @@ std::uint64_t Program::create_vulkan_fft_plan(
                   dimensions.size() > 3 || batches <= 0,
               "Vulkan FFT requires a local compact scalar-f32 ndarray and "
               "one to three positive transform dimensions.");
+  TI_ERROR_IF(
+      batch_tile < 0 || batch_tile > batches,
+      "Vulkan FFT batch tile must be zero (legacy) or in [1, batches].");
   std::vector<int> shape;
   if (batches > 1) {
     shape.push_back(batches);
@@ -101,8 +127,18 @@ std::uint64_t Program::create_vulkan_fft_plan(
   config.buffer_bytes = data->get_nelement() * data->get_element_size();
   {
     auto queue_lock = device->acquire_external_compute_queue_lock();
-    TI_ERROR_IF(plan->api.create(&config, &plan->handle) != 0,
-                "Vulkan FFT plan creation failed: {}", plan->api.last_error());
+    int result;
+    if (batch_tile) {
+      TI_ERROR_IF(!plan->recipe_api.create,
+                  "Vulkan FFT adapter has no batch recipe extension.");
+      TiForgeVkfftRecipeConfig recipe{sizeof(TiForgeVkfftRecipeConfig), 0,
+                                      static_cast<uint64_t>(batch_tile)};
+      result = plan->recipe_api.create(&config, &recipe, &plan->handle);
+    } else {
+      result = plan->api.create(&config, &plan->handle);
+    }
+    TI_ERROR_IF(result != 0, "Vulkan FFT plan creation failed: {}",
+                plan->api.last_error());
   }
   const auto handle = next_vulkan_fft_plan_handle_++;
   vulkan_fft_plans_.emplace(handle, std::move(plan));
@@ -140,20 +176,33 @@ Program::vulkan_fft_plan_statistics(std::uint64_t handle) {
   const auto &plan = entry->second;
   TiForgeVkfftMemory memory{};
   plan->api.memory(plan->handle, &memory);
-  return {{"persistent_allocation_bytes", memory.persistent_allocation_bytes},
-          {"initialization_peak_allocation_bytes",
-           memory.initialization_peak_allocation_bytes},
-          {"persistent_allocation_count", memory.persistent_allocation_count},
-          {"temporary_buffer_bytes", memory.temporary_buffer_bytes},
-          {"adapter_abi", plan->api.abi_version},
-          {"vkfft_version", plan->api.vkfft_version},
-          {"glslang_major", plan->api.glslang_major},
-          {"glslang_minor", plan->api.glslang_minor},
-          {"glslang_patch", plan->api.glslang_patch},
-          {"device_vendor_id", plan->vendor_id},
-          {"device_id", plan->device_id},
-          {"vulkan_driver_version", plan->driver_version},
-          {"vulkan_api_version", plan->api_version}};
+  std::unordered_map<std::string, std::uint64_t> result{
+      {"persistent_allocation_bytes", memory.persistent_allocation_bytes},
+      {"initialization_peak_allocation_bytes",
+       memory.initialization_peak_allocation_bytes},
+      {"persistent_allocation_count", memory.persistent_allocation_count},
+      {"temporary_buffer_bytes", memory.temporary_buffer_bytes},
+      {"adapter_abi", plan->api.abi_version},
+      {"vkfft_version", plan->api.vkfft_version},
+      {"glslang_major", plan->api.glslang_major},
+      {"glslang_minor", plan->api.glslang_minor},
+      {"glslang_patch", plan->api.glslang_patch},
+      {"device_vendor_id", plan->vendor_id},
+      {"device_id", plan->device_id},
+      {"vulkan_driver_version", plan->driver_version},
+      {"vulkan_api_version", plan->api_version}};
+  if (plan->recipe_api.describe) {
+    TiForgeVkfftRecipeFacts facts{};
+    plan->recipe_api.describe(plan->handle, &facts);
+    result.insert({{"recipe_extension_abi", plan->recipe_api.abi_version},
+                   {"batch_tile", facts.batch_tile},
+                   {"application_count", facts.application_count},
+                   {"shader_module_count", facts.shader_module_count},
+                   {"dispatch_count", facts.dispatch_count},
+                   {"shader_fingerprint", facts.shader_fingerprint},
+                   {"dispatch_fingerprint", facts.dispatch_fingerprint}});
+  }
+  return result;
 }
 
 void Program::destroy_vulkan_fft_plan(std::uint64_t handle) {
@@ -178,6 +227,15 @@ std::uint64_t Program::create_vulkan_fft_plan(const std::string &,
                                               int,
                                               int,
                                               bool) {
+  TI_ERROR("Vulkan FFT is unavailable in this build.");
+}
+std::uint64_t Program::create_vulkan_fft_recipe_plan(const std::string &,
+                                                     Ndarray *,
+                                                     const std::vector<int> &,
+                                                     int,
+                                                     int,
+                                                     bool,
+                                                     int) {
   TI_ERROR("Vulkan FFT is unavailable in this build.");
 }
 void Program::vulkan_fft_execute(std::uint64_t) {

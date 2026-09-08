@@ -3156,6 +3156,11 @@ void export_lang(py::module &m) {
       .def("_vulkan_fft_execute",
            tracked_native_program_method(&Program::vulkan_fft_execute),
            py::arg("handle"), py::call_guard<py::gil_scoped_release>())
+      .def("_create_vulkan_fft_recipe_plan",
+           tracked_native_program_method(&Program::create_vulkan_fft_recipe_plan),
+           py::arg("adapter_path"), py::arg("data"), py::arg("dimensions"),
+           py::arg("batches"), py::arg("direction"), py::arg("normalize_inverse"),
+           py::arg("batch_tile"), py::call_guard<py::gil_scoped_release>())
       .def("_vulkan_fft_plan_statistics", &Program::vulkan_fft_plan_statistics,
            py::arg("handle"))
       .def("_destroy_vulkan_fft_plan",

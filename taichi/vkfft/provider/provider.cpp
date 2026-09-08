@@ -7,6 +7,7 @@
 #include <mutex>
 #include <new>
 #include <unordered_map>
+#include <vector>
 
 #include <glslang/build_info.h>
 
@@ -20,6 +21,50 @@ struct Allocations {
   uint64_t peak{0};
 };
 thread_local Allocations *active_allocations = nullptr;
+thread_local TiForgeVkfftRecipeFacts *active_facts = nullptr;
+
+void hash_word(uint64_t &hash, uint64_t word) {
+  for (int byte = 0; byte < 8; ++byte) {
+    hash = (hash ^ (word & 0xff)) * 1099511628211ull;
+    word >>= 8;
+  }
+}
+
+struct FactsScope {
+  TiForgeVkfftRecipeFacts *previous;
+  explicit FactsScope(TiForgeVkfftRecipeFacts &facts) : previous(active_facts) {
+    active_facts = &facts;
+  }
+  ~FactsScope() {
+    active_facts = previous;
+  }
+};
+
+VkResult create_shader_module(VkDevice device,
+                              const VkShaderModuleCreateInfo *info,
+                              const VkAllocationCallbacks *callbacks,
+                              VkShaderModule *shader) {
+  const auto result = vkCreateShaderModule(device, info, callbacks, shader);
+  if (result == VK_SUCCESS) {
+    ++active_facts->shader_module_count;
+    hash_word(active_facts->shader_fingerprint, info->codeSize);
+    for (size_t i = 0; i < info->codeSize / sizeof(uint32_t); ++i) {
+      hash_word(active_facts->shader_fingerprint, info->pCode[i]);
+    }
+  }
+  return result;
+}
+
+void record_dispatch(VkCommandBuffer command,
+                     uint32_t x,
+                     uint32_t y,
+                     uint32_t z) {
+  ++active_facts->dispatch_count;
+  for (const auto value : {x, y, z}) {
+    hash_word(active_facts->dispatch_fingerprint, value);
+  }
+  vkCmdDispatch(command, x, y, z);
+}
 
 struct AllocationScope {
   Allocations *previous;
@@ -67,10 +112,14 @@ void free_memory(VkDevice device,
 // Local to this translation unit, covering upstream allocation calls only.
 #define vkAllocateMemory allocate_memory
 #define vkFreeMemory free_memory
+#define vkCreateShaderModule create_shader_module
+#define vkCmdDispatch record_dispatch
 #define VKFFT_BACKEND 0
 #include <vkFFT.h>
 #undef vkAllocateMemory
 #undef vkFreeMemory
+#undef vkCreateShaderModule
+#undef vkCmdDispatch
 
 namespace {
 thread_local char error_message[256]{};
@@ -87,14 +136,21 @@ struct Plan {
   VkCommandPool pool{VK_NULL_HANDLE};
   VkFence fence{VK_NULL_HANDLE};
   VkCommandBuffer executable{VK_NULL_HANDLE};
-  VkFFTApplication application{};
+  struct Application {
+    VkFFTApplication fft{};
+    bool initialized{false};
+  };
+  std::vector<std::unique_ptr<Application>> applications;
   Allocations allocations;
-  bool initialized{false};
+  TiForgeVkfftRecipeFacts facts{
+      0, 0, 0, 0, 14695981039346656037ull, 14695981039346656037ull};
 
   ~Plan() {
     AllocationScope scope(allocations);
-    if (initialized) {
-      deleteVkFFT(&application);
+    for (auto &application : applications) {
+      if (application->initialized) {
+        deleteVkFFT(&application->fft);
+      }
     }
     if (fence != VK_NULL_HANDLE) {
       vkDestroyFence(config.device, fence, nullptr);
@@ -117,7 +173,9 @@ bool supported_size(uint64_t size) {
   return size == 1;
 }
 
-int create_plan(const TiForgeVkfftConfig *config, TiForgeVkfftPlan *out) {
+int create_recipe_plan(const TiForgeVkfftConfig *config,
+                       const TiForgeVkfftRecipeConfig *recipe,
+                       TiForgeVkfftPlan *out) {
   if (!out) {
     return fail("missing plan output", -1);
   }
@@ -144,9 +202,17 @@ int create_plan(const TiForgeVkfftConfig *config, TiForgeVkfftPlan *out) {
   if (bytes != config->buffer_bytes) {
     return fail("FFT buffer size must equal compact batched storage", -1);
   }
+  if (recipe &&
+      (recipe->struct_size != sizeof(*recipe) || recipe->reserved ||
+       recipe->batch_tile == 0 || recipe->batch_tile > config->batches)) {
+    return fail("invalid FFT batch partition", -1);
+  }
+  const uint64_t tile = recipe ? recipe->batch_tile : config->batches;
+  const uint64_t tail = config->batches % tile;
   try {
     auto plan = std::make_unique<Plan>();
     plan->config = *config;
+    plan->facts.batch_tile = tile;
     VkCommandPoolCreateInfo pool_info{
         VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pool_info.queueFamilyIndex = config->queue_family;
@@ -166,7 +232,7 @@ int create_plan(const TiForgeVkfftConfig *config, TiForgeVkfftPlan *out) {
     for (uint32_t axis = 0; axis < config->rank; ++axis) {
       parameters.size[axis] = config->dimensions[config->rank - axis - 1];
     }
-    parameters.numberBatches = config->batches;
+    parameters.numberBatches = tile;
     parameters.physicalDevice = &plan->config.physical_device;
     parameters.device = &plan->config.device;
     parameters.queue = &plan->config.queue;
@@ -177,15 +243,28 @@ int create_plan(const TiForgeVkfftConfig *config, TiForgeVkfftPlan *out) {
     parameters.normalize = config->normalize_inverse;
     parameters.makeForwardPlanOnly = config->direction == -1;
     parameters.makeInversePlanOnly = config->direction == 1;
+    parameters.specifyOffsetsAtLaunch = tile != config->batches;
     // No shared global compiler lifetime races between cold plan builds.
     std::lock_guard<std::mutex> compiler_lock(compiler_mutex);
     AllocationScope scope(plan->allocations);
-    const auto fft_result = initializeVkFFT(&plan->application, parameters);
-    if (fft_result != VKFFT_SUCCESS) {
-      // initializeVkFFT owns cleanup of partially initialized applications.
-      return fail("initializeVkFFT", fft_result);
+    FactsScope facts_scope(plan->facts);
+    for (const auto count : {tile, tail}) {
+      if (count == 0) {
+        continue;
+      }
+      parameters.numberBatches = count;
+      // Publish ownership before initialization; a later host allocation
+      // failure must not leak a successfully initialized application.
+      plan->applications.push_back(std::make_unique<Plan::Application>());
+      auto &application = *plan->applications.back();
+      const auto fft_result = initializeVkFFT(&application.fft, parameters);
+      if (fft_result != VKFFT_SUCCESS) {
+        // initializeVkFFT owns cleanup of partially initialized applications.
+        return fail("initializeVkFFT", fft_result);
+      }
+      application.initialized = true;
     }
-    plan->initialized = true;
+    plan->facts.application_count = plan->applications.size();
     VkCommandBufferAllocateInfo allocation{
         VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocation.commandPool = plan->pool;
@@ -207,10 +286,30 @@ int create_plan(const TiForgeVkfftConfig *config, TiForgeVkfftPlan *out) {
     }
     VkFFTLaunchParams launch{};
     launch.commandBuffer = &plan->executable;
-    const auto record_result =
-        VkFFTAppend(&plan->application, config->direction, &launch);
-    if (record_result != VKFFT_SUCCESS) {
-      return fail("VkFFTAppend during plan recording", record_result);
+    for (uint64_t first = 0; first < config->batches; first += tile) {
+      const bool is_tail = config->batches - first < tile;
+      auto &application = *plan->applications[is_tail ? 1 : 0];
+      launch.bufferOffset = first * (bytes / config->batches);
+      const auto record_result =
+          VkFFTAppend(&application.fft, config->direction, &launch);
+      if (record_result != VKFFT_SUCCESS) {
+        return fail("VkFFTAppend during plan recording", record_result);
+      }
+      // Full tiles share writable scratch; the tail owns another application.
+      // Disjoint slices without scratch need no additional GPU dependency.
+      // VkFFT already emits its own per-dispatch write-to-read barriers.
+      if (application.fft.configuration.allocateTempBuffer &&
+          (config->batches - first) / tile > 1) {
+        VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+        barrier.srcAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        barrier.dstAccessMask =
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+        vkCmdPipelineBarrier(plan->executable,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                             VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                             &barrier, 0, nullptr, 0, nullptr);
+      }
     }
     result = vkEndCommandBuffer(plan->executable);
     if (result != VK_SUCCESS) {
@@ -226,6 +325,10 @@ int create_plan(const TiForgeVkfftConfig *config, TiForgeVkfftPlan *out) {
   }
 }
 
+int create_plan(const TiForgeVkfftConfig *config, TiForgeVkfftPlan *out) {
+  return create_recipe_plan(config, nullptr, out);
+}
+
 int append_plan(TiForgeVkfftPlan handle, VkCommandBuffer command) {
   auto *plan = static_cast<Plan *>(handle);
   // The complete vendor dispatch sequence was recorded once at plan creation.
@@ -237,10 +340,18 @@ int append_plan(TiForgeVkfftPlan handle, VkCommandBuffer command) {
 
 void plan_memory(TiForgeVkfftPlan handle, TiForgeVkfftMemory *out) {
   const auto *plan = static_cast<Plan *>(handle);
-  const auto &config = plan->application.configuration;
+  uint64_t temporary_bytes = 0;
+  for (const auto &application : plan->applications) {
+    const auto &config = application->fft.configuration;
+    temporary_bytes += config.allocateTempBuffer ? config.tempBufferSize[0] : 0;
+  }
   *out = {plan->allocations.live, plan->allocations.peak,
           static_cast<uint64_t>(plan->allocations.sizes.size()),
-          config.allocateTempBuffer ? config.tempBufferSize[0] : 0};
+          temporary_bytes};
+}
+
+void describe_plan(TiForgeVkfftPlan handle, TiForgeVkfftRecipeFacts *out) {
+  *out = static_cast<Plan *>(handle)->facts;
 }
 
 void destroy_plan(TiForgeVkfftPlan handle) {
@@ -269,5 +380,17 @@ int taichi_forge_vkfft_provider_query(uint32_t abi,
           plan_memory,
           destroy_plan,
           last_error};
+  return 0;
+}
+
+int taichi_forge_vkfft_recipe_query(uint32_t abi,
+                                    size_t size,
+                                    TiForgeVkfftRecipeApi *api) {
+  if (abi != TI_FORGE_VKFFT_RECIPE_ABI_VERSION || size != sizeof(*api) ||
+      !api) {
+    return fail("VkFFT recipe extension ABI mismatch", -1);
+  }
+  *api = {sizeof(*api), TI_FORGE_VKFFT_RECIPE_ABI_VERSION, create_recipe_plan,
+          describe_plan};
   return 0;
 }

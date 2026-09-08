@@ -1312,6 +1312,14 @@ class TI_DLL_EXPORT Program {
                                       int batches,
                                       int direction,
                                       bool normalize_inverse);
+  std::uint64_t create_vulkan_fft_recipe_plan(
+      const std::string &adapter_path,
+      Ndarray *data,
+      const std::vector<int> &dimensions,
+      int batches,
+      int direction,
+      bool normalize_inverse,
+      int batch_tile);
   void vulkan_fft_execute(std::uint64_t handle);
   std::unordered_map<std::string, std::uint64_t>
   vulkan_fft_plan_statistics(std::uint64_t handle);
