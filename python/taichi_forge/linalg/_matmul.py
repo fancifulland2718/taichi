@@ -155,10 +155,8 @@ class _MatmulCatalog:
     def append(self, builder, choice_id, admission):
         from taichi_forge.graph._graph import Arg, ArgKind
         from taichi_forge.linalg._matmul_kernels import (
-            pack_transpose_2d,
-            pack_transpose_3d,
-            relu_2d,
-            relu_3d,
+            packing_kernel,
+            relu_kernel,
         )
 
         config = self.physical_config(choice_id)
@@ -179,7 +177,7 @@ class _MatmulCatalog:
             shape = _shapes(physical)[0 if name == "a" else 1]
             packed = builder.private_ndarray(f"{prefix}_{name}", f32, shape)
             builder.dispatch(
-                pack_transpose_3d if rank == 3 else pack_transpose_2d,
+                packing_kernel(shape),
                 Arg(ArgKind.NDARRAY, semantics[name], f32, ndim=rank),
                 packed,
             )
@@ -198,7 +196,7 @@ class _MatmulCatalog:
         builder.append_native(recording, admission=admission)
         if config["epilogue"] == "separate":
             builder.dispatch(
-                relu_3d if rank == 3 else relu_2d,
+                relu_kernel(_shapes(semantics)[2]),
                 Arg(ArgKind.NDARRAY, semantics["output"], f32, ndim=rank),
             )
 
