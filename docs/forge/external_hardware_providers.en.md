@@ -698,10 +698,38 @@ with ti.hardware.tensor.CutensorProvider(runtime_path) as provider:
         ti.sync()
 ```
 
-cuTENSOR is a candidate for large contractions, reductions, permutations, and
-elementwise tensor operations with layouts that would otherwise require
-substantial handwritten indexing. It depends on CUDART and remains entirely
-outside the driver-only Forge wheel.
+For repeated contractions, `plan.record(alpha=..., beta=...)` is a root CUDA
+Graph recording, with symbolic `a`, `b`, `c`, `d` bindings (configurable at
+record creation):
+
+```python
+recording = plan.record(alpha=1.0, beta=0.25)
+builder = ti.graph.GraphBuilder()
+builder.append_native(recording)
+graph = builder.compile()
+bindings = graph.bind(dict(a=a, b=b, c=c, d=d))
+graph.run(bindings)
+```
+
+The recording retains the prepared vendor plan and exact workspace. Plan and
+provider close are rejected while their dependents remain live; retire Graphs,
+builders, definitions and recordings before closing the plan. Runtime reset
+retires these resources before finalizing the CUDA Program. Capture does not
+execute the contraction; it does not advance `beta*C` feedback. C/D may share
+storage only with identical layouts/modes, and D must not alias A/B. Shape,
+dtype and storage legality are resolved at binding/capture, not scanned during
+steady replay. The fixed recording also composes with immutable binding frames.
+No standalone `recording.execute()` or nested sequential/AOT recording is
+provided. This execution route does not itself expose contraction strategy
+search or change automatic selection.
+
+The cuTENSOR vendor runtime and its CUDA dependencies stay outside the portable
+wheel; Forge's thin bundled adapter and capture bridge remain inside. Current
+Forge execution/recording covers contraction, not the vendor's broader
+reduction, permutation or elementwise APIs. Windows capture has been exercised
+with cuTENSOR 2.7/CUDA 13; this is not a claim of testing every supported vendor
+version or platform. Resource reports distinguish known workspace bytes from
+opaque vendor state and do not claim to measure driver peak VRAM.
 
 Recommended adapter policy:
 

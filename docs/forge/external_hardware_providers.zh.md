@@ -570,9 +570,33 @@ with ti.hardware.tensor.CutensorProvider(runtime_path) as provider:
         ti.sync()
 ```
 
-cuTENSOR 适合 large contraction、reduction、permutation 和 elementwise tensor operation，
-特别是那些否则需要大量手写 indexing 的 layout。它依赖 CUDART，必须完全留在 driver-only
-Forge wheel 之外。
+重复 contraction 可通过 `plan.record(alpha=..., beta=...)` 进入 root CUDA Graph；
+`a`、`b`、`c`、`d` 是可在创建 recording 时指定的符号绑定名：
+
+```python
+recording = plan.record(alpha=1.0, beta=0.25)
+builder = ti.graph.GraphBuilder()
+builder.append_native(recording)
+graph = builder.compile()
+bindings = graph.bind(dict(a=a, b=b, c=c, d=d))
+graph.run(bindings)
+```
+
+recording 持有已准备的 vendor plan 和精确 workspace。依赖仍存活时，plan/provider 的
+close 会明确拒绝；应先释放 Graph、builder、definition 和 recording，再关闭 plan。
+runtime reset 会在 CUDA Program finalize 前释放这些资源。capture 不执行数学运算，
+不会提前推进 `beta*C` 反馈。C/D 仅在 layout/modes 相同时可以共享存储，D 不得 alias A/B。
+shape、dtype 和存储合法性在 bind/capture 边界确定，不在 steady replay 扫描。
+此固定 recording 也可组合 immutable binding frames；不提供独立 `recording.execute()`、
+nested sequential 或 AOT recording。这个执行入口本身不开放 contraction 策略搜索，
+也不改变普通自动选择。
+
+cuTENSOR vendor runtime 及其 CUDA 依赖仍在 portable wheel 外，Forge 自有 thin adapter
+和 capture bridge 可以随 wheel 提供。当前 Forge 执行/recording 只覆盖 contraction，
+不代表 vendor 更广的 reduction、permutation 和 elementwise API 都已接入。
+Windows capture 已使用 cuTENSOR 2.7/CUDA 13 验证，不代表所有支持的 vendor 版本或平台
+均已测试。资源报告区分已知 workspace 字节和未知 vendor state，不宣称观测了 driver
+峰值显存。
 
 推荐 adapter 策略：
 

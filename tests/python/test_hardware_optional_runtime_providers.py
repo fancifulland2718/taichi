@@ -296,9 +296,14 @@ def test_optional_runtime_execution_capabilities_are_explicit_host_plan_apis():
     )
     for operation_id in operation_ids:
         descriptor = ti.hardware.capability(operation_id)
-        assert descriptor.scopes == ("python",)
+        is_contraction = operation_id == "tensor.contract.cutensor"
+        assert descriptor.scopes == (
+            ("python", "graph") if is_contraction else ("python",)
+        )
         assert descriptor.execution_kind == "external_library"
-        assert descriptor.graph_integration == "unsupported"
+        assert descriptor.graph_integration == (
+            "root_ordered" if is_contraction else "unsupported"
+        )
         assert descriptor.hardware_acceleration == "implementation_defined"
         assert descriptor.activation_mode == "explicit_hardware_api"
         assert descriptor.lifetime_policy == "provider_plan"
