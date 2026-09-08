@@ -29,6 +29,8 @@ class _PlanLease:
         self.plan = None
         with plan.provider._lock, plan._lock:
             plan._validate_lifetime()
+            if plan._preparation_only:
+                raise TaichiRuntimeError("cuTENSOR preparation descriptions cannot be captured")
             plan._capture_leases += 1
             self.plan = plan
 

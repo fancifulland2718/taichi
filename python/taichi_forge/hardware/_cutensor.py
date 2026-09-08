@@ -331,6 +331,8 @@ class CutensorContractionPlan:
         alignment_bytes,
         workspace_preference,
         workspace_limit_bytes,
+        _preparation_only=False,
+        _expected_workspace_bytes=None,
     ):
         if not isinstance(provider, CutensorProvider):
             raise TypeError("provider must be a CutensorProvider")
@@ -400,12 +402,18 @@ class CutensorContractionPlan:
         self._alignment_bytes = alignment_bytes
         self._compute = compute
         self._capture_leases = 0
+        self._preparation_only = _preparation_only
         self.workspace_estimate_bytes = int(info.workspace_estimate_bytes)
         self.workspace_required_bytes = int(info.workspace_required_bytes)
         try:
+            if (
+                _expected_workspace_bytes is not None
+                and self.workspace_required_bytes != _expected_workspace_bytes
+            ):
+                raise TaichiRuntimeError("cuTENSOR restored plan workspace drifted")
             self._workspace = (
                 ScalarNdarray(u8, (self.workspace_required_bytes,))
-                if self.workspace_required_bytes
+                if self.workspace_required_bytes and not _preparation_only
                 else None
             )
             provider._plans.add(self)
@@ -495,7 +503,8 @@ class CutensorContractionPlan:
                     "cuTENSOR plan cannot close while capture leases are live"
                 )
             if runtime_generation_matches(self):
-                self._runtime_prog.synchronize()
+                if not self._preparation_only:
+                    self._runtime_prog.synchronize()
                 self._close_native()
         return None
 
