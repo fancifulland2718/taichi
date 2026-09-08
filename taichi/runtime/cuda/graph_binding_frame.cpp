@@ -30,6 +30,7 @@ struct GraphBindingFrame::State {
   void *argument_image{nullptr};
   std::vector<std::uint8_t> host_argument_image;
   std::vector<std::unique_ptr<CudaDevice::AllocationLease>> allocations;
+  std::vector<std::shared_ptr<void>> provider_capture_resources;
   std::size_t bytes{0};
   std::size_t nodes{0};
 
@@ -58,6 +59,7 @@ struct GraphBindingFrame::State {
     host_argument_image.clear();
     contexts.clear();
     allocations.clear();
+    provider_capture_resources.clear();
     device = nullptr;
     bytes = 0;
   }
@@ -422,6 +424,9 @@ std::shared_ptr<GraphBindingFrame> GraphBindingExecutor::prepare(
       const auto &command = state.graph.dispatches[i].cuda_capture_command;
       if (command) {
         command->record(args, *state.program, state.capture_stream);
+        if (auto resource = command->take_capture_resources()) {
+          data.provider_capture_resources.push_back(std::move(resource));
+        }
       } else {
         state.launcher->capture_cuda_graph_launch(data.packets[i],
                                                   state.capture_stream);
@@ -439,8 +444,13 @@ std::shared_ptr<GraphBindingFrame> GraphBindingExecutor::prepare(
     for (auto *node : nodes) {
       std::uint32_t type = 0;
       driver.graph_node_get_type(node, &type);
-      TI_ERROR_IF(type != 0 /* CU_GRAPH_NODE_TYPE_KERNEL */,
-                  "CUDA binding frame contains a non-kernel node");
+      // Fixed-plan providers also record workspace clears and copies. Their
+      // resource lease owns any host source bytes per immutable frame. This
+      // does not admit host callbacks, allocations, or opaque child graphs.
+      const bool provider_memory = !state.provider_plans.empty() &&
+                                   (type == 1 || type == 2);  // memcpy/memset
+      TI_ERROR_IF(type != 0 /* kernel */ && !provider_memory,
+                  "CUDA binding frame contains an unsupported node");
     }
     if (!state.executable) {
       driver.graph_instantiate_with_flags(&state.executable, data.graph, 0);

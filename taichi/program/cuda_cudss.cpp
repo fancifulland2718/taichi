@@ -1,10 +1,13 @@
 #include "taichi/program/program.h"
+#include "taichi/program/cuda_cudss_capture.h"
 
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -235,6 +238,20 @@ class CudssProviderRuntime {
     return runtime_info_;
   }
 
+  TiForgeCudssAllocatorApi allocator_api() const {
+    auto *symbol =
+        loader_->load_function_optional(TI_FORGE_CUDSS_ALLOCATOR_QUERY_SYMBOL);
+    TI_ERROR_IF(!symbol,
+                "CUDA cuDSS Graph allocator extension is unavailable.");
+    auto query = reinterpret_cast<TiForgeCudssAllocatorQueryFn>(symbol);
+    TiForgeCudssAllocatorApi result{};
+    TI_ERROR_IF(query(1, sizeof(result), &result) != TI_FORGE_CUDSS_SUCCESS ||
+                    result.struct_size < sizeof(result) ||
+                    result.abi_version != 1 || !result.set_allocator,
+                "CUDA cuDSS Graph allocator extension is incompatible.");
+    return result;
+  }
+
  private:
   std::string adapter_error() const {
     if (!api_.get_last_error) {
@@ -255,6 +272,89 @@ class CudssProviderRuntime {
   TiForgeCudssRuntimeInfo runtime_info_{};
 };
 
+// Only preparation/capture/retirement calls this allocator. After warming the
+// private snapshot it is sealed: captured work cannot create/free persistent
+// vendor pointers that would escape a particular CUDA graph's lifetime.
+class CudssGraphAllocator {
+ public:
+  static int allocate(void *context,
+                      void **pointer,
+                      size_t bytes,
+                      void *stream) noexcept {
+    auto &owner = *static_cast<CudssGraphAllocator *>(context);
+    std::lock_guard<std::mutex> lock(owner.mutex_);
+    *pointer = nullptr;
+    if (bytes == 0) {
+      return 0;
+    }
+    if (owner.sealed_) {
+      ++owner.sealed_allocation_rejections_;
+      return 1;
+    }
+    try {
+      CUDADriver::get_instance().malloc_async_impl(pointer, bytes, stream);
+      owner.allocations_.emplace(*pointer, bytes);
+      owner.live_bytes_ += bytes;
+      owner.peak_bytes_ = std::max(owner.peak_bytes_, owner.live_bytes_);
+      return 0;
+    } catch (...) {
+      if (*pointer) {
+        try {
+          CUDADriver::get_instance().mem_free_async_impl(*pointer, stream);
+        } catch (...) {
+        }
+        *pointer = nullptr;
+      }
+      return 1;
+    }
+  }
+
+  static int deallocate(void *context,
+                        void *pointer,
+                        size_t,
+                        void *stream) noexcept {
+    auto &owner = *static_cast<CudssGraphAllocator *>(context);
+    std::lock_guard<std::mutex> lock(owner.mutex_);
+    if (!pointer) {
+      return 0;
+    }
+    if (owner.sealed_) {
+      ++owner.sealed_allocation_rejections_;
+      return 1;
+    }
+    const auto found = owner.allocations_.find(pointer);
+    if (found == owner.allocations_.end()) {
+      return 1;
+    }
+    try {
+      CUDADriver::get_instance().mem_free_async_impl(pointer, stream);
+      owner.live_bytes_ -= found->second;
+      owner.allocations_.erase(found);
+      return 0;
+    } catch (...) {
+      return 1;
+    }
+  }
+
+  void seal(bool value) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    sealed_ = value;
+  }
+
+  std::array<std::uint64_t, 3> observation() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return {live_bytes_, peak_bytes_, sealed_allocation_rejections_};
+  }
+
+ private:
+  mutable std::mutex mutex_;
+  bool sealed_{false};
+  std::unordered_map<void *, std::size_t> allocations_;
+  std::uint64_t live_bytes_{0};
+  std::uint64_t peak_bytes_{0};
+  std::uint64_t sealed_allocation_rejections_{0};
+};
+
 class CudaCudssPlan final : public CudaProviderCompletionResource {
  public:
   CudaCudssPlan(const CuSparseMatrix &matrix,
@@ -263,13 +363,17 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
                 const std::string &adapter_path,
                 const std::string &runtime_library_path,
                 std::shared_ptr<RuntimeFaultDomain> fault_domain,
-                const std::vector<int> &configuration)
+                const std::vector<int> &configuration,
+                bool graph_owned)
       : rows_(static_cast<std::size_t>(matrix.num_rows())),
         nonzeros_(static_cast<std::size_t>(matrix.get_nnz())),
+        graph_owned_(graph_owned),
         provider_(std::make_unique<CudssProviderRuntime>(adapter_path,
                                                          runtime_library_path)),
         fault_domain_(std::move(fault_domain)) {
     validate_cudss_matrix_contract(matrix_type, matrix_view);
+    TI_ERROR_IF(graph_owned && configuration.empty(),
+                "CUDA cuDSS Graph plans require a frozen configuration.");
     TI_ERROR_IF(!configuration.empty() &&
                     (configuration.size() != 2 || configuration[0] < 0 ||
                      configuration[0] > 3 || configuration[1] < 0 ||
@@ -288,6 +392,28 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
       TI_ERROR_IF(!context_, "CUDA cuDSS returned a null handle.");
       require_cudss_success(api.set_stream(runtime, context_, nullptr),
                             "runtime stream binding");
+      if (graph_owned_) {
+        auto &driver = CUDADriver::get_instance();
+        TI_ERROR_IF(
+            !driver.malloc_async_impl.available() ||
+                !driver.mem_free_async_impl.available() ||
+                !CUDAContext::get_instance().supports_mem_pool(),
+            "CUDA cuDSS Graph plans require stream-ordered allocation.");
+        // cuDSS analysis/factors retain stream-local state. Keep one stream
+        // for the whole owner lifetime, including capture and destruction.
+        driver.stream_create(&graph_stream_, CU_STREAM_NON_BLOCKING);
+        driver.event_create(&graph_fork_event_, CU_EVENT_DISABLE_TIMING);
+        driver.event_create(&graph_join_event_, CU_EVENT_DISABLE_TIMING);
+        require_cudss_success(api.set_stream(runtime, context_, graph_stream_),
+                              "Graph owner stream binding");
+        allocator_ = std::make_unique<CudssGraphAllocator>();
+        require_cudss_success(
+            provider_->allocator_api().set_allocator(
+                runtime, context_, allocator_.get(),
+                CudssGraphAllocator::allocate, CudssGraphAllocator::deallocate),
+            "Graph allocator binding");
+        create_graph_snapshot(matrix);
+      }
       require_cudss_success(api.config_create(runtime, &config_),
                             "configuration creation");
       if (configuration_api_.configure) {
@@ -298,7 +424,8 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
       }
       require_cudss_success(api.data_create(runtime, context_, &data_),
                             "solver-data creation");
-      auto *row_start = matrix.get_row_ptr();
+      const void *row_start =
+          graph_owned_ ? seed_buffers_[0] : matrix.get_row_ptr();
       // cuDSS accepts the canonical three-array CSR form when rowEnd is null.
       // Passing rowOffsets + 1 selects its unsupported four-array CSR form.
       require_cudss_success(
@@ -306,10 +433,14 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
               runtime, &matrix_, static_cast<std::int64_t>(matrix.num_rows()),
               static_cast<std::int64_t>(matrix.num_cols()),
               static_cast<std::int64_t>(matrix.get_nnz()), row_start, nullptr,
-              matrix.get_col_ind(), matrix.get_val_ptr(), kCudssDataTypeI32,
-              kCudssDataTypeI32, kCudssDataTypeF32, matrix_type, matrix_view,
-              kCudssBaseZero),
+              graph_owned_ ? seed_buffers_[1] : matrix.get_col_ind(),
+              graph_owned_ ? seed_buffers_[2] : matrix.get_val_ptr(),
+              kCudssDataTypeI32, kCudssDataTypeI32, kCudssDataTypeF32,
+              matrix_type, matrix_view, kCudssBaseZero),
           "CSR descriptor creation");
+      if (graph_owned_) {
+        prepare_graph_snapshot();
+      }
     } catch (...) {
       destroy(true);
       throw;
@@ -564,7 +695,18 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
     const bool estimates_valid =
         analyzed_ && memory_estimates_status_ == kCudssStatusSuccess &&
         memory_estimates_written_ >= 6 * sizeof(std::int64_t);
+    const auto allocation =
+        allocator_ ? allocator_->observation() : std::array<std::uint64_t, 3>{};
     return {{"configuration_abi", configuration_api_.abi_version},
+            {"graph_owned", graph_owned_ ? 1 : 0},
+            {"allocator_live_requested_bytes",
+             static_cast<std::int64_t>(allocation[0])},
+            {"allocator_peak_requested_bytes",
+             static_cast<std::int64_t>(allocation[1])},
+            {"sealed_allocation_rejections",
+             static_cast<std::int64_t>(allocation[2])},
+            {"graph_snapshot_bytes",
+             static_cast<std::int64_t>(graph_snapshot_bytes_)},
             {"reordering", reordering_},
             {"solve", solve_algorithm_},
             {"memory_estimates_status", memory_estimates_status_},
@@ -580,6 +722,56 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
              estimates_valid ? memory_estimates_[3] : -1}};
   }
 
+  void claim_graph_phase(int phase) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    TI_ERROR_IF(closed_ || !graph_owned_ || !factorized_,
+                "CUDA cuDSS capture requires a prepared Graph-owned snapshot.");
+    TI_ERROR_IF(phase != 0 && phase != kCudssPhaseFactorization &&
+                    phase != kCudssPhaseRefactorization,
+                "CUDA cuDSS capture numerical phase is unsupported.");
+    TI_ERROR_IF(graph_numeric_phase_ != -1 && graph_numeric_phase_ != phase,
+                "A cuDSS Graph owner cannot mix fixed factors and numerical "
+                "update policies; materialize an independent owner.");
+    graph_numeric_phase_ = phase;
+  }
+
+  void record_graph(int phase,
+                    void *values,
+                    void *rhs,
+                    void *solution,
+                    void *stream) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    TI_ERROR_IF(closed_ || !graph_owned_ || !factorized_ ||
+                    graph_numeric_phase_ != phase,
+                "CUDA cuDSS captured owner is unavailable.");
+    const auto &api = provider_->api();
+    auto runtime = provider_->runtime();
+    auto &driver = CUDADriver::get_instance();
+    // Capture joins the retained owner stream instead of rebinding warmed
+    // cuDSS state to a transient parent stream. These event operations become
+    // Graph dependency edges; replay does not call cuDSS or host-synchronize.
+    driver.event_record(graph_fork_event_, stream);
+    driver.stream_wait_event(graph_stream_, graph_fork_event_, 0);
+    try {
+      require_cudss_success(
+          api.matrix_set_values(runtime, matrix_,
+                                phase ? values : seed_buffers_[2]),
+          "capture matrix binding");
+      bind_dense_vectors(rhs, solution);
+      if (phase) {
+        require_cudss_success(api.execute(runtime, context_, phase, config_,
+                                          data_, matrix_, solution_, rhs_),
+                              "captured numerical factorization");
+      }
+      execute_solve();
+      driver.event_record(graph_join_event_, graph_stream_);
+      driver.stream_wait_event(stream, graph_join_event_, 0);
+    } catch (...) {
+      factorized_ = false;
+      throw;
+    }
+  }
+
   void destroy(bool provider_calls_safe) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     if (closed_) {
@@ -589,8 +781,16 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
     if (!provider_calls_safe || !provider_) {
       return;
     }
+    if (allocator_) {
+      allocator_->seal(false);
+    }
     const auto &api = provider_->api();
     auto runtime = provider_->runtime();
+    if (graph_stream_) {
+      warn_cudss_failure(
+          CUDADriver::get_instance().stream_synchronize.call(graph_stream_),
+          "Graph owner retirement");
+    }
     if (solution_) {
       warn_cudss_failure(api.matrix_destroy(runtime, solution_),
                          "solution descriptor destruction");
@@ -611,6 +811,14 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
                          "solver-data destruction");
       data_ = nullptr;
     }
+    for (auto &buffer : seed_buffers_) {
+      if (buffer) {
+        warn_cudss_failure(CudssGraphAllocator::deallocate(
+                               allocator_.get(), buffer, 0, graph_stream_),
+                           "private snapshot retirement");
+        buffer = nullptr;
+      }
+    }
     if (config_) {
       warn_cudss_failure(api.config_destroy(runtime, config_),
                          "configuration destruction");
@@ -620,9 +828,70 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
       warn_cudss_failure(api.destroy(runtime, context_), "handle destruction");
       context_ = nullptr;
     }
+    auto &driver = CUDADriver::get_instance();
+    if (graph_fork_event_) {
+      driver.event_destroy.call(graph_fork_event_);
+      graph_fork_event_ = nullptr;
+    }
+    if (graph_join_event_) {
+      driver.event_destroy.call(graph_join_event_);
+      graph_join_event_ = nullptr;
+    }
+    if (graph_stream_) {
+      driver.stream_destroy.call(graph_stream_);
+      graph_stream_ = nullptr;
+    }
   }
 
  private:
+  void create_graph_snapshot(const CuSparseMatrix &matrix) {
+    const std::array<std::size_t, 5> sizes = {
+        (rows_ + 1) * sizeof(int), nonzeros_ * sizeof(int),
+        nonzeros_ * sizeof(float), rows_ * sizeof(float),
+        rows_ * sizeof(float)};
+    const std::array<void *, 3> sources = {
+        matrix.get_row_ptr(), matrix.get_col_ind(), matrix.get_val_ptr()};
+    auto &driver = CUDADriver::get_instance();
+    for (std::size_t i = 0; i < sizes.size(); ++i) {
+      require_cudss_success(
+          CudssGraphAllocator::allocate(allocator_.get(), &seed_buffers_[i],
+                                        sizes[i], nullptr),
+          "private snapshot allocation");
+      graph_snapshot_bytes_ += sizes[i];
+      if (i < sources.size()) {
+        driver.memcpy_device_to_device(seed_buffers_[i], sources[i], sizes[i]);
+      } else {
+        driver.memset(seed_buffers_[i], 0, sizes[i]);
+      }
+    }
+  }
+
+  void prepare_graph_snapshot() {
+    const auto &api = provider_->api();
+    auto runtime = provider_->runtime();
+    // The private copy was made on the runtime stream. Publish it to the
+    // owner's stream at this cold materialization boundary only.
+    CUDADriver::get_instance().stream_synchronize(nullptr);
+    bind_dense_vectors(seed_buffers_[3], seed_buffers_[4]);
+    require_cudss_success(api.execute(runtime, context_, kCudssPhaseAnalysis,
+                                      config_, data_, matrix_, solution_, rhs_),
+                          "Graph snapshot analysis");
+    analyzed_ = true;
+    memory_estimates_status_ = configuration_api_.analysis_memory_estimates(
+        runtime, context_, data_, memory_estimates_.data(),
+        sizeof(memory_estimates_), &memory_estimates_written_);
+    require_cudss_success(
+        api.execute(runtime, context_, kCudssPhaseFactorization, config_, data_,
+                    matrix_, solution_, rhs_),
+        "Graph snapshot factorization");
+    execute_solve();
+    // This is materialization of private data, never Graph prepare() or replay.
+    // Finish initial factors before publishing a captured owner.
+    CUDADriver::get_instance().stream_synchronize(graph_stream_);
+    factorized_ = true;
+    allocator_->seal(true);
+  }
+
   void require_no_refactor_solve_inflight(const char *operation) const {
     TI_ERROR_IF(refactor_solve_inflight_,
                 "CUDA cuDSS {} cannot run while a refactorize+solve "
@@ -713,6 +982,14 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
   std::int64_t memory_estimates_status_{-1};
   std::size_t memory_estimates_written_{0};
   std::size_t nonzeros_{0};
+  const bool graph_owned_{false};
+  int graph_numeric_phase_{-1};
+  void *graph_stream_{nullptr};
+  void *graph_fork_event_{nullptr};
+  void *graph_join_event_{nullptr};
+  std::unique_ptr<CudssGraphAllocator> allocator_;
+  std::array<void *, 5> seed_buffers_{};
+  std::size_t graph_snapshot_bytes_{0};
   void *context_{nullptr};
   void *config_{nullptr};
   void *data_{nullptr};
@@ -748,6 +1025,190 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
   mutable std::mutex mutex_;
 };
 
+namespace {
+class CudaCudssCaptureCommand final : public aot::CudaGraphCaptureCommand {
+ public:
+  CudaCudssCaptureCommand(Program *program,
+                          std::uint64_t handle,
+                          int phase,
+                          const std::vector<aot::Arg> &arguments)
+      : program_(program), phase_(phase), arguments_(arguments) {
+    TI_ERROR_IF(!program || program->compile_config().arch != Arch::cuda,
+                "cuDSS capture requires a CUDA Program.");
+    TI_ERROR_IF(arguments.size() != (phase ? 3 : 2),
+                "cuDSS capture bindings do not match the numerical phase.");
+    for (std::size_t i = 0; i < arguments.size(); ++i) {
+      const auto &arg = arguments[i];
+      TI_ERROR_IF(arg.tag != aot::ArgKind::kNdarray ||
+                      arg.dtype_id != PrimitiveTypeID::f32 ||
+                      arg.field_dim != 1 || !arg.element_shape.empty() ||
+                      arg.name.empty(),
+                  "cuDSS capture requires named scalar f32 vectors.");
+      for (std::size_t j = 0; j < i; ++j) {
+        TI_ERROR_IF(arg.name == arguments[j].name,
+                    "cuDSS capture binding names must be distinct.");
+      }
+    }
+    owner_ = program->retain_cuda_cudss_capture_plan(handle);
+    auto &driver = CUDADriver::get_instance();
+    TI_ERROR_IF(
+        !driver.stream_get_capture_info_v2.available() ||
+            !driver.graph_node_get_type.available() ||
+            !driver.graph_memcpy_node_get_params.available() ||
+            !driver.graph_memcpy_node_set_params.available(),
+        "cuDSS capture requires immutable host-input snapshot support.");
+    owner_->claim_graph_phase(phase);
+  }
+
+  const char *kind() const override {
+    return "cudss_retained_solve_f32";
+  }
+  Program *program() const override {
+    return program_;
+  }
+  bool supports_binding_frames() const override {
+    return true;
+  }
+  std::shared_ptr<void> retain_binding_frame_plan(Program &) override {
+    return owner_;
+  }
+  std::shared_ptr<void> take_capture_resources() override {
+    return std::exchange(capture_inputs_, {});
+  }
+
+  bool supports(const std::unordered_map<std::string, aot::IValue> &args,
+                Program &program) const override {
+    if (&program != program_)
+      return false;
+    for (std::size_t i = 0; i < arguments_.size(); ++i) {
+      auto *value = array(i, args);
+      if (!value)
+        return false;
+      for (std::size_t j = 0; j < i; ++j) {
+        if (value->get_device_allocation() ==
+            array(j, args)->get_device_allocation())
+          return false;
+      }
+    }
+    return true;
+  }
+
+  void prepare(const std::unordered_map<std::string, aot::IValue> &args,
+               Program &program) override {
+    TI_ERROR_IF(!supports(args, program),
+                "cuDSS capture bindings are incompatible.");
+    // Owner creation already warmed a private numerical snapshot. Never run
+    // mathematical work with caller bindings before the first Graph submission.
+  }
+
+  void record(const std::unordered_map<std::string, aot::IValue> &args,
+              Program &program,
+              void *stream) override {
+    TI_ERROR_IF(!supports(args, program),
+                "cuDSS capture bindings are incompatible.");
+    capture_inputs_.reset();
+    std::uint32_t capture_status = 0;
+    CUgraph graph = nullptr;
+    auto &driver = CUDADriver::get_instance();
+    driver.stream_get_capture_info_v2(stream, &capture_status, nullptr, &graph,
+                                      nullptr, nullptr);
+    const auto previous =
+        capture_status == 1 ? graph_nodes(graph) : std::vector<void *>{};
+    const std::unordered_set<void *> previous_nodes(previous.begin(),
+                                                    previous.end());
+    const auto pointer = [&](std::size_t i) {
+      return reinterpret_cast<void *>(
+          program.get_ndarray_data_ptr_as_int(array(i, args)));
+    };
+    owner_->record_graph(phase_, phase_ ? pointer(0) : nullptr,
+                         pointer(phase_ ? 1 : 0), pointer(phase_ ? 2 : 1),
+                         stream);
+    if (capture_status == 1) {
+      capture_inputs_ =
+          std::make_shared<std::vector<std::vector<std::uint8_t>>>();
+      for (auto *node : graph_nodes(graph)) {
+        if (previous_nodes.count(node))
+          continue;
+        std::uint32_t type = 0;
+        driver.graph_node_get_type(node, &type);
+        if (type != 1 /* memcpy */)
+          continue;
+        CUDA_MEMCPY3D params{};
+        driver.graph_memcpy_node_get_params(node, &params);
+        TI_ERROR_IF(params.dstMemoryType != CU_MEMORYTYPE_DEVICE,
+                    "cuDSS capture contains a non-device copy destination.");
+        if (params.srcMemoryType == CU_MEMORYTYPE_DEVICE)
+          continue;
+        TI_ERROR_IF(params.srcMemoryType != 1 /* host */ || !params.srcHost ||
+                        params.Height != 1 || params.Depth != 1 ||
+                        params.srcY || params.srcZ || params.srcLOD,
+                    "cuDSS capture host inputs require contiguous 1D storage.");
+        // cuDSS owns a mutable array of vector pointers. Copy its contents at
+        // capture, not replay, so recording a second binding cannot rewrite
+        // the first frame or an already queued graph launch.
+        auto &bytes = capture_inputs_->emplace_back(params.WidthInBytes);
+        std::memcpy(bytes.data(),
+                    static_cast<const std::uint8_t *>(params.srcHost) +
+                        params.srcXInBytes,
+                    bytes.size());
+        params.srcHost = bytes.data();
+        params.srcXInBytes = 0;
+        driver.graph_memcpy_node_set_params(node, &params);
+      }
+    }
+  }
+
+ private:
+  static std::vector<void *> graph_nodes(CUgraph graph) {
+    auto &driver = CUDADriver::get_instance();
+    std::size_t count = 0;
+    driver.graph_get_nodes(graph, nullptr, &count);
+    std::vector<void *> nodes(count);
+    driver.graph_get_nodes(graph, nodes.data(), &count);
+    nodes.resize(count);
+    return nodes;
+  }
+  Ndarray *array(
+      std::size_t index,
+      const std::unordered_map<std::string, aot::IValue> &args) const {
+    const auto found = args.find(arguments_[index].name);
+    if (found == args.end() || found->second.tag != aot::ArgKind::kNdarray)
+      return nullptr;
+    auto *array = reinterpret_cast<Ndarray *>(found->second.val);
+    if (!array || array->owning_program() != program_ ||
+        array->get_element_data_type() != PrimitiveType::f32 ||
+        !array->get_element_shape().empty() || array->shape.size() != 1 ||
+        array->get_nelement() !=
+            (phase_ && index == 0 ? owner_->nonzeros() : owner_->rows()))
+      return nullptr;
+    return array;
+  }
+  Program *program_;
+  const int phase_;
+  const std::vector<aot::Arg> arguments_;
+  std::shared_ptr<CudaCudssPlan> owner_;
+  std::shared_ptr<std::vector<std::vector<std::uint8_t>>> capture_inputs_;
+};
+}  // namespace
+
+std::shared_ptr<aot::CudaGraphCaptureCommand> make_cuda_cudss_capture_command(
+    Program *program,
+    std::uint64_t handle,
+    int numeric_phase,
+    const std::vector<aot::Arg> &arguments) {
+  return std::make_shared<CudaCudssCaptureCommand>(program, handle,
+                                                   numeric_phase, arguments);
+}
+
+std::shared_ptr<CudaCudssPlan> Program::retain_cuda_cudss_capture_plan(
+    std::uint64_t handle) {
+  std::lock_guard<std::mutex> lock(cuda_cudss_plan_mutex_);
+  const auto found = cuda_cudss_graph_plans_.find(handle);
+  TI_ERROR_IF(found == cuda_cudss_graph_plans_.end(),
+              "CUDA cuDSS Graph owner is stale, closed, or not Graph-owned.");
+  return found->second;
+}
+
 std::uint64_t Program::create_cuda_cudss_plan(
     SparseMatrix *matrix,
     int matrix_type,
@@ -764,7 +1225,8 @@ std::uint64_t Program::create_cuda_cudss_configured_plan(
     int matrix_view,
     const std::string &adapter_path,
     const std::string &runtime_library_path,
-    const std::vector<int> &configuration) {
+    const std::vector<int> &configuration,
+    bool graph_owned) {
   auto submission_guard = acquire_runtime_resource_submission_guard();
   TI_ERROR_IF(compile_config().arch != Arch::cuda,
               "CUDA cuDSS plans require the CUDA backend.");
@@ -777,12 +1239,13 @@ std::uint64_t Program::create_cuda_cudss_configured_plan(
   auto context_guard = CUDAContext::get_instance().get_guard();
   auto plan = std::make_shared<CudaCudssPlan>(
       csr, matrix_type, matrix_view, adapter_path, runtime_library_path,
-      runtime_fault_domain_, configuration);
+      runtime_fault_domain_, configuration, graph_owned);
   std::lock_guard<std::mutex> lock(cuda_cudss_plan_mutex_);
   TI_ERROR_IF(next_cuda_cudss_plan_handle_ == 0,
               "CUDA cuDSS plan handle space exhausted.");
   const auto handle = next_cuda_cudss_plan_handle_++;
-  cuda_cudss_plans_.emplace(handle, std::move(plan));
+  auto &owners = graph_owned ? cuda_cudss_graph_plans_ : cuda_cudss_plans_;
+  owners.emplace(handle, std::move(plan));
   return handle;
 }
 
@@ -928,6 +1391,10 @@ Program::cuda_cudss_plan_statistics(std::uint64_t handle) {
 std::unordered_map<std::string, std::int64_t>
 Program::cuda_cudss_plan_configuration(std::uint64_t handle) {
   std::lock_guard<std::mutex> lock(cuda_cudss_plan_mutex_);
+  const auto graph = cuda_cudss_graph_plans_.find(handle);
+  if (graph != cuda_cudss_graph_plans_.end()) {
+    return graph->second->configuration();
+  }
   const auto found = cuda_cudss_plans_.find(handle);
   TI_ERROR_IF(found == cuda_cudss_plans_.end(),
               "CUDA cuDSS plan handle is stale or closed.");
@@ -951,12 +1418,15 @@ void Program::destroy_cuda_cudss_plan(std::uint64_t handle) {
   std::shared_ptr<CudaCudssPlan> plan;
   {
     std::lock_guard<std::mutex> lock(cuda_cudss_plan_mutex_);
-    const auto found = cuda_cudss_plans_.find(handle);
-    if (found == cuda_cudss_plans_.end()) {
+    auto *owners = cuda_cudss_graph_plans_.count(handle)
+                       ? &cuda_cudss_graph_plans_
+                       : &cuda_cudss_plans_;
+    const auto found = owners->find(handle);
+    if (found == owners->end()) {
       return;
     }
     plan = std::move(found->second);
-    cuda_cudss_plans_.erase(found);
+    owners->erase(found);
   }
   // RuntimeCompletion owns any in-flight reference. Destruction therefore
   // occurs immediately only when no submitted phase still uses this plan.
@@ -967,11 +1437,15 @@ void Program::cuda_clear_cudss_plans() {
   std::vector<std::shared_ptr<CudaCudssPlan>> plans;
   {
     std::lock_guard<std::mutex> lock(cuda_cudss_plan_mutex_);
-    plans.reserve(cuda_cudss_plans_.size());
+    plans.reserve(cuda_cudss_plans_.size() + cuda_cudss_graph_plans_.size());
     for (auto &[handle, plan] : cuda_cudss_plans_) {
       plans.push_back(std::move(plan));
     }
     cuda_cudss_plans_.clear();
+    for (auto &[handle, plan] : cuda_cudss_graph_plans_) {
+      plans.push_back(std::move(plan));
+    }
+    cuda_cudss_graph_plans_.clear();
   }
   const bool provider_calls_safe = !runtime_has_fatal_fault();
   if (provider_calls_safe && !plans.empty()) {
@@ -994,13 +1468,27 @@ void Program::cuda_clear_cudss_plans() {
 
 namespace taichi::lang {
 
+std::shared_ptr<aot::CudaGraphCaptureCommand> make_cuda_cudss_capture_command(
+    Program *,
+    std::uint64_t,
+    int,
+    const std::vector<aot::Arg> &) {
+  TI_ERROR("CUDA cuDSS requires TI_WITH_CUDA=ON.");
+}
+
+std::shared_ptr<CudaCudssPlan> Program::retain_cuda_cudss_capture_plan(
+    std::uint64_t) {
+  TI_ERROR("CUDA cuDSS requires TI_WITH_CUDA=ON.");
+}
+
 std::uint64_t Program::create_cuda_cudss_configured_plan(
     SparseMatrix *,
     int,
     int,
     const std::string &,
     const std::string &,
-    const std::vector<int> &) {
+    const std::vector<int> &,
+    bool) {
   TI_ERROR("CUDA cuDSS requires TI_WITH_CUDA=ON.");
 }
 

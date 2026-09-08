@@ -1136,6 +1136,7 @@ struct CompiledGraphCudaState {
       parallel_capture_streams;
   std::vector<CudaEventHandle> parallel_capture_events;
   std::vector<CudaGraphCapturePacket> packets;
+  std::vector<std::shared_ptr<void>> provider_capture_resources;
   std::vector<CudaGraphBoundedDispatchControl> bounded_dispatch_controls;
   std::vector<CudaGraphBoundedDispatchGroup> bounded_dispatch_groups;
   // Host-only immutable recipes for opt-in physical launch observation.
@@ -1337,6 +1338,7 @@ struct CompiledGraphCudaState {
       CUDADriver::get_instance().stream_synchronize(stream);
     }
     packets.clear();
+    provider_capture_resources.clear();
     // graph_exec.reset() synchronized the default stream, so all deferred
     // events are ready. Recycle their handles for a later recapture/patch.
     while (!deferred_resources.empty()) {
@@ -2069,6 +2071,10 @@ std::uint32_t capture_cuda_graph_packets(const CompiledGraph &graph,
     const auto &dispatch = graph.dispatches[i];
     if (dispatch.cuda_capture_command) {
       record_cuda_capture_command(dispatch, args, program, stream);
+      if (auto resource =
+              dispatch.cuda_capture_command->take_capture_resources()) {
+        state.provider_capture_resources.push_back(std::move(resource));
+      }
       return CUDA_SUCCESS;
     }
     const auto &metadata = dispatch.cuda_bounded_dispatch;

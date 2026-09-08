@@ -1404,7 +1404,11 @@ class TI_DLL_EXPORT Program {
       int matrix_view,
       const std::string &adapter_path,
       const std::string &runtime_library_path,
-      const std::vector<int> &configuration);
+      const std::vector<int> &configuration,
+      bool graph_owned = false);
+
+  std::shared_ptr<CudaCudssPlan> retain_cuda_cudss_capture_plan(
+      std::uint64_t handle);
 
   std::unordered_map<std::string, std::int64_t> cuda_cudss_plan_configuration(
       std::uint64_t handle);
@@ -4232,6 +4236,10 @@ class TI_DLL_EXPORT Program {
   std::mutex cuda_cudss_plan_mutex_;
   std::unordered_map<std::uint64_t, std::shared_ptr<CudaCudssPlan>>
       cuda_cudss_plans_;
+  // Disjoint ownership: explicit solve/refactor entry points never resolve a
+  // Graph-owned snapshot, with no extra check in ordinary provider replay.
+  std::unordered_map<std::uint64_t, std::shared_ptr<CudaCudssPlan>>
+      cuda_cudss_graph_plans_;
   std::uint64_t next_cuda_cudss_plan_handle_{1};
   std::atomic<std::uint64_t> cuda_async_tile_lowered_specializations_{0};
   std::atomic<std::uint64_t> cuda_async_tile_copy_sites_{0};

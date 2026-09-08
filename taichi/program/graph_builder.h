@@ -255,6 +255,11 @@ class GraphBuilder {
       const CudaCutensorCapturePlan &plan,
       const std::vector<aot::Arg> &arguments);
 
+  void dispatch_cuda_capture_cudss(Program *program,
+                                   std::uint64_t handle,
+                                   int numeric_phase,
+                                   const std::vector<aot::Arg> &arguments);
+
   void dispatch_cuda_capture_cusparselt(
       Program *program,
       const CudaCusparseLtCapturePlan &plan,

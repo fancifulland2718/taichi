@@ -170,6 +170,28 @@ taichi_forge_cudss_provider_query(uint32_t requested_abi_version,
 #define TI_FORGE_CUDSS_CONFIGURATION_QUERY_SYMBOL \
   "taichi_forge_cudss_configuration_query"
 
+// Optional Graph allocator extension, separate from both published tables.
+#define TI_FORGE_CUDSS_ALLOCATOR_QUERY_SYMBOL \
+  "taichi_forge_cudss_allocator_query"
+typedef struct TiForgeCudssAllocatorApi {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  uint32_t (*set_allocator)(TiForgeCudssRuntime runtime,
+                            void *handle,
+                            void *owner,
+                            int (*allocate)(void *, void **, size_t, void *),
+                            int (*deallocate)(void *, void *, size_t, void *));
+} TiForgeCudssAllocatorApi;
+typedef TiForgeCudssResult (*TiForgeCudssAllocatorQueryFn)(
+    uint32_t,
+    size_t,
+    TiForgeCudssAllocatorApi *);
+
+TI_FORGE_CUDSS_EXPORT TiForgeCudssResult
+taichi_forge_cudss_allocator_query(uint32_t requested_abi_version,
+                                   size_t api_size,
+                                   TiForgeCudssAllocatorApi *out_api);
+
 typedef enum TiForgeCudssReordering {
   TI_FORGE_CUDSS_REORDER_DEFAULT = 0,
   TI_FORGE_CUDSS_REORDER_AMD = 1,

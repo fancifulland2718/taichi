@@ -1453,6 +1453,7 @@ class CudssPlan:
         matrix_type="general",
         matrix_view=None,
         library_path=None,
+        _graph_owned=False,
     ):
         """Private recipe preparation, never a mutable execution option."""
         plan = cls.__new__(cls)
@@ -1464,6 +1465,7 @@ class CudssPlan:
                 matrix_view,
                 library_path,
                 configuration,
+                _graph_owned,
             )
             return plan
         except BaseException:
@@ -1471,7 +1473,13 @@ class CudssPlan:
             raise
 
     def _initialize(
-        self, matrix, matrix_type, matrix_view, library_path, configuration
+        self,
+        matrix,
+        matrix_type,
+        matrix_view,
+        library_path,
+        configuration,
+        graph_owned=False,
     ):
         from taichi_forge.hardware._cudss import (  # pylint: disable=C0415
             _register_loaded_plan,
@@ -1520,7 +1528,7 @@ class CudssPlan:
                 extra = ()
                 if configuration is not None:
                     create = program._create_cuda_cudss_configured_plan
-                    extra = (configuration,)
+                    extra = (configuration, True) if graph_owned else (configuration,)
                 handle = create(
                     matrix.matrix,
                     self._MATRIX_TYPES[matrix_type],
@@ -1533,6 +1541,8 @@ class CudssPlan:
         self._runtime_generation = impl.runtime_generation()
         self._matrix = matrix
         self._handle = handle
+        self._graph_owned = graph_owned
+        self._capture_leases = 0
         self._rows = matrix.n
         self._nnz = int(matrix.matrix.num_nonzero())
         self._effect_name = f"__cudss_plan_{self._runtime_generation}_{self._handle}"
@@ -1588,7 +1598,7 @@ class CudssPlan:
                 ),
                 "workspace_limit_bytes": None,
                 "stream_binding": "runtime_ordered",
-                "capture_compatible": False,
+                "capture_compatible": graph_owned,
             },
         )
 
@@ -1822,6 +1832,8 @@ class CudssPlan:
     def close(self):
         """Release this owner; in-flight work retains state until completion."""
 
+        if getattr(self, "_capture_leases", 0):
+            raise TaichiRuntimeError("cuDSS plan is retained by a Graph recording")
         handle = self._handle
         self._handle = None
         if handle is not None and impl.get_runtime().prog is self._program:

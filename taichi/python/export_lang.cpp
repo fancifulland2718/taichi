@@ -3216,7 +3216,8 @@ void export_lang(py::module &m) {
                &Program::create_cuda_cudss_configured_plan),
            py::arg("matrix"), py::arg("matrix_type"), py::arg("matrix_view"),
            py::arg("adapter_path"), py::arg("runtime_library_path"),
-           py::arg("configuration"), py::call_guard<py::gil_scoped_release>())
+           py::arg("configuration"), py::arg("graph_owned") = false,
+           py::call_guard<py::gil_scoped_release>())
       .def("_cuda_cudss_plan_configuration",
            &Program::cuda_cudss_plan_configuration, py::arg("handle"),
            py::call_guard<py::gil_scoped_release>())
@@ -5386,6 +5387,10 @@ void export_lang(py::module &m) {
       .def("_dispatch_cuda_cusparselt_capture_recipe",
            &GraphBuilder::dispatch_cuda_capture_cusparselt,
            py::arg("program"), py::arg("plan"), py::arg("arguments"))
+      .def("_dispatch_cuda_cudss_capture_recipe",
+           &GraphBuilder::dispatch_cuda_capture_cudss,
+           py::arg("program"), py::arg("handle"), py::arg("numeric_phase"),
+           py::arg("arguments"))
       .def("compile", &GraphBuilder::compile)
       .def("_enable_two_map_composer",
            &GraphBuilder::enable_two_map_composer)

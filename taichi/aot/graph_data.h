@@ -286,6 +286,12 @@ class CudaGraphCaptureCommand {
   virtual std::shared_ptr<void> retain_binding_frame_plan(Program &program) {
     return {};
   }
+  // Cold capture handoff. A provider may snapshot host parameters which its
+  // library otherwise mutates when recording another binding. Each captured
+  // graph/frame retains these bytes until its queued launches have retired.
+  virtual std::shared_ptr<void> take_capture_resources() {
+    return {};
+  }
 };
 
 struct CompiledDispatch {

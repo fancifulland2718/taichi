@@ -103,6 +103,7 @@ struct Runtime {
   decltype(&cudssConfigSet) config_set{nullptr};
   decltype(&cudssConfigGet) config_get{nullptr};
   decltype(&cudssDataGet) data_get{nullptr};
+  decltype(&cudssSetDeviceMemHandler) set_mem_handler{nullptr};
   decltype(&cudssDataCreate) data_create{nullptr};
   decltype(&cudssDataDestroy) data_destroy{nullptr};
   decltype(&cudssMatrixCreateCsr) matrix_create_csr{nullptr};
@@ -192,6 +193,9 @@ TiForgeCudssResult make_runtime(const char *library_path,
         load_symbol(runtime->library, "cudssConfigGet"));
     runtime->data_get = reinterpret_cast<decltype(runtime->data_get)>(
         load_symbol(runtime->library, "cudssDataGet"));
+    runtime->set_mem_handler =
+        reinterpret_cast<decltype(runtime->set_mem_handler)>(
+            load_symbol(runtime->library, "cudssSetDeviceMemHandler"));
     BIND_CUDSS(data_create, DataCreate);
     BIND_CUDSS(data_destroy, DataDestroy);
     BIND_CUDSS(matrix_create_csr, MatrixCreateCsr);
@@ -469,6 +473,32 @@ size_t get_last_error(char *destination, size_t destination_size) {
   return required;
 }
 
+uint32_t set_allocator(TiForgeCudssRuntime runtime,
+                       void *handle,
+                       void *owner,
+                       int (*allocate)(void *, void **, size_t, void *),
+                       int (*deallocate)(void *, void *, size_t, void *)) {
+  auto *instance = checked(runtime);
+  if (!instance || !instance->set_mem_handler) {
+    return CUDSS_STATUS_NOT_SUPPORTED;
+  }
+  if (!handle || !owner || !allocate || !deallocate) {
+    return CUDSS_STATUS_INVALID_VALUE;
+  }
+  // cuDSS copies this handler; callback context belongs to the retained native
+  // owner. cudaStream_t is an opaque pointer, not a Toolkit runtime dependency.
+  cudssDeviceMemHandler_t handler{};
+  handler.ctx = owner;
+  handler.device_alloc =
+      reinterpret_cast<decltype(handler.device_alloc)>(allocate);
+  handler.device_free =
+      reinterpret_cast<decltype(handler.device_free)>(deallocate);
+  std::strncpy(handler.name, "forge-driver-async-retained",
+               sizeof(handler.name) - 1);
+  return instance->set_mem_handler(static_cast<cudssHandle_t>(handle),
+                                   &handler);
+}
+
 }  // namespace
 
 extern "C" TI_FORGE_CUDSS_EXPORT TiForgeCudssResult
@@ -528,5 +558,19 @@ taichi_forge_cudss_configuration_query(uint32_t requested_abi_version,
   }
   *out_api = {sizeof(*out_api), TI_FORGE_CUDSS_CONFIGURATION_ABI_VERSION,
               configure, analysis_memory_estimates};
+  return TI_FORGE_CUDSS_SUCCESS;
+}
+
+extern "C" TI_FORGE_CUDSS_EXPORT TiForgeCudssResult
+taichi_forge_cudss_allocator_query(uint32_t requested_abi_version,
+                                   size_t api_size,
+                                   TiForgeCudssAllocatorApi *out_api) {
+  if (!out_api || api_size < sizeof(*out_api)) {
+    return TI_FORGE_CUDSS_ERROR_INVALID_ARGUMENT;
+  }
+  if (requested_abi_version != 1) {
+    return TI_FORGE_CUDSS_ERROR_ABI_MISMATCH;
+  }
+  *out_api = {sizeof(*out_api), 1, set_allocator};
   return TI_FORGE_CUDSS_SUCCESS;
 }

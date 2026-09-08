@@ -26,7 +26,7 @@ def canonical_configuration(configuration):
     }
 
 
-def configured_plan(matrix, configuration, **kwargs):
+def configured_plan(matrix, configuration, *, _graph_owned=False, **kwargs):
     from taichi_forge.hardware._linalg import CudssPlan
 
     configuration = canonical_configuration(configuration)
@@ -34,7 +34,9 @@ def configured_plan(matrix, configuration, **kwargs):
         _REORDERINGS.index(configuration["reordering"]),
         _SOLVES.index(configuration["solve"]),
     )
-    plan = CudssPlan._create_configured(matrix, encoded, **kwargs)
+    plan = CudssPlan._create_configured(
+        matrix, encoded, _graph_owned=_graph_owned, **kwargs
+    )
     try:
         if plan._configuration_report()["configuration"] != configuration:
             raise ValueError("cuDSS frozen configuration drifted during preparation")
@@ -84,4 +86,16 @@ def configuration_report(facts):
             **estimates,
         },
         "observed_device_peak_bytes": None,
+        "graph_owned": bool(facts.get("graph_owned", 0)),
+        "graph_allocator": (
+            {
+                "kind": "requested_payload_not_driver_residency",
+                "live_bytes": facts["allocator_live_requested_bytes"],
+                "peak_live_bytes": facts["allocator_peak_requested_bytes"],
+                "snapshot_bytes": facts["graph_snapshot_bytes"],
+                "sealed_allocation_rejections": facts["sealed_allocation_rejections"],
+            }
+            if facts.get("graph_owned", 0)
+            else None
+        ),
     }

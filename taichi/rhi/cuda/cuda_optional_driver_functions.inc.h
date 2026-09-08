@@ -60,6 +60,22 @@ PER_CUDA_OPTIONAL_FUNCTION(graph_upload, cuGraphUpload, CUgraphExec, void *);
 // loading these symbols does not enable a new replay policy by itself.
 PER_CUDA_OPTIONAL_FUNCTION(graph_node_get_type,
                            cuGraphNodeGetType, void *, std::uint32_t *);
+PER_CUDA_OPTIONAL_FUNCTION(stream_get_capture_info_v2,
+                           cuStreamGetCaptureInfo_v2,
+                           void *,
+                           std::uint32_t *,
+                           std::uint64_t *,
+                           CUgraph *,
+                           const void ***,
+                           std::size_t *);
+PER_CUDA_OPTIONAL_FUNCTION(graph_memcpy_node_get_params,
+                           cuGraphMemcpyNodeGetParams,
+                           void *,
+                           CUDA_MEMCPY3D *);
+PER_CUDA_OPTIONAL_FUNCTION(graph_memcpy_node_set_params,
+                           cuGraphMemcpyNodeSetParams,
+                           void *,
+                           const CUDA_MEMCPY3D *);
 PER_CUDA_OPTIONAL_FUNCTION(graph_kernel_node_get_params_v1,
                            cuGraphKernelNodeGetParams, void *,
                            TaichiCudaKernelNodeParamsV1 *);
