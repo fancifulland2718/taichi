@@ -24,7 +24,7 @@ APIs for the bounded operations below; discovery probes remain non-executing.
 | cuDSS 0.8.x | Registered bundled-adapter ABI | Forge adapter; user vendor runtime | `ti.hardware.probe("cudss", library_path=...)` | Domain auto/explicit or root Graph; not kernel-callable |
 | OptiX ABI 93/105/118 | Registered bundled-adapter ABI | Forge adapter; user/driver vendor runtime | `ti.hardware.probe("optix", library_path=...)` | Explicit scene/launch or root Graph; not kernel-callable |
 | Vulkan driver/ICD | D0 backend dependency, not a D1 provider | OS/GPU driver installation | `ti.init(arch=ti.vulkan)` plus capability queries | Kernel and documented native Vulkan APIs |
-| cuSPARSELt 0.8.x-0.9.x | Registered bundled-adapter ABI | Forge adapter; user optional package | `ti.hardware.probe(...)` or `ti.hardware.tensor.CusparseLtProvider` | Explicit FP16 2:4 matmul plan; no Graph/kernel/auto route |
+| cuSPARSELt 0.8.x-0.9.x | Registered bundled-adapter ABI | Forge adapter; user optional package | `ti.hardware.tensor.CusparseLtProvider` / `CusparseLtMatmulPlan.record` | FP16 2:4 plan and retained root Graph capture; no kernel intrinsic or automatic rewrite |
 | cuTENSOR 2.0.x-2.7.x | Registered bundled-adapter ABI | Forge adapter; user optional package | `ti.hardware.tensor.CutensorProvider` / `ti.linalg.record_contraction` | Retained root Graph capture and complete contraction dataflows; no kernel intrinsic or implicit auto rewrite |
 | AmgX stable C API | Registered bundled-adapter ABI | Forge adapter; user source build | `ti.hardware.probe(...)` or `ti.hardware.linalg.AmgxProvider` | Explicit host-CSR solver; no Graph/kernel/auto route |
 | NCCL | Outside Forge's current single-GPU scope | User system package | No public Forge probe or execution API | External multi-GPU communication only |
@@ -61,7 +61,8 @@ entry is declared for that operation; it does not prohibit application providers
 | Vulkan VkFFT | Explicit fixed-storage plan or root Graph recording | Vulkan JIT/source adapter; no built-in complete FFT-recipe search or CUDA binding-frame integration is implied. |
 | cuBLASLt matmul region | `ti.linalg.record_matmul(...)`, then `operation.prepare()` | CUDA compact scalar-f32, fixed shape and optional strided batch. Explicit `ti.hardware.linalg.MatmulRecipeProvider()` composes frozen algorithm/workspace choices, real operand packing, and separate/fused ReLU. The expert retained-plan API remains private. |
 | cuTENSOR contraction region | `ti.linalg.record_contraction(...)`, then `operation.prepare()` | Explicit `ti.hardware.tensor.ContractionRecipeProvider()` composes real input permutations and vendor/separate epilogues; includes retained workspace and immutable binding frames. |
-| cuSPARSELt / AmgX | Explicit provider plans described below | No complete-recipe provider or general Graph recording route is currently exposed. |
+| cuSPARSELt | Explicit plan and `plan.record(...)` | Root Graph capture of a compressed snapshot or recompress/matmul. Recording alone does not provide a complete strategy-search domain. |
+| AmgX | Explicit provider plans described below | No complete-recipe provider or general Graph recording route is currently exposed. |
 
 Prepare mathematical operations before freezing the Graph. SpMM, FFT, matmul and contraction require
 explicit finite-input / f32 tolerance contracts; Forge does not scan values on
@@ -612,11 +613,45 @@ with ti.hardware.tensor.CusparseLtProvider(runtime_path) as provider:
         ti.sync()
 ```
 
-Follow the selected release's support table. Current cuSPARSELt documentation
-requires compute capability 8.0 or newer and, for the current release line, a
-CUDA 12.9-or-newer software stack with a compatible driver. Older package
-releases have different requirements; package availability is not a
-compatibility test.
+The fixed plan can also be captured into a root CUDA Graph:
+
+```python
+provider = ti.hardware.tensor.CusparseLtProvider(runtime_path)
+plan = provider.matmul_plan(m, n, k)
+plan.compress(a)  # Explicit, already-valid 2:4 weight snapshot.
+recording = plan.record(alpha=0.75, beta=0.25)
+builder = ti.graph.GraphBuilder()
+builder.append_native(recording)
+graph = builder.compile()
+frame = graph.bind({"b": b_transposed, "c": output, "d": output})
+graph.run(frame)
+```
+
+For A that changes on each replay, use a separate plan and
+`plan.record(a="a", ...)`, then include `"a": a` in the bindings. That command
+captures compression followed by matmul; neither bind nor capture executes
+the mathematics or advances C/D feedback. B/C/D values remain live in both
+modes, and C/D may alias. A/D and B/D aliasing is rejected at binding/capture.
+Immutable binding-frame recipes are supported on runtimes exposing this
+capture capability, without Python provider callbacks during replay.
+
+The recording retains the plan, compressed data and scratch. While any
+recording/Graph holds a lease, `plan.compress()` and `plan.close()` are rejected.
+For a new snapshot, retire the old bindings/Graphs/recordings first, or create a
+new plan/weight epoch. Do not mix refreshing and snapshot recordings on one
+plan: their shared compressed buffer would invalidate the snapshot meaning.
+Runtime reset retires the vendor plans before the device Program is destroyed.
+There is no standalone recording execution, nested sequential/AOT recording,
+automatic pruning, value-change detection, or implicit algorithm search.
+Snapshot reuse and per-replay refresh have different input contracts; they
+must not be presented as interchangeable optimization candidates without a
+common explicit weight-lifetime contract.
+
+Follow the selected release's supported GPU list and driver requirements.
+cuSPARSELt 0.8 supports CUDA 12.9/13.0; 0.9 dropped CUDA 12.9 support.
+The vendor runtime and its CUDA dependencies remain outside Forge's portable
+wheel. Package availability is not a compatibility test. See the
+[cuSPARSELt release notes](https://docs.nvidia.com/cuda/cusparselt/release_notes.html).
 
 The application adapter should own this lifecycle:
 

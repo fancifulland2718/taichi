@@ -21,7 +21,7 @@ retained-provider API，而 discovery probe 始终不执行算法。
 | cuDSS 0.8.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户提供 vendor runtime | `ti.hardware.probe("cudss", library_path=...)` | 领域级 auto/explicit 或 root Graph；不能在 kernel 内调用 |
 | OptiX ABI 93/105/118 | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户/driver 提供 vendor runtime | `ti.hardware.probe("optix", library_path=...)` | 显式 scene/launch 或 root Graph；不能在 kernel 内调用 |
 | Vulkan driver/ICD | D0 backend 依赖，不是 D1 provider | OS/GPU driver 安装 | `ti.init(arch=ti.vulkan)` 加 capability query | kernel 与已公开 native Vulkan API |
-| cuSPARSELt 0.8.x-0.9.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户安装可选包 | `ti.hardware.probe(...)` 或 `ti.hardware.tensor.CusparseLtProvider` | 显式 FP16 2:4 matmul plan；无 Graph/kernel/auto 路线 |
+| cuSPARSELt 0.8.x-0.9.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户安装可选包 | `ti.hardware.tensor.CusparseLtProvider` / `CusparseLtMatmulPlan.record` | FP16 2:4 plan 与 retained root Graph capture；无 kernel intrinsic 或自动 rewrite |
 | cuTENSOR 2.0.x-2.7.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户安装可选包 | `ti.hardware.tensor.CutensorProvider` / `ti.linalg.record_contraction` | retained root Graph capture 与完整 contraction 数据流；无 kernel intrinsic 或隐式 auto rewrite |
 | AmgX stable C API | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户源码构建 | `ti.hardware.probe(...)` 或 `ti.hardware.linalg.AmgxProvider` | 显式 host-CSR solver；无 Graph/kernel/auto 路线 |
 | NCCL | 不属于 Forge 当前单 GPU 范围 | 用户安装系统包 | 没有公开 Forge probe 或执行 API | 仅外部 multi-GPU communication |
@@ -53,7 +53,8 @@ cuTENSOR、AmgX 或 NCCL 绝不会触发 compiler rewrite。
 | 其他 cuSPARSE / cuFFT / cuDSS expert operation | 既有显式 plan 和已说明的 root Graph recording | recording 本身不提供 recipe generator；cuDSS root 有序调用不能描述成 CUDA Graph capture。 |
 | cuBLASLt matmul region | `ti.linalg.record_matmul(...)`，随后 `operation.prepare()` | CUDA 紧凑 scalar-f32、固定形状及可选 strided batch。显式 `ti.hardware.linalg.MatmulRecipeProvider()` 组合冻结算法/workspace、真实输入打包、独立/融合 ReLU；专家 retained-plan API 仍为私有。 |
 | cuTENSOR contraction region | `ti.linalg.record_contraction(...)`，然后 `operation.prepare()` | 显式 `ti.hardware.tensor.ContractionRecipeProvider()` 组合真实输入重排与 vendor/separate epilogue，持有 workspace 并支持 immutable binding frames。 |
-| cuSPARSELt / AmgX | 下文的显式 provider plan | 当前没有公开 complete-recipe provider 或通用 Graph recording 路线。 |
+| cuSPARSELt | 显式 plan 与 `plan.record(...)` | root Graph capture 支持压缩快照或重压缩/matmul；录制本身不构成完整策略搜索域。 |
+| AmgX | 下文的显式 provider plan | 当前没有公开 complete-recipe provider 或通用 Graph recording 路线。 |
 
 先准备数学 operation，再 freeze Graph。SpMM/FFT/matmul/contraction 要求显式的 finite-input / f32 tolerance 合同，
 Forge 不在每次 replay 扫描数值。FFT 正向、逆向均不归一化，连续应用两者会将输入乘以 `H * W`。
@@ -492,9 +493,37 @@ with ti.hardware.tensor.CusparseLtProvider(runtime_path) as provider:
         ti.sync()
 ```
 
-必须遵守所选 release 的 support table。当前 cuSPARSELt 文档要求 compute capability 8.0
-或更高版本；当前 release line 要求 CUDA 12.9 或更新的软件栈和兼容 driver。旧 package
-release 的要求不同；package 可安装不等于运行兼容。
+固定 plan 还可捕获到 root CUDA Graph：
+
+```python
+provider = ti.hardware.tensor.CusparseLtProvider(runtime_path)
+plan = provider.matmul_plan(m, n, k)
+plan.compress(a)  # 显式建立已满足 2:4 的权重快照。
+recording = plan.record(alpha=0.75, beta=0.25)
+builder = ti.graph.GraphBuilder()
+builder.append_native(recording)
+graph = builder.compile()
+frame = graph.bind({"b": b_transposed, "c": output, "d": output})
+graph.run(frame)
+```
+
+A 每 replay 变化时，使用另一个 plan 的 `plan.record(a="a", ...)`，绑定中增加 `"a": a`。
+这个命令捕获“压缩 + matmul”；bind/capture 不执行数学计算，不提前推进 C/D 反馈。
+两种模式中 B/C/D 都读取当前值，C/D 可同数组；A/D、B/D alias 在 bind/capture 边界拒绝。
+具备对应 native capture capability 的 runtime 支持 immutable binding-frame recipe，
+replay 不调用 Python provider。
+
+recording 持有 plan、压缩数据和 scratch。只要 recording/Graph 的 lease 存活，
+`plan.compress()` 与 `plan.close()` 都会拒绝。新权重快照需要先退休旧 binding/Graph/recording，
+或者建立新 plan/weight epoch；同一 plan 不得混用刷新与快照录制，以免共享 compressed buffer
+悄悄改变快照含义。runtime reset 在 device Program 销毁前释放 vendor plan。
+不提供 standalone recording 执行、nested sequential/AOT recording、自动 pruning、
+数值变化探测或隐式算法搜索。快照复用和每 replay 重压缩的输入变化合同不同，没有共同明确的
+weight-lifetime 合同时不能把它们当成可互换的优化候选。
+
+必须按具体 release 核对支持的 GPU 列表和 driver 要求。cuSPARSELt 0.8 支持 CUDA12.9/13.0，
+0.9 已取消 CUDA12.9 支持；vendor runtime 及其 CUDA 依赖仍在 Forge portable wheel 外。
+package 可安装不等于运行兼容，见 [cuSPARSELt release notes](https://docs.nvidia.com/cuda/cusparselt/release_notes.html)。
 
 应用 adapter 应持有以下 lifecycle：
 
