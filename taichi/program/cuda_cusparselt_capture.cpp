@@ -18,14 +18,27 @@ class CudaCusparseLtCaptureCommand final : public aot::CudaGraphCaptureCommand {
                 "cuSPARSELt capture requires a CUDA Program");
     TI_ERROR_IF(!plan.execute_address || !plan.handle ||
                     (plan.recompress && !plan.compress_address) ||
-                    plan.m <= 0 || plan.n <= 0 || plan.k <= 0 || plan.m % 16 ||
-                    plan.n % 16 || plan.k % 16 || !plan.compressed_bytes ||
+                    plan.m <= 0 || plan.n <= 0 || plan.k <= 0 ||
+                    plan.matmul_count <= 0 || plan.m % 16 || plan.n % 16 ||
+                    plan.k % 16 || !plan.compressed_bytes ||
                     plan.alignment_bytes < 16 ||
                     (plan.alignment_bytes & (plan.alignment_bytes - 1)) ||
                     !std::isfinite(plan.alpha) || !std::isfinite(plan.beta),
                 "cuSPARSELt capture plan is incomplete");
-    shapes_ = {{plan.n, plan.k}, {plan.m, plan.n}, {plan.m, plan.n}, {}};
-    sizes_ = {0, 0, 0, plan.compressed_bytes};
+    const auto product_args = std::size_t(plan.matmul_count) * 3;
+    const auto argument_count =
+        product_args + 1 + bool(plan.workspace_bytes) +
+        (plan.recompress ? 1 + bool(plan.compression_buffer_bytes) : 0);
+    TI_ERROR_IF(arguments.size() != argument_count,
+                "cuSPARSELt capture bindings are incomplete");
+    for (int i = 0; i < plan.matmul_count; ++i) {
+      shapes_.insert(shapes_.end(),
+                     {{plan.n, plan.k}, {plan.m, plan.n}, {plan.m, plan.n}});
+      sizes_.insert(sizes_.end(), {0, 0, 0});
+    }
+    compressed_index_ = shapes_.size();
+    shapes_.push_back({});
+    sizes_.push_back(plan.compressed_bytes);
     if (plan.workspace_bytes) {
       workspace_index_ = shapes_.size();
       shapes_.push_back({});
@@ -41,8 +54,6 @@ class CudaCusparseLtCaptureCommand final : public aot::CudaGraphCaptureCommand {
         sizes_.push_back(plan.compression_buffer_bytes);
       }
     }
-    TI_ERROR_IF(arguments.size() != shapes_.size(),
-                "cuSPARSELt capture bindings are incomplete");
     for (std::size_t i = 0; i < arguments.size(); ++i) {
       const auto &arg = arguments[i];
       TI_ERROR_IF(arg.tag != aot::ArgKind::kNdarray ||
@@ -58,6 +69,8 @@ class CudaCusparseLtCaptureCommand final : public aot::CudaGraphCaptureCommand {
   }
 
   const char *kind() const override {
+    if (plan_.matmul_count > 1)
+      return "cusparselt_shared_a_matmul_f16";
     return plan_.recompress ? "cusparselt_compress_matmul_f16"
                             : "cusparselt_snapshot_matmul_f16";
   }
@@ -79,7 +92,12 @@ class CudaCusparseLtCaptureCommand final : public aot::CudaGraphCaptureCommand {
         return false;
       for (std::size_t j = 0; j < i; ++j) {
         const bool scratch = sizes_[i] || sizes_[j];
-        const bool illegal_output = (i == 2 || j == 2) && !(i == 2 && j == 1);
+        // The products share A, not mutable feedback. Only each product's
+        // own C/D alias is legal; no output may clobber another input/output.
+        const bool output_i = i < compressed_index_ && i % 3 == 2;
+        const bool output_j = j < compressed_index_ && j % 3 == 2;
+        const bool illegal_output =
+            (output_i || output_j) && !(output_i && j == i - 1);
         if ((scratch || illegal_output) &&
             value->get_device_allocation() ==
                 array(j, args)->get_device_allocation()) {
@@ -116,7 +134,7 @@ class CudaCusparseLtCaptureCommand final : public aot::CudaGraphCaptureCommand {
       TiForgeCusparseLtCompressDesc desc{};
       desc.struct_size = sizeof(desc);
       desc.dense_a = pointer(a_index_);
-      desc.compressed_a = pointer(3);
+      desc.compressed_a = pointer(compressed_index_);
       desc.compression_buffer = pointer(compression_index_);
       desc.compression_buffer_bytes = plan_.compression_buffer_bytes;
       desc.cuda_stream = stream_value;
@@ -131,18 +149,20 @@ class CudaCusparseLtCaptureCommand final : public aot::CudaGraphCaptureCommand {
     desc.struct_size = sizeof(desc);
     desc.alpha = plan_.alpha;
     desc.beta = plan_.beta;
-    desc.compressed_a = pointer(3);
-    desc.b = pointer(0);
-    desc.c = pointer(1);
-    desc.d = pointer(2);
+    desc.compressed_a = pointer(compressed_index_);
     desc.workspace = pointer(workspace_index_);
     desc.workspace_bytes = plan_.workspace_bytes;
     desc.cuda_stream = stream_value;
-    const auto status = reinterpret_cast<TiForgeCusparseLtExecuteFn>(
-        plan_.execute_address)(handle, &desc);
-    TI_ERROR_IF(status != TI_FORGE_RUNTIME_PROVIDER_SUCCESS,
-                "cuSPARSELt matmul capture failed with adapter status {}",
-                static_cast<int>(status));
+    for (int i = 0; i < plan_.matmul_count; ++i) {
+      desc.b = pointer(3 * i);
+      desc.c = pointer(3 * i + 1);
+      desc.d = pointer(3 * i + 2);
+      const auto status = reinterpret_cast<TiForgeCusparseLtExecuteFn>(
+          plan_.execute_address)(handle, &desc);
+      TI_ERROR_IF(status != TI_FORGE_RUNTIME_PROVIDER_SUCCESS,
+                  "cuSPARSELt matmul capture failed with adapter status {}",
+                  static_cast<int>(status));
+    }
   }
 
  private:
@@ -173,7 +193,8 @@ class CudaCusparseLtCaptureCommand final : public aot::CudaGraphCaptureCommand {
   const std::vector<aot::Arg> arguments_;
   std::vector<std::vector<int>> shapes_;
   std::vector<std::size_t> sizes_;
-  int workspace_index_{-1}, a_index_{-1}, compression_index_{-1};
+  int compressed_index_{-1}, workspace_index_{-1}, a_index_{-1},
+      compression_index_{-1};
 };
 
 }  // namespace

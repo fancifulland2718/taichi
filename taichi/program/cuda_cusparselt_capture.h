@@ -12,6 +12,7 @@ struct CudaCusparseLtCapturePlan {
   std::uint64_t execute_address{0};
   std::uint64_t handle{0};
   int m{0}, n{0}, k{0};
+  int matmul_count{1};  // One shared compression followed by ordered products.
   std::size_t compressed_bytes{0};
   std::size_t compression_buffer_bytes{0};
   std::size_t workspace_bytes{0};

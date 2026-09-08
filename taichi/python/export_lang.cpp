@@ -622,6 +622,7 @@ void export_lang(py::module &m) {
       .def_readwrite("m", &CudaCusparseLtCapturePlan::m)
       .def_readwrite("n", &CudaCusparseLtCapturePlan::n)
       .def_readwrite("k", &CudaCusparseLtCapturePlan::k)
+      .def_readwrite("matmul_count", &CudaCusparseLtCapturePlan::matmul_count)
       .def_readwrite("compressed_bytes", &CudaCusparseLtCapturePlan::compressed_bytes)
       .def_readwrite("compression_buffer_bytes",
                      &CudaCusparseLtCapturePlan::compression_buffer_bytes)

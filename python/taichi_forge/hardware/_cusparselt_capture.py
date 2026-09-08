@@ -68,11 +68,14 @@ class _MatmulCaptureRecipe(_CudaGraphCaptureRecipe):
             recording.alpha,
             recording.beta,
         )
+        self.matmul_count = recording.matmul_count
         self.kind = (
             "cusparselt_compress_matmul_f16"
             if self.recompress
             else "cusparselt_snapshot_matmul_f16"
         )
+        if self.matmul_count > 1:
+            self.kind = "cusparselt_shared_a_matmul_f16"
 
     def append_to_graph(self, builder, program):
         from taichi_forge.graph._graph import Arg, ArgKind
@@ -80,6 +83,8 @@ class _MatmulCaptureRecipe(_CudaGraphCaptureRecipe):
         plan = self.lease.plan
         plan._validate_lifetime()
         native = core._CudaCusparseLtCapturePlan()
+        if hasattr(native, "matmul_count"):
+            native.matmul_count = self.matmul_count
         native.compress_address = ctypes.cast(
             plan.provider._execution_api.compress_sparse_a, ctypes.c_void_p
         ).value
@@ -146,7 +151,7 @@ class CusparseLtCaptureRecording(BackendCommandRecording):
         )()
     )
 
-    def __init__(self, plan, *, a, b, c, d, alpha, beta):
+    def __init__(self, plan, *, a, b, c, d, alpha, beta, _products=None):
         if not isinstance(plan, CusparseLtMatmulPlan):
             raise TypeError("cuSPARSELt capture requires a matmul plan")
         if not hasattr(core, "_CudaCusparseLtCapturePlan"):
@@ -154,7 +159,19 @@ class CusparseLtCaptureRecording(BackendCommandRecording):
                 "cuSPARSELt capture requires typed native capture support"
             )
         recompress = a is not None
-        public = (b, c, d, a) if recompress else (b, c, d)
+        products = (
+            ((b, c, d),) if _products is None else tuple(tuple(x) for x in _products)
+        )
+        if not products or any(len(x) != 3 for x in products):
+            raise ValueError("cuSPARSELt products require nonempty B/C/D triples")
+        if len(products) > 1 and not hasattr(
+            core._CudaCusparseLtCapturePlan, "matmul_count"
+        ):
+            raise TaichiRuntimeError(
+                "cuSPARSELt shared-A groups require native group capture support"
+            )
+        product_names = tuple(x for row in products for x in row)
+        public = (*product_names, a) if recompress else product_names
         if any(not isinstance(x, str) or not x for x in public) or len(
             set(public)
         ) != len(public):
@@ -168,7 +185,9 @@ class CusparseLtCaptureRecording(BackendCommandRecording):
         while any(x.startswith(prefix) for x in public):
             prefix += "_"
         fixed = {f"{prefix}_compressed": plan._compressed_a}
-        names, arrays = [b, c, d, *fixed], [(f16, 2)] * 3 + [(u8, 1)]
+        names, arrays = [*product_names, *fixed], [(f16, 2)] * len(product_names) + [
+            (u8, 1)
+        ]
         if plan.workspace_bytes:
             name = f"{prefix}_workspace"
             fixed[name] = plan._workspace
@@ -192,6 +211,7 @@ class CusparseLtCaptureRecording(BackendCommandRecording):
         object.__setattr__(self, "_lease", _PlanLease(plan, recompress))
         for name, value in dict(
             plan=plan,
+            matmul_count=len(products),
             recompress=recompress,
             alpha=alpha,
             beta=beta,
@@ -210,6 +230,7 @@ class CusparseLtCaptureRecording(BackendCommandRecording):
                 m=plan.m,
                 n=plan.n,
                 k=plan.k,
+                matmul_count=len(products),
                 alpha=alpha,
                 beta=beta,
                 input_contract="already_valid_fp16_row_2of4",
@@ -255,10 +276,11 @@ class CusparseLtCaptureRecording(BackendCommandRecording):
                 name,
                 (
                     GraphAccess.WRITE
-                    if i == 2
+                    if i < 3 * self.matmul_count and i % 3 == 2
                     else (
                         GraphAccess.READ_WRITE
-                        if dtype == u8 and (i != 3 or self.recompress)
+                        if dtype == u8
+                        and (i != 3 * self.matmul_count or self.recompress)
                         else GraphAccess.READ
                     )
                 ),
