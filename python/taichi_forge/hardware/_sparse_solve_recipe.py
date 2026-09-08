@@ -34,8 +34,8 @@ class SparseSolveRecipeProvider(GraphRuntimeFragmentProvider):
 
     descriptor = runtime_family_provider_descriptor(
         "sparse_solve",
-        domain_version="shared-pattern-sparse-solve-region-v1",
-        semantic_fingerprint="csr-f32-current-or-fixed-matrix-shared-rhs-lifecycle-v1",
+        domain_version="shared-pattern-sparse-solve-region-v2",
+        semantic_fingerprint="csr-f32-shared-rhs-lifecycle-capture-storage-v2",
         capabilities=(
             "semantic-sparse-solve",
             "frozen-ordering-lifecycles",
@@ -87,6 +87,9 @@ class SparseSolveRecipeProvider(GraphRuntimeFragmentProvider):
                             factor_lifetime=semantics["matrix_lifetime"],
                             shared_factor_owner=path,
                             submission="retained_stream_capture",
+                            capture_parameter_storage=config[
+                                "capture_parameter_storage"
+                            ],
                             component=source.facts["component"],
                             vendor_kernel_topology="unobserved",
                         ),
@@ -182,7 +185,8 @@ class SparseSolveRecipeProvider(GraphRuntimeFragmentProvider):
                 "one shared analysis/factor owner, sequential compact vector RHS; no hidden batching or format conversion",
                 "fixed-matrix and current-values regions have distinct semantics, never interchangeable choices",
                 "caller evaluates residuals; no per-replay input scan, error readback or convergence test",
-                "capture includes vendor HtoD staging and device copies; not a zero-transfer claim",
+                "capture parameter storage follows the reported native capability; device copies and workspace clears remain",
+                "per-binding resident parameter bytes are reported by Graph execution memory, not counted as shared plan workspace",
                 "known requested payload includes private and catalog numeric snapshots, excludes caller inputs and opaque driver pool residency",
                 "ordering defaults remain vendor policy; kernel topology and resolved default algorithm are unobserved",
                 "restoration rebuilds selected configuration and factors, never serializes an executable",

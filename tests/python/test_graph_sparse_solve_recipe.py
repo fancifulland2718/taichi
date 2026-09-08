@@ -149,6 +149,11 @@ def test_sparse_solve_lifecycles_shared_rhs_and_binding_frames(
         with definition.materialize(recipe, providers=_providers()) as materialized:
             graph = materialized.executor
             frames = [graph.bind(b) for b, _ in inputs]
+            resident = (
+                artifact["choices"][key]["capture_parameter_storage"]
+                == "device_resident_per_binding"
+            )
+            before_stats = graph.execution_stats().memory.persistent_bytes
             for b, _ in inputs:
                 for i in range(3):
                     np.testing.assert_array_equal(b[f"x{i}"].to_numpy(), np.full(9, -7))
@@ -164,6 +169,13 @@ def test_sparse_solve_lifecycles_shared_rhs_and_binding_frames(
                     graph.run(frames[index])
             for scale, (b, host) in zip((0.75, 1.8), inputs):
                 _assert(problem, b, host, 1 if fixed else scale)
+            if resident:
+                after_stats = graph.execution_stats().memory.persistent_bytes
+                assert after_stats > 0
+                # Ordinary baseline captures lazily on its first run; immutable
+                # frame recipes already own all images after bind.
+                if before_stats:
+                    assert after_stats == before_stats
             if not fixed:
                 inputs[0][0]["source"].from_numpy(problem[3] * 1.25)
                 graph.run(frames[0])

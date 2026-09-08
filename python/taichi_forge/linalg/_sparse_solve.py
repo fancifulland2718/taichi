@@ -134,6 +134,13 @@ class _SparseSolveCatalog:
                 raise TaichiRuntimeError(
                     "Sparse solve prepared resource contract drifted"
                 )
+            if (
+                plan._configuration_report()["capture_parameter_storage"]
+                != config["capture_parameter_storage"]
+            ):
+                raise TaichiRuntimeError(
+                    "Sparse solve capture parameter storage drifted"
+                )
             recording = _SolveRecording(self, key, plan)
             builder.append_native(recording, admission=admission)
         except BaseException:
@@ -433,6 +440,9 @@ class SparseSolveOperation(NativeGraphNode):
                         analysis="once_per_materialization",
                         factor_scope="shared_by_all_rhs",
                         submission="ordered_capture_group",
+                        capture_parameter_storage=plan._configuration_report()[
+                            "capture_parameter_storage"
+                        ],
                     )
                     key = "sparse-solve:" + _digest(config)
                     choices[key], baseline = config, baseline or key
@@ -483,6 +493,7 @@ class SparseSolveOperation(NativeGraphNode):
                 "analysis",
                 "factor_scope",
                 "submission",
+                "capture_parameter_storage",
             }:
                 raise ValueError("Sparse solve physical configuration fields drifted")
             canonical_configuration(config["configuration"])
@@ -498,6 +509,8 @@ class SparseSolveOperation(NativeGraphNode):
                 or config["analysis"] != "once_per_materialization"
                 or config["factor_scope"] != "shared_by_all_rhs"
                 or config["submission"] != "ordered_capture_group"
+                or config["capture_parameter_storage"]
+                not in ("device_resident_per_binding", "host_snapshot_per_binding")
                 or key != "sparse-solve:" + _digest(config)
             ):
                 raise ValueError(

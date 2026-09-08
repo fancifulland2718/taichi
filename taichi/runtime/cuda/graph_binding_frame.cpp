@@ -30,8 +30,10 @@ struct GraphBindingFrame::State {
   void *argument_image{nullptr};
   std::vector<std::uint8_t> host_argument_image;
   std::vector<std::unique_ptr<CudaDevice::AllocationLease>> allocations;
-  std::vector<std::shared_ptr<void>> provider_capture_resources;
+  std::vector<std::shared_ptr<aot::CudaGraphCaptureResources>>
+      provider_capture_resources;
   std::size_t bytes{0};
+  std::size_t provider_bytes{0};
   std::size_t nodes{0};
 
   void release(bool backend_safe) noexcept {
@@ -59,9 +61,13 @@ struct GraphBindingFrame::State {
     host_argument_image.clear();
     contexts.clear();
     allocations.clear();
+    for (const auto &resource : provider_capture_resources) {
+      resource->release(backend_safe);
+    }
     provider_capture_resources.clear();
     device = nullptr;
     bytes = 0;
+    provider_bytes = 0;
   }
 };
 
@@ -437,6 +443,14 @@ std::shared_ptr<GraphBindingFrame> GraphBindingExecutor::prepare(
     capturing = false;
     TI_ERROR_IF(error != CUDA_SUCCESS, "CUDA binding-frame capture failed: {}",
                 error);
+    for (const auto &resource : data.provider_capture_resources) {
+      resource->finalize();
+      const auto bytes = resource->requested_device_bytes();
+      data.provider_bytes += bytes;
+      data.bytes += bytes;
+      state.upload_calls += bytes != 0;
+      state.upload_bytes += bytes;
+    }
     driver.graph_get_nodes(data.graph, nullptr, &data.nodes);
     TI_ERROR_IF(data.nodes == 0, "CUDA binding frame contains no kernel nodes");
     std::vector<void *> nodes(data.nodes);
@@ -524,11 +538,13 @@ GraphBindingExecutor::snapshot() {
     state.collect(true);
   }
   std::uint64_t bytes = 0;
+  std::uint64_t provider_bytes = 0;
   std::uint64_t frames = 0;
   std::uint64_t nodes = 0;
   for (const auto &entry : state.frames) {
     if (auto frame = entry.lock()) {
       bytes += frame->state_->bytes;
+      provider_bytes += frame->state_->provider_bytes;
       nodes += frame->state_->nodes;
       ++frames;
     }
@@ -538,6 +554,7 @@ GraphBindingExecutor::snapshot() {
           {"failed", state.failed},
           {"frames", frames},
           {"argument_bytes", bytes},
+          {"provider_argument_bytes", provider_bytes},
           {"kernel_nodes", nodes},
           {"executables", state.executable ? 1 : 0},
           {"pending_frame_leases", state.pending.size()},

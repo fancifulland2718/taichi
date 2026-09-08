@@ -161,6 +161,9 @@ class CudssCaptureRecording(BackendCommandRecording):
                 "factor_reuse": "all_rhs_in_region",
                 "plan_handle": plan._handle,
                 "configuration": plan._configuration_report()["configuration"],
+                "capture_parameter_storage": plan._configuration_report()[
+                    "capture_parameter_storage"
+                ],
                 "capture": "retained_private_snapshot",
             },
         )

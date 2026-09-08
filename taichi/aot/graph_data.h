@@ -254,6 +254,17 @@ struct CpuBoundedDispatchMetadata {
   std::uint32_t capacity{0};
 };
 
+// Capture-local provider storage. Finalization runs after stream capture and
+// before instantiation, never on replay. The graph/frame retires this storage
+// only after its launches complete. No AOT or public deployment schema.
+class CudaGraphCaptureResources {
+ public:
+  virtual ~CudaGraphCaptureResources() = default;
+  virtual void finalize() = 0;
+  virtual std::uint64_t requested_device_bytes() const = 0;
+  virtual void release(bool backend_safe) noexcept = 0;
+};
+
 // JIT-only contract for one provider command that can be prepared outside a
 // CUDA stream capture and then recorded on the capture stream. Concrete
 // provider recipes remain internal and are deliberately excluded from the
@@ -289,7 +300,7 @@ class CudaGraphCaptureCommand {
   // Cold capture handoff. A provider may snapshot host parameters which its
   // library otherwise mutates when recording another binding. Each captured
   // graph/frame retains these bytes until its queued launches have retired.
-  virtual std::shared_ptr<void> take_capture_resources() {
+  virtual std::shared_ptr<CudaGraphCaptureResources> take_capture_resources() {
     return {};
   }
 };

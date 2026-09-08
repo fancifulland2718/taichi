@@ -1136,7 +1136,8 @@ struct CompiledGraphCudaState {
       parallel_capture_streams;
   std::vector<CudaEventHandle> parallel_capture_events;
   std::vector<CudaGraphCapturePacket> packets;
-  std::vector<std::shared_ptr<void>> provider_capture_resources;
+  std::vector<std::shared_ptr<CudaGraphCaptureResources>>
+      provider_capture_resources;
   std::vector<CudaGraphBoundedDispatchControl> bounded_dispatch_controls;
   std::vector<CudaGraphBoundedDispatchGroup> bounded_dispatch_groups;
   // Host-only immutable recipes for opt-in physical launch observation.
@@ -1338,6 +1339,9 @@ struct CompiledGraphCudaState {
       CUDADriver::get_instance().stream_synchronize(stream);
     }
     packets.clear();
+    for (const auto &resource : provider_capture_resources) {
+      resource->release(true);
+    }
     provider_capture_resources.clear();
     // graph_exec.reset() synchronized the default stream, so all deferred
     // events are ready. Recycle their handles for a later recapture/patch.
@@ -1388,6 +1392,9 @@ struct CompiledGraphCudaState {
       bytes += sizeof(std::uint32_t);
     }
     bytes += known_bounded_control_bytes();
+    for (const auto &resource : provider_capture_resources) {
+      bytes += resource->requested_device_bytes();
+    }
     for (const auto &packet : packets) {
       bytes += packet.packet.device_arg_buffer_size;
     }
@@ -2703,6 +2710,9 @@ bool try_run_cuda_graph(const CompiledGraph &graph,
   if (end_err != CUDA_SUCCESS || !captured_graph) {
     return handle_cuda_graph_driver_failure(*state, end_err,
                                             "stream end capture");
+  }
+  for (const auto &resource : state->provider_capture_resources) {
+    resource->finalize();
   }
   auto instantiate_err = driver.graph_instantiate_with_flags.call(
       state->graph_exec.put(), captured_graph.get(), 0);

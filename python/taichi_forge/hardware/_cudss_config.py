@@ -87,6 +87,15 @@ def configuration_report(facts):
         },
         "observed_device_peak_bytes": None,
         "graph_owned": bool(facts.get("graph_owned", 0)),
+        "capture_parameter_storage": (
+            (
+                "device_resident_per_binding"
+                if facts.get("capture_parameters_device_resident", 0)
+                else "host_snapshot_per_binding"
+            )
+            if facts.get("graph_owned", 0)
+            else None
+        ),
         "graph_allocator": (
             {
                 "kind": "requested_payload_not_driver_residency",

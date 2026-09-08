@@ -355,6 +355,101 @@ class CudssGraphAllocator {
   std::uint64_t sealed_allocation_rejections_{0};
 };
 
+// cuDSS emits small host-to-device parameter copies while recording solves.
+// Snapshot each RHS immediately, then upload the packed immutable bytes once
+// after capture. Graph nodes read device storage owned by that graph/frame;
+// later bindings cannot overwrite it, and replay needs no host transfer.
+class CudssCaptureInputs final : public aot::CudaGraphCaptureResources {
+ public:
+  explicit CudssCaptureInputs(std::shared_ptr<RuntimeFaultDomain> fault_domain)
+      : fault_domain_(std::move(fault_domain)) {
+  }
+
+  ~CudssCaptureInputs() override {
+    release(true);
+  }
+
+  void snapshot(void *node, CUDA_MEMCPY3D params) {
+    auto &input = inputs_.emplace_back();
+    input.node = node;
+    input.params = params;
+    input.bytes.resize(params.WidthInBytes);
+    std::memcpy(
+        input.bytes.data(),
+        static_cast<const std::uint8_t *>(params.srcHost) + params.srcXInBytes,
+        input.bytes.size());
+    // The vendor may reuse its host buffer during the very next RHS capture.
+    params.srcHost = input.bytes.data();
+    params.srcXInBytes = 0;
+    CUDADriver::get_instance().graph_memcpy_node_set_params(node, &params);
+  }
+
+  void finalize() override {
+    if (inputs_.empty())
+      return;
+    std::vector<std::uint8_t> packed;
+    for (auto &input : inputs_) {
+      const auto size = packed.size();
+      TI_ERROR_IF(size > std::numeric_limits<std::size_t>::max() - 7,
+                  "cuDSS capture parameter storage is too large.");
+      input.offset = (size + 7) & ~std::size_t(7);
+      TI_ERROR_IF(input.bytes.size() >
+                      std::numeric_limits<std::size_t>::max() - input.offset,
+                  "cuDSS capture parameter storage is too large.");
+      packed.resize(input.offset + input.bytes.size());
+      std::memcpy(packed.data() + input.offset, input.bytes.data(),
+                  input.bytes.size());
+    }
+    auto &driver = CUDADriver::get_instance();
+    driver.malloc(&device_, packed.size());
+    bytes_ = packed.size();
+    // Synchronous cold upload keeps rollback/lifetime local. It executes no
+    // mathematical work, and does not impose synchronization on graph replay.
+    driver.memcpy_host_to_device(device_, packed.data(), packed.size());
+    for (const auto &input : inputs_) {
+      auto params = input.params;
+      params.srcMemoryType = static_cast<CUmemorytype>(CU_MEMORYTYPE_DEVICE);
+      params.srcHost = nullptr;
+      params.srcDevice = static_cast<char *>(device_) + input.offset;
+      params.srcXInBytes = 0;
+      params.srcPitch = params.WidthInBytes;
+      driver.graph_memcpy_node_set_params(input.node, &params);
+    }
+    inputs_.clear();
+  }
+
+  std::uint64_t requested_device_bytes() const override {
+    return bytes_;
+  }
+
+  void release(bool backend_safe) noexcept override {
+    auto *device = std::exchange(device_, nullptr);
+    bytes_ = 0;
+    if (!device || !backend_safe || !fault_domain_ ||
+        !fault_domain_->backend_calls_safe() ||
+        fault_domain_->state() == RuntimeLifecycleState::kFinalized)
+      return;
+    try {
+      auto context = CUDAContext::get_instance().get_guard();
+      CUDADriver::get_instance().mem_free(device);
+    } catch (...) {
+      // Failed contexts must not cause another backend call during unwinding.
+    }
+  }
+
+ private:
+  struct Input {
+    void *node{nullptr};
+    CUDA_MEMCPY3D params{};
+    std::vector<std::uint8_t> bytes;
+    std::size_t offset{0};
+  };
+  std::vector<Input> inputs_;
+  void *device_{nullptr};
+  std::uint64_t bytes_{0};
+  std::shared_ptr<RuntimeFaultDomain> fault_domain_;
+};
+
 class CudaCudssPlan final : public CudaProviderCompletionResource {
  public:
   CudaCudssPlan(const CuSparseMatrix &matrix,
@@ -461,6 +556,10 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
       }
     }
     destroy(false);
+  }
+
+  std::shared_ptr<CudssCaptureInputs> capture_inputs() const {
+    return std::make_shared<CudssCaptureInputs>(fault_domain_);
   }
 
   void analyze(const CuSparseMatrix &matrix) {
@@ -699,6 +798,7 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
         allocator_ ? allocator_->observation() : std::array<std::uint64_t, 3>{};
     return {{"configuration_abi", configuration_api_.abi_version},
             {"graph_owned", graph_owned_ ? 1 : 0},
+            {"capture_parameters_device_resident", graph_owned_ ? 1 : 0},
             {"allocator_live_requested_bytes",
              static_cast<std::int64_t>(allocation[0])},
             {"allocator_peak_requested_bytes",
@@ -1075,7 +1175,7 @@ class CudaCudssCaptureCommand final : public aot::CudaGraphCaptureCommand {
   std::shared_ptr<void> retain_binding_frame_plan(Program &) override {
     return owner_;
   }
-  std::shared_ptr<void> take_capture_resources() override {
+  std::shared_ptr<aot::CudaGraphCaptureResources> take_capture_resources() override {
     return std::exchange(capture_inputs_, {});
   }
 
@@ -1120,8 +1220,7 @@ class CudaCudssCaptureCommand final : public aot::CudaGraphCaptureCommand {
           program.get_ndarray_data_ptr_as_int(array(i, args)));
     };
     if (capture_status == 1) {
-      capture_inputs_ =
-          std::make_shared<std::vector<std::vector<std::uint8_t>>>();
+      capture_inputs_ = owner_->capture_inputs();
     }
     const std::size_t offset = phase_ ? 1 : 0;
     for (std::size_t i = offset; i < arguments_.size(); i += 2) {
@@ -1152,17 +1251,7 @@ class CudaCudssCaptureCommand final : public aot::CudaGraphCaptureCommand {
                         params.Height != 1 || params.Depth != 1 ||
                         params.srcY || params.srcZ || params.srcLOD,
                     "cuDSS capture host inputs require contiguous 1D storage.");
-        // cuDSS owns a mutable array of vector pointers. Copy its contents at
-        // capture, not replay, so recording a second binding cannot rewrite
-        // the first frame or an already queued graph launch.
-        auto &bytes = capture_inputs_->emplace_back(params.WidthInBytes);
-        std::memcpy(bytes.data(),
-                    static_cast<const std::uint8_t *>(params.srcHost) +
-                        params.srcXInBytes,
-                    bytes.size());
-        params.srcHost = bytes.data();
-        params.srcXInBytes = 0;
-        driver.graph_memcpy_node_set_params(node, &params);
+        capture_inputs_->snapshot(node, params);
       }
     }
   }
@@ -1196,7 +1285,7 @@ class CudaCudssCaptureCommand final : public aot::CudaGraphCaptureCommand {
   const int phase_;
   const std::vector<aot::Arg> arguments_;
   std::shared_ptr<CudaCudssPlan> owner_;
-  std::shared_ptr<std::vector<std::vector<std::uint8_t>>> capture_inputs_;
+  std::shared_ptr<CudssCaptureInputs> capture_inputs_;
 };
 }  // namespace
 
