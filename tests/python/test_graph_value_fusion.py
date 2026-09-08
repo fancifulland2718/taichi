@@ -244,3 +244,214 @@ def test_native_value_fusion_rejects_symbolic_abi_mismatch_before_execution():
         _fused_node(ti.u32, len(bounds) - 1, 32, (producer[0], wrong), consumer)
     for name in ("values", "reduced", "result"):
         np.testing.assert_array_equal(bindings[name].to_numpy(), 777)
+
+
+@ti.kernel
+def _copy_add(source: ti.types.ndarray(), target: ti.types.ndarray()):
+    for i in target:
+        target[i] = source[i] + 9
+
+
+def _value_definition(*, extra_dispatches=False):
+    bindings, bounds, expected = _fixture(ti.u32)
+    producer, consumer = _sources(ti.u32)
+    layout = ti.algorithms.SegmentedLayout.from_offsets(
+        bounds, capacity=bindings["values"].shape[0]
+    )
+    builder = ti.graph.GraphBuilder()
+    if extra_dispatches:
+        bindings["prefix"] = ti.ndarray(ti.u32, shape=bindings["source"].shape)
+        bindings["suffix"] = ti.ndarray(ti.u32, shape=bindings["result"].shape)
+        builder.dispatch(_copy_add, _array("source", ti.u32), _array("prefix", ti.u32))
+    builder.dispatch(_produce, *producer[1])
+    builder.segmented_reduce(bindings["values"], layout, bindings["reduced"])
+    builder.dispatch(_consume, *consumer[1])
+    if extra_dispatches:
+        builder.dispatch(_copy_add, _array("result", ti.u32), _array("suffix", ti.u32))
+    bindings.pop("offsets")
+    return builder.freeze(), bindings, expected
+
+
+def _value_recipes(definition):
+    catalog = definition.recipe_catalog()
+    result = []
+    for fragment in catalog.fragments:
+        if fragment.provider_namespace != "taichi_forge.graph.value_fusion":
+            continue
+        facts = fragment.tasks[0].physical
+        recipe = catalog.compose(
+            (fragment.fragment_id,),
+            stage="single-region",
+            parent_recipe_ids=(catalog.baseline.recipe.recipe_id,),
+        ).recipe
+        result.append((recipe, facts))
+    return result
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_public_value_recipes_preserve_all_stores_and_cold_binding_proofs(monkeypatch):
+    from taichi_forge.graph._recipes.value_fusion import _BindingProof
+
+    definition, bindings, expected = _value_definition()
+    recipes = [
+        (recipe, facts)
+        for recipe, facts in _value_recipes(definition)
+        if facts["producer"] and facts["consumer"] and facts["consumer_input"] == 0
+    ]
+    assert len(recipes) == 8  # Four reduction topologies, two submission plans.
+    physical = set()
+    for recipe, facts in recipes:
+        for name in ("values", "reduced", "result"):
+            bindings[name].fill(777)
+        with definition.materialization_context() as context:
+            materialized = context.materialize(recipe)
+            graph = materialized.executor
+            # Discovery/compilation have not run any part of the user's DAG.
+            np.testing.assert_array_equal(bindings["result"].to_numpy(), 777)
+            bound = graph.bind(bindings)
+
+            def forbidden(*args, **kwargs):
+                raise AssertionError(
+                    "published replay performed cold value-fusion work"
+                )
+
+            with monkeypatch.context() as replay:
+                replay.setattr(_BindingProof, "validate_graph_bindings", forbidden)
+                replay.setattr(core, "_graph_pointwise_value_program", forbidden)
+                replay.setattr(
+                    core, "_compile_graph_segmented_reduce_values", forbidden
+                )
+                for _ in range(3):
+                    graph.run(bound)
+            _assert_outputs(bindings, expected)
+            assert len(graph._spec.nodes) == 1
+            assert graph._instance.physical_submission_mode == (
+                "cuda_immutable_argument_frames_exec_reuse"
+                if facts["submission"] == "immutable_frames"
+                else "runtime_managed"
+            )
+            expected_tasks = (
+                2 if facts["reduction"]["strategy"] == "chunk_partial_finalize" else 1
+            )
+            assert graph._spec.nodes[0].physical_dispatch_count == expected_tasks
+            assert (
+                materialized.manifest.persistent_requested_bytes
+                == recipe.declared_persistent_resource_bytes
+            )
+            physical.add(materialized.manifest.materialized_physical_id)
+    assert len(physical) == 8
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_value_recipe_binding_rejects_false_dataflow_tail_and_cross_phase_alias():
+    from taichi_forge.graph._recipes.materialize import GraphMaterializationError
+
+    definition, bindings, _ = _value_definition()
+    recipe, _ = next(
+        (recipe, facts)
+        for recipe, facts in _value_recipes(definition)
+        if facts["producer"]
+        and facts["consumer"]
+        and facts["consumer_input"] == 0
+        and facts["submission"] == "immutable_frames"
+    )
+    with definition.materialization_context(workspace_lanes=2) as context:
+        with pytest.raises(
+            GraphMaterializationError, match="one ordered workspace lane"
+        ):
+            context.materialize(recipe)
+    with definition.materialization_context() as context:
+        materialized = context.materialize(recipe)
+        graph = materialized.executor
+        changed = dict(
+            bindings, values=ti.ndarray(ti.u32, shape=bindings["values"].shape)
+        )
+        with pytest.raises(ValueError, match="fixed reduction values"):
+            graph.bind(changed)
+        with pytest.raises(ValueError, match="exact iteration coverage"):
+            graph.bind(dict(bindings, count=bindings["count"] + 1))
+        with pytest.raises(ValueError, match="storage alias"):
+            graph.bind(dict(bindings, source=bindings["values"]))
+        with pytest.raises(ValueError, match="storage alias"):
+            graph.bind(dict(bindings, bias=bindings["reduced"]))
+        # Failed publication leaves all original outputs untouched and does not
+        # invalidate the legal baseline or a subsequent correct publication.
+        for name in ("values", "reduced", "result"):
+            np.testing.assert_array_equal(bindings[name].to_numpy(), 777)
+        graph.run(graph.bind(bindings))
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_public_value_search_records_binding_failures_and_restores_selection():
+    definition, bindings, expected = _value_definition()
+    observed = []
+
+    def evaluate(graph, recipe):
+        bound = graph.bind(bindings)
+        graph.run(bound)
+        _assert_outputs(bindings, expected)
+        # Count actual compiled dispatches plus root native calls, not speed.
+        count = sum(
+            node.physical_dispatch_count + int(node.source_native_count)
+            for node in graph._spec.nodes
+        )
+        observed.append((recipe.recipe_id, count))
+        return {"execution_units": float(count)}
+
+    session = definition.search_recipes(
+        engine="compileiq",
+        target=ti.graph.GraphOptimizationTarget(
+            objectives=(("execution_units", "min"),)
+        ),
+        budget=ti.graph.GraphSearchBudget(evaluation_limit=40),
+        workload_context=ti.graph.GraphWorkloadContext(
+            {"fixture": "certified-value-region"}
+        ),
+        evaluation_contract=ti.graph.GraphEvaluationContract(
+            {"metric": "actual-execution-units-not-timing"}
+        ),
+        backend_environment=ti.graph.GraphBackendEnvironment(
+            {"fixture": "current-cuda"}
+        ),
+    )
+    decision = session.run(evaluate)
+    assert any(count == 1 for _, count in observed)
+    assert not decision.selection.manifest.is_baseline
+    second, second_bindings, second_expected = _value_definition()
+    assert second.semantic_graph_id == definition.semantic_graph_id
+    resolved = second.resolve_recipe(decision.selection_artifact)
+    with second.materialize(resolved) as materialized:
+        materialized.executor.run(materialized.executor.bind(second_bindings))
+        _assert_outputs(second_bindings, second_expected)
+    report = decision.report.to_json()
+    assert "fixed reduction output" in report  # Invalid role is a recorded failure.
+    assert "segmented-values:" in report
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_value_fusion_retains_unaffected_prefix_suffix_and_source_lineage():
+    definition, bindings, expected = _value_definition(extra_dispatches=True)
+    recipe, _ = next(
+        (recipe, facts)
+        for recipe, facts in _value_recipes(definition)
+        if facts["producer"]
+        and facts["consumer"]
+        and facts["consumer_input"] == 0
+        and facts["submission"] == "immutable_frames"
+        and facts["reduction"]["strategy"] == "chunk_partial_finalize"
+    )
+    with definition.materialization_context() as context:
+        materialized = context.materialize(recipe)
+        graph = materialized.executor
+        graph.run(graph.bind(bindings))
+        _assert_outputs(bindings, expected)
+        np.testing.assert_array_equal(
+            bindings["prefix"].to_numpy(), bindings["source"].to_numpy() + np.uint32(9)
+        )
+        np.testing.assert_array_equal(
+            bindings["suffix"].to_numpy(), expected[2] + np.uint32(9)
+        )
+        assert graph._spec.nodes[0].physical_dispatch_count == 4
+        assert {
+            region for task in materialized.manifest.tasks for region in task.region_ids
+        } == {source.region_id for source in definition.sources}
