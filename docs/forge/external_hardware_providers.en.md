@@ -25,7 +25,7 @@ APIs for the bounded operations below; discovery probes remain non-executing.
 | OptiX ABI 93/105/118 | Registered bundled-adapter ABI | Forge adapter; user/driver vendor runtime | `ti.hardware.probe("optix", library_path=...)` | Explicit scene/launch or root Graph; not kernel-callable |
 | Vulkan driver/ICD | D0 backend dependency, not a D1 provider | OS/GPU driver installation | `ti.init(arch=ti.vulkan)` plus capability queries | Kernel and documented native Vulkan APIs |
 | cuSPARSELt 0.8.x-0.9.x | Registered bundled-adapter ABI | Forge adapter; user optional package | `ti.hardware.probe(...)` or `ti.hardware.tensor.CusparseLtProvider` | Explicit FP16 2:4 matmul plan; no Graph/kernel/auto route |
-| cuTENSOR 2.0.x-2.7.x | Registered bundled-adapter ABI | Forge adapter; user optional package | `ti.hardware.probe(...)` or `ti.hardware.tensor.CutensorProvider` | Explicit FP32 contraction plan; no Graph/kernel/auto route |
+| cuTENSOR 2.0.x-2.7.x | Registered bundled-adapter ABI | Forge adapter; user optional package | `ti.hardware.tensor.CutensorProvider` / `ti.linalg.record_contraction` | Retained root Graph capture and complete contraction dataflows; no kernel intrinsic or implicit auto rewrite |
 | AmgX stable C API | Registered bundled-adapter ABI | Forge adapter; user source build | `ti.hardware.probe(...)` or `ti.hardware.linalg.AmgxProvider` | Explicit host-CSR solver; no Graph/kernel/auto route |
 | NCCL | Outside Forge's current single-GPU scope | User system package | No public Forge probe or execution API | External multi-GPU communication only |
 
@@ -60,9 +60,10 @@ entry is declared for that operation; it does not prohibit application providers
 | Other cuSPARSE / cuFFT / cuDSS expert operations | Existing explicit plans and documented root Graph recording | Recording alone does not provide a recipe generator. cuDSS root ordering must not be described as CUDA Graph capture. |
 | Vulkan VkFFT | Explicit fixed-storage plan or root Graph recording | Vulkan JIT/source adapter; no built-in complete FFT-recipe search or CUDA binding-frame integration is implied. |
 | cuBLASLt matmul region | `ti.linalg.record_matmul(...)`, then `operation.prepare()` | CUDA compact scalar-f32, fixed shape and optional strided batch. Explicit `ti.hardware.linalg.MatmulRecipeProvider()` composes frozen algorithm/workspace choices, real operand packing, and separate/fused ReLU. The expert retained-plan API remains private. |
-| cuSPARSELt / cuTENSOR / AmgX | Explicit provider plans described below | No complete-recipe provider or general Graph recording route is currently exposed. |
+| cuTENSOR contraction region | `ti.linalg.record_contraction(...)`, then `operation.prepare()` | Explicit `ti.hardware.tensor.ContractionRecipeProvider()` composes real input permutations and vendor/separate epilogues; includes retained workspace and immutable binding frames. |
+| cuSPARSELt / AmgX | Explicit provider plans described below | No complete-recipe provider or general Graph recording route is currently exposed. |
 
-Prepare mathematical operations before freezing the Graph. SpMM, FFT and matmul require
+Prepare mathematical operations before freezing the Graph. SpMM, FFT, matmul and contraction require
 explicit finite-input / f32 tolerance contracts; Forge does not scan values on
 each replay. FFT forward and inverse are both unnormalized, so applying both
 multiplies the input by `H * W`. Layout, precision and normalization are semantic
@@ -722,6 +723,59 @@ steady replay. The fixed recording also composes with immutable binding frames.
 No standalone `recording.execute()` or nested sequential/AOT recording is
 provided. This execution route does not itself expose contraction strategy
 search or change automatic selection.
+
+For complete contraction search, use the semantic entry rather than a fixed
+expert plan:
+
+```python
+operation = ti.linalg.record_contraction(
+    (19, 5, 7), "kmi", (3, 19, 11), "jkn", "imjn",
+    alpha=0.75, beta=0.25, activation="relu",
+    absolute_tolerance=3e-5, relative_tolerance=3e-5,
+)
+preparation = operation.prepare(workspace_limit_bytes=32 << 20)
+builder = ti.graph.GraphBuilder()
+builder.append_native(operation)
+definition = builder.freeze()
+providers = (*ti.graph.default_recipe_providers(),
+             ti.hardware.tensor.ContractionRecipeProvider())
+session = definition.search_recipes(
+    engine="compileiq", providers=providers, target=target, budget=budget,
+    workload_context=workload, evaluation_contract=evaluation_contract,
+    backend_environment=environment,
+)
+decision = session.run(evaluator)
+```
+
+`target`, `budget`, `workload`, `evaluation_contract`, `environment` and `evaluator`
+are caller-owned, as in the [complete-recipe search contract](graph_runtime_optimization.en.md).
+Default binding names are `a`, `b`, `c`, `output`; output/C shape is inferred
+from the declared output modes. Shared output modes are batches. Each reduced
+mode must occur in both inputs with the same extent. Repeated modes, implicit
+broadcasting and scalar outputs are not supported. Dataflow helpers follow
+Forge's 12-index limit and require at most `2**31-1` elements per tensor.
+`compute="f32"` or `"tf32"` is a semantic choice, never a search axis.
+
+Preparation creates descriptors, not candidate GPU scratch or performance
+measurements. The baseline uses original input layouts and the vendor default
+plan. Candidates physically reorder A, B or both, and can separate the product
+from a fused alpha/beta/activation epilogue. These buffers refresh every replay;
+they are not caches of input values. Neutral alpha/beta and singleton-only
+permutations do not create artificial candidates. Workspace limits must be
+positive: the legacy adapter's zero means its estimate, not zero scratch.
+
+Save `preparation` and `decision.selection_artifact.to_dict()` as JSON. In a new
+process, recreate the same operation with `preparation=preparation`, freeze it,
+then use `definition.resolve_recipe(selection, providers=providers)` and
+`definition.materialize(resolved, providers=providers)`. Restoration verifies
+the semantic/device/component contract and the selected plan's required
+workspace; it does not rediscover the candidate catalog. It reconstructs a
+vendor plan request, **not a serialized or guaranteed bitwise-identical vendor
+kernel binary**. Opaque vendor kernels and transitive-library behavior remain
+outside that identity claim. Environment/measurement applicability must include
+the caller's relevant driver and vendor dependency versions. Reports preserve
+declared dataflows, imported-preparation provenance and actual evaluator facts
+separately; synthetic tests do not confer production qualification.
 
 The cuTENSOR vendor runtime and its CUDA dependencies stay outside the portable
 wheel; Forge's thin bundled adapter and capture bridge remain inside. Current

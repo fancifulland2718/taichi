@@ -22,7 +22,7 @@ retained-provider API，而 discovery probe 始终不执行算法。
 | OptiX ABI 93/105/118 | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户/driver 提供 vendor runtime | `ti.hardware.probe("optix", library_path=...)` | 显式 scene/launch 或 root Graph；不能在 kernel 内调用 |
 | Vulkan driver/ICD | D0 backend 依赖，不是 D1 provider | OS/GPU driver 安装 | `ti.init(arch=ti.vulkan)` 加 capability query | kernel 与已公开 native Vulkan API |
 | cuSPARSELt 0.8.x-0.9.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户安装可选包 | `ti.hardware.probe(...)` 或 `ti.hardware.tensor.CusparseLtProvider` | 显式 FP16 2:4 matmul plan；无 Graph/kernel/auto 路线 |
-| cuTENSOR 2.0.x-2.7.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户安装可选包 | `ti.hardware.probe(...)` 或 `ti.hardware.tensor.CutensorProvider` | 显式 FP32 contraction plan；无 Graph/kernel/auto 路线 |
+| cuTENSOR 2.0.x-2.7.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户安装可选包 | `ti.hardware.tensor.CutensorProvider` / `ti.linalg.record_contraction` | retained root Graph capture 与完整 contraction 数据流；无 kernel intrinsic 或隐式 auto rewrite |
 | AmgX stable C API | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户源码构建 | `ti.hardware.probe(...)` 或 `ti.hardware.linalg.AmgxProvider` | 显式 host-CSR solver；无 Graph/kernel/auto 路线 |
 | NCCL | 不属于 Forge 当前单 GPU 范围 | 用户安装系统包 | 没有公开 Forge probe 或执行 API | 仅外部 multi-GPU communication |
 
@@ -52,9 +52,10 @@ cuTENSOR、AmgX 或 NCCL 绝不会触发 compiler rewrite。
 | Vulkan VkFFT | 显式 fixed-storage plan 或 root Graph recording | Vulkan JIT/source adapter；不意味着已有内建完整 FFT recipe 搜索或 CUDA binding-frame 接入。 |
 | 其他 cuSPARSE / cuFFT / cuDSS expert operation | 既有显式 plan 和已说明的 root Graph recording | recording 本身不提供 recipe generator；cuDSS root 有序调用不能描述成 CUDA Graph capture。 |
 | cuBLASLt matmul region | `ti.linalg.record_matmul(...)`，随后 `operation.prepare()` | CUDA 紧凑 scalar-f32、固定形状及可选 strided batch。显式 `ti.hardware.linalg.MatmulRecipeProvider()` 组合冻结算法/workspace、真实输入打包、独立/融合 ReLU；专家 retained-plan API 仍为私有。 |
-| cuSPARSELt / cuTENSOR / AmgX | 下文的显式 provider plan | 当前没有公开 complete-recipe provider 或通用 Graph recording 路线。 |
+| cuTENSOR contraction region | `ti.linalg.record_contraction(...)`，然后 `operation.prepare()` | 显式 `ti.hardware.tensor.ContractionRecipeProvider()` 组合真实输入重排与 vendor/separate epilogue，持有 workspace 并支持 immutable binding frames。 |
+| cuSPARSELt / AmgX | 下文的显式 provider plan | 当前没有公开 complete-recipe provider 或通用 Graph recording 路线。 |
 
-先准备数学 operation，再 freeze Graph。SpMM/FFT/matmul 要求显式的 finite-input / f32 tolerance 合同，
+先准备数学 operation，再 freeze Graph。SpMM/FFT/matmul/contraction 要求显式的 finite-input / f32 tolerance 合同，
 Forge 不在每次 replay 扫描数值。FFT 正向、逆向均不归一化，连续应用两者会将输入乘以 `H * W`。
 layout、精度和归一化属于语义要求，不是优化器选择。vendor 不开放的内部信息报告为 unknown，
 不能据此虚构内部 kernel 数。
@@ -590,6 +591,51 @@ shape、dtype 和存储合法性在 bind/capture 边界确定，不在 steady re
 此固定 recording 也可组合 immutable binding frames；不提供独立 `recording.execute()`、
 nested sequential 或 AOT recording。这个执行入口本身不开放 contraction 策略搜索，
 也不改变普通自动选择。
+
+完整 contraction 搜索使用语义入口，不把固定 expert plan 当作搜索轴：
+
+```python
+operation = ti.linalg.record_contraction(
+    (19, 5, 7), "kmi", (3, 19, 11), "jkn", "imjn",
+    alpha=0.75, beta=0.25, activation="relu",
+    absolute_tolerance=3e-5, relative_tolerance=3e-5,
+)
+preparation = operation.prepare(workspace_limit_bytes=32 << 20)
+builder = ti.graph.GraphBuilder()
+builder.append_native(operation)
+definition = builder.freeze()
+providers = (*ti.graph.default_recipe_providers(),
+             ti.hardware.tensor.ContractionRecipeProvider())
+session = definition.search_recipes(
+    engine="compileiq", providers=providers, target=target, budget=budget,
+    workload_context=workload, evaluation_contract=evaluation_contract,
+    backend_environment=environment,
+)
+decision = session.run(evaluator)
+```
+
+`target`、`budget`、`workload`、`evaluation_contract`、`environment` 与 `evaluator`
+由调用方提供，沿用[完整 recipe 搜索合同](graph_runtime_optimization.zh.md)。默认绑定名为
+`a`、`b`、`c`、`output`，C/output shape 从输出 modes 推导。共同输出 mode 表示 batch；
+每个被归约 mode 必须在两个输入中出现且 extent 相同。不支持重复 mode、隐式广播或 scalar
+输出。数据流辅助 kernel 遵循 Forge 的 12-index 限制，每 tensor 最多 `2**31-1` 元素。
+`compute="f32"` 或 `"tf32"` 是固定语义选择，不是搜索轴。
+
+prepare 只建立 descriptor，不分配各候选的 GPU scratch，也不产生性能观测。baseline 保留
+输入原布局和 vendor default plan；候选真实重排 A、B 或两者，或将 product 与融合的
+alpha/beta/activation epilogue 分离。私有 buffer 每 replay 重写，不缓存输入值。
+中性 alpha/beta 和只移动 singleton 轴不会制造伪候选。workspace limit 必须为正：legacy
+adapter 的零代表采用估计值，并非零 workspace。
+
+将 preparation 和 `decision.selection_artifact.to_dict()` 保存为 JSON。新进程用相同语义
+和 `preparation=preparation` 重建 operation、freeze 后，通过
+`definition.resolve_recipe(selection, providers=providers)` 与
+`definition.materialize(resolved, providers=providers)` 恢复。此时核对语义、device、组件
+合同及选中计划的 workspace，不重新发现整个候选集合。恢复的是 vendor plan request，
+**不是序列化的 vendor kernel 二进制，也不保证逐 bit 相同的内部算法实现**。opaque vendor
+kernel 与传递库行为不在这个身份声明内；测量环境适用性还需调用方注明相关 driver 与 vendor
+依赖版本。报告将声明数据流、导入 preparation 的来源和 evaluator 实测分开保存；synthetic
+测试不升级为生产资格。
 
 cuTENSOR vendor runtime 及其 CUDA 依赖仍在 portable wheel 外，Forge 自有 thin adapter
 和 capture bridge 可以随 wheel 提供。当前 Forge 执行/recording 只覆盖 contraction，
