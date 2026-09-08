@@ -58,6 +58,13 @@ class CudaCublasLtCaptureCommand final : public aot::CudaGraphCaptureCommand {
     return "cublaslt_retained_matmul_f32";
   }
 
+  bool supports_binding_frames() const override {
+    // Immutable frame capture changes only operand addresses. The Python
+    // recording lease pins the fixed descriptors, algorithm and workspace
+    // until its owning Graph closes the native executor.
+    return true;
+  }
+
   Program *program() const override {
     return program_;
   }

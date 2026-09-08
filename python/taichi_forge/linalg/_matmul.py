@@ -28,7 +28,10 @@ from taichi_forge.hardware._cublaslt_algorithms import (
     _AlgorithmChoice,
     _MatmulRecipePlan,
 )
-from taichi_forge.hardware._cublaslt_capture import CublasLtCaptureRecording
+from taichi_forge.hardware._cublaslt_capture import (
+    CublasLtCaptureRecording,
+    _BINDING_FRAMES_SUPPORTED,
+)
 from taichi_forge.hardware._memory import HardwareMemoryComponent, make_memory_report
 from taichi_forge.hardware._native_adapter import (
     native_recording_node,
@@ -202,7 +205,7 @@ class _MatmulCatalog:
 
 
 class _FrozenMatmulSource(FrozenNativeRecipeSource):
-    _graph_binding_frame_capture_safe = True
+    _graph_binding_frame_capture_safe = _BINDING_FRAMES_SUPPORTED
 
     def __init__(self, source):
         self._graph_matmul_source = source
@@ -239,7 +242,7 @@ class _MatmulDescriptionRecipe(_CudaGraphCaptureRecipe):
 
 
 class _MatmulDescriptionRecording(BackendCommandRecording):
-    _graph_binding_frame_capture_safe = True
+    _graph_binding_frame_capture_safe = _BINDING_FRAMES_SUPPORTED
 
     def __init__(self, source):
         semantics = source.semantics

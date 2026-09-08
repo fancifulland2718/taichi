@@ -579,6 +579,7 @@ void export_lang(py::module &m) {
   m.def("_cuda_scan_capture_workspace_bytes", &lang::cuda_scan_capture_workspace_bytes);
   py::class_<lang::CudaCublasLtCapturePlan>(m, "_CudaCublasLtCapturePlan")
       .def(py::init<>())
+      .def_static("supports_binding_frames", []() { return true; })
       .def_readwrite("matmul_address", &lang::CudaCublasLtCapturePlan::matmul_address)
       .def_readwrite("handle", &lang::CudaCublasLtCapturePlan::handle)
       .def_readwrite("descriptor", &lang::CudaCublasLtCapturePlan::descriptor)

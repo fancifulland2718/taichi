@@ -238,6 +238,7 @@ def test_matmul_public_search_resolves_frozen_choices_without_heuristics(monkeyp
             ),
         ).run(evaluate)
         assert len(set(observed)) >= len(artifact["choices"])
+        assert len(observed) == decision.report.to_dict()["search"]["evaluation_count"]
         assert decision.selection is not None, decision.report.to_dict()["search"]
         assert not decision.selection.manifest.is_baseline
         restored_operation = _operation(
@@ -288,3 +289,59 @@ def test_matmul_rejects_drift_and_public_alias_before_replay(monkeypatch):
                     materialized.executor.bind(
                         {**bindings, "a": ti.ndarray(ti.f32, shape=(4, 16))}
                     )
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_matmul_composes_with_immutable_frames_and_retains_feedback(monkeypatch):
+    from taichi_forge.hardware._cublaslt_capture import _BINDING_FRAMES_SUPPORTED
+    from taichi_forge.hardware._cublaslt_algorithms import _AlgorithmApi
+    from taichi_forge.linalg._matmul import _MatmulRecording
+
+    if not _BINDING_FRAMES_SUPPORTED:
+        pytest.skip("native runtime omits matmul immutable binding-frame support")
+    operation = _operation(monkeypatch)
+    artifact = operation.prepare(heuristic_limit=1)
+    definition = _freeze(operation)
+    catalog = definition.recipe_catalog(providers=_providers())
+    frame_fragment = next(
+        f for f in catalog.fragments if f.provider_namespace.endswith(".binding_frames")
+    )
+    matmul_fragment = next(
+        f
+        for f in catalog.fragments
+        if f.provider_namespace.endswith(".matmul")
+        and artifact["choices"][
+            f.provider_metadata["family_selection"]["materialization_choice"]
+        ]["packed_inputs"]
+        and artifact["choices"][
+            f.provider_metadata["family_selection"]["materialization_choice"]
+        ]["epilogue"]
+        == "fused"
+    )
+    recipe = catalog.compose(
+        (frame_fragment.fragment_id, matmul_fragment.fragment_id), stage="composed"
+    ).recipe
+    pairs = [_inputs(operation) for _ in range(2)]
+    with definition.materialization_context(providers=_providers()) as context:
+        with context.materialize(recipe) as materialized:
+            graph = materialized.executor
+            frames = [graph.bind(bindings) for bindings, _ in pairs]
+            operation.close()
+            for bindings, host in pairs:
+                np.testing.assert_array_equal(bindings["output"].to_numpy(), host[2])
+            expected = [host[2].astype(np.float64) for _, host in pairs]
+            with monkeypatch.context() as replay:
+                replay.setattr(_AlgorithmApi, "restore", _no_cold_work)
+                replay.setattr(
+                    _MatmulRecording, "validate_graph_bindings", _no_cold_work
+                )
+                for index in (0, 1, 0, 0, 1):
+                    graph.run(frames[index])
+                    expected[index] = np.maximum(
+                        _product(pairs[index][1]) + 0.25 * expected[index], 0
+                    )
+            for (bindings, _), value in zip(pairs, expected):
+                np.testing.assert_allclose(
+                    bindings["output"].to_numpy(), value, rtol=2e-5, atol=2e-5
+                )
+            assert graph._graph_stats[0]["last_path"] == "cuda_prepared_binding_plan"

@@ -25,6 +25,15 @@ from taichi_forge.lang.exception import TaichiRuntimeError
 from taichi_forge.types.primitive_types import f32, u8
 
 
+_BINDING_FRAMES_SUPPORTED = bool(
+    getattr(
+        getattr(core, "_CudaCublasLtCapturePlan", None),
+        "supports_binding_frames",
+        lambda: False,
+    )()
+)
+
+
 class _PlanLease:
     """Keep descriptors and exact workspace alive until every capture retires."""
 
@@ -139,7 +148,7 @@ class CublasLtCaptureRecording(BackendCommandRecording):
 
     # Explicit close is prevented by the lease; reset invalidates the Graph.
     # No per-replay Python provider validation is necessary.
-    _graph_binding_frame_capture_safe = True
+    _graph_binding_frame_capture_safe = _BINDING_FRAMES_SUPPORTED
 
     def __init__(self, plan, *, workspace):
         if not isinstance(plan, CublasLtMatmulPlan):
