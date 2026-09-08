@@ -541,6 +541,10 @@ def test_capability_and_provider_queries_are_stable_and_fail_closed():
     assert cudss.requirements[2] == "user-managed cuDSS 0.8.x shared library"
     assert "never rewritten" in cudss.notes[0]
     assert "no Forge wheel variant" in cudss.notes[1]
+    assert cudss.recipe_semantic_api == "ti.linalg.record_sparse_solve"
+    assert cudss.recipe_provider_api == "ti.hardware.linalg.SparseSolveRecipeProvider"
+    assert "ordered vector RHS pairs" in cudss.recipe_scope[1]
+    assert "Legacy CudssSolveRecording" in cudss.notes[3]
 
     automatic_cudss = ti.hardware.capability("linalg.solve.cudss_auto")
     assert automatic_cudss.activation_mode == "domain_api_auto_provider"

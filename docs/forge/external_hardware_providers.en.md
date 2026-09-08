@@ -58,6 +58,7 @@ entry is declared for that operation; it does not prohibit application providers
 | Driver-native segmented scan | `GraphBuilder.segmented_scan()` and default recipe providers | Fixed disjoint i32/u32 arrays and immutable segments. Global correction uses retained CUDA recording and Graph-bound scratch; no external Toolkit library is required. It remains a fixed-resource action, not a binding-frame region. |
 | Toolkit reset-monoid segmented scan | Existing `GraphBuilder.segmented_scan()` plus `CubSegmentedScanRecipeProvider(manifest_path)` from `taichi_forge.hardware.source_providers` | Optional source-provider addon; bounded i32/u32 sum and immutable segmented layout. Prepared capture, workspace and head-bitset lifetime form the physical recipe; the addon is not part of the portable runtime wheel. |
 | Other cuSPARSE / cuFFT / cuDSS expert operations | Existing explicit plans and documented root Graph recording | Recording alone does not provide a recipe generator. cuDSS root ordering must not be described as CUDA Graph capture. |
+| Shared-pattern sparse-solve region | `ti.linalg.record_sparse_solve(...)`, then `operation.prepare()` | Explicit `ti.hardware.linalg.SparseSolveRecipeProvider()` searches complete ordering/factor lifecycles with Graph-owned capture; separate from legacy root-ordered cuDSS recording. |
 | Vulkan VkFFT | Explicit fixed-storage plan or root Graph recording | Vulkan JIT/source adapter; no built-in complete FFT-recipe search or CUDA binding-frame integration is implied. |
 | cuBLASLt matmul region | `ti.linalg.record_matmul(...)`, then `operation.prepare()` | CUDA compact scalar-f32, fixed shape and optional strided batch. Explicit `ti.hardware.linalg.MatmulRecipeProvider()` composes frozen algorithm/workspace choices, real operand packing, and separate/fused ReLU. The expert retained-plan API remains private. |
 | cuTENSOR contraction region | `ti.linalg.record_contraction(...)`, then `operation.prepare()` | Explicit `ti.hardware.tensor.ContractionRecipeProvider()` composes real input permutations and vendor/separate epilogues; includes retained workspace and immutable binding frames. |
@@ -504,6 +505,73 @@ The recommended physics workload is a repeatedly solved fixed-pattern sparse
 system where analysis and usually refactorization are amortized. For a
 one-off, small, or frequently remeshed system, measure the complete
 analysis-factor-solve lifecycle rather than solve time alone.
+
+#### Complete sparse-solve regions
+
+`ti.linalg.record_sparse_solve(pattern, initial_values, ...)` describes one
+square scalar f32 CSR matrix and one or more compact f32 vector RHS/output
+pairs. The immutable `SparsePattern` supplies topology; the operation copies
+initial values into its own preparation storage. `values=None` declares a
+fixed matrix whose factors may be reused. A named `values` binding declares
+current numerical values on every invocation, requiring factor/refactor before
+solving. These are different semantic contracts, never interchangeable search
+choices. All bound arrays must be disjoint; outputs may feed later invocations.
+
+```python
+operation = ti.linalg.record_sparse_solve(
+    pattern, initial_values,
+    values="matrix_values",
+    rhs_pairs=(("rhs0", "solution0"), ("rhs1", "solution1")),
+    matrix_type="spd", matrix_view="full",
+    absolute_tolerance=2e-5, relative_tolerance=2e-5,
+    library_path=path,
+)
+preparation = operation.prepare(max_plans=2)
+builder = ti.graph.GraphBuilder()
+builder.append_native(operation)
+definition = builder.freeze()
+providers = (
+    *ti.graph.default_recipe_providers(),
+    ti.hardware.linalg.SparseSolveRecipeProvider(),
+)
+catalog = definition.recipe_catalog(providers=providers)
+```
+
+Pass the same providers to the complete-recipe search/materialization/resolution
+APIs. Preparation performs bounded private analysis and numerical warmup, not
+benchmarking on caller outputs. The baseline already shares a factor owner
+across RHS pairs; alternatives freeze reordering and full-factor/refactor
+lifecycles. RHS vectors are solved sequentially with shared workspace, not
+silently converted to a dense batched matrix. Default policies remain vendor
+choices: different requested phases do not guarantee different kernels or a
+speedup. Modified CompileIQ receives opaque complete recipes, not library names
+or numerical-policy knobs. Ordinary `SparseSolver` auto behavior is unchanged.
+
+Materialization needs the adapter's optional configuration/allocator extensions
+and matching native Graph-owned capture capability. It creates private solver
+storage and a retained stream; analysis stays outside replay. Capture records
+one numerical update per region and its ordered solves, with per-binding
+parameter ownership. Resident-capable native builds upload frozen parameters
+once after capture and use device-to-device copies on replay. The report records
+this capability; restoration rejects a different capture-storage contract.
+Preparation can synchronize and allocate; steady replay adds no input scans,
+Python/vendor calls, host error readbacks, or report collection. Workspace
+clears and device copies still execute. Known memory distinguishes shared plan
+payload, the source's numeric snapshot, and Graph-owned per-binding parameters;
+vendor estimates and opaque driver pool/residency are not measured VRAM peaks.
+
+The caller declares finite, nonsingular inputs and the matrix class. Each RHS
+must satisfy `||Ax-b||inf <= atol + rtol*||b||inf` in the evaluator; this is not a
+per-replay residual check or a promise for arbitrary ill-conditioned inputs.
+Windows contracts cover SPD and general non-symmetric changing values, fixed
+SPD values, and interleaved bindings. They do not qualify every symmetric-
+indefinite/pivoting case, Linux deployment, or production workload.
+
+Preparation/selection reuse stores JSON facts, not CSR data or vendor factors.
+A new process supplies the same pattern, initial values and semantic contract,
+passes `preparation=...`, resolves the saved selection, and rebuilds only the
+selected numerical plan. Provider/device/seed/resource drift is explicit.
+Neither Python executables nor CUDA graphs are deserialized from the report.
 
 ### OptiX runtime provider
 

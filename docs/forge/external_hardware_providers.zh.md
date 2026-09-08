@@ -51,6 +51,7 @@ cuTENSOR、AmgX 或 NCCL 绝不会触发 compiler rewrite。
 | Driver-native segmented scan | `GraphBuilder.segmented_scan()` 与默认 recipe providers | 固定、互不重叠的 i32/u32 数组和不可变 segment；global correction 使用 retained CUDA recording 与 Graph-bound scratch，不依赖外部 Toolkit 库；仍是 fixed-resource action，不是 binding-frame region。 |
 | Vulkan VkFFT | 显式 fixed-storage plan 或 root Graph recording | Vulkan JIT/source adapter；不意味着已有内建完整 FFT recipe 搜索或 CUDA binding-frame 接入。 |
 | 其他 cuSPARSE / cuFFT / cuDSS expert operation | 既有显式 plan 和已说明的 root Graph recording | recording 本身不提供 recipe generator；cuDSS root 有序调用不能描述成 CUDA Graph capture。 |
+| 共享 pattern 的 sparse-solve region | `ti.linalg.record_sparse_solve(...)`，然后 `operation.prepare()` | 显式 `ti.hardware.linalg.SparseSolveRecipeProvider()` 搜索完整排序/factor 生命周期及 Graph-owned capture；与旧 cuDSS root 有序录制分开。 |
 | cuBLASLt matmul region | `ti.linalg.record_matmul(...)`，随后 `operation.prepare()` | CUDA 紧凑 scalar-f32、固定形状及可选 strided batch。显式 `ti.hardware.linalg.MatmulRecipeProvider()` 组合冻结算法/workspace、真实输入打包、独立/融合 ReLU；专家 retained-plan API 仍为私有。 |
 | cuTENSOR contraction region | `ti.linalg.record_contraction(...)`，然后 `operation.prepare()` | 显式 `ti.hardware.tensor.ContractionRecipeProvider()` 组合真实输入重排与 vendor/separate epilogue，持有 workspace 并支持 immutable binding frames。 |
 | cuSPARSELt shared-A region | `ti.linalg.record_sparse_matmul(...)`，然后 `operation.prepare()` | 显式 `ti.hardware.tensor.SparseMatmulRecipeProvider()` 搜索冻结的算法/资源/epilogue 数据流；当前 A 每 invocation 压缩一次，不做跨 replay 值缓存。 |
@@ -395,6 +396,58 @@ Forge 当前要求 CUDA Driver API 12.0 或更高版本，以及 square scalar f
 推荐的 physics workload 是反复求解的 fixed-pattern sparse system，其中 analysis，通常还有
 refactorization，能够被充分摊销。对于一次性、小规模或频繁 remesh 的系统，应测量完整
 analysis-factor-solve lifecycle，不能只看 solve 时间。
+
+#### 完整 sparse-solve region
+
+`ti.linalg.record_sparse_solve(pattern, initial_values, ...)` 描述一个 square scalar f32 CSR
+矩阵及一个或多个 compact f32 RHS/output 向量对。不可变 `SparsePattern` 提供拓扑；初始数值复制到
+operation 自有准备存储。`values=None` 声明固定矩阵，可以复用 factors；具名 `values` binding 声明
+每次 invocation 的当前数值，必须先 factor/refactor 再 solve。两者是不同语义合同，不能作为等价搜索
+候选互换。所有绑定数组必须互不重叠；输出可以供后续 invocation 读取。
+
+```python
+operation = ti.linalg.record_sparse_solve(
+    pattern, initial_values,
+    values="matrix_values",
+    rhs_pairs=(("rhs0", "solution0"), ("rhs1", "solution1")),
+    matrix_type="spd", matrix_view="full",
+    absolute_tolerance=2e-5, relative_tolerance=2e-5,
+    library_path=path,
+)
+preparation = operation.prepare(max_plans=2)
+builder = ti.graph.GraphBuilder()
+builder.append_native(operation)
+definition = builder.freeze()
+providers = (
+    *ti.graph.default_recipe_providers(),
+    ti.hardware.linalg.SparseSolveRecipeProvider(),
+)
+catalog = definition.recipe_catalog(providers=providers)
+```
+
+搜索、物化及选择恢复使用相同 provider set。preparation 进行有界的私有 analysis/数值 warmup，
+不会在调用者输出上运行 benchmark。完整 baseline 已经在多个 RHS 间共享 factor owner；候选冻结
+reordering 与 full-factor/refactor 生命周期。RHS 向量顺序求解并共享 workspace，不隐式转换为
+dense batched RHS。默认策略仍由 vendor 决定；请求不同 phase 不保证产生不同 kernel 或加速。
+魔改 CompileIQ 只接收 opaque complete recipe，不搜索库名或数值策略裸参数，也不改变普通
+`SparseSolver` auto 行为。
+
+物化要求 adapter 的可选 configuration/allocator extension，以及对应 native Graph-owned capture
+能力。它建立私有 solver 存储和 retained stream，analysis 不进入 replay。capture 每个 region
+只记录一次数值更新及有序 solves，参数按 binding 独立持有。支持参数驻留的 native 在 capture 后
+一次性上传冻结参数，replay 使用 DtoD；报告记录此能力，恢复时不能静默换成另一存储合同。
+准备阶段允许同步/分配；steady replay 不增加输入扫描、Python/vendor 调用、host 错误回读或报告
+采集。workspace 清零与 device copies 仍会执行。已知显存区分共享 plan payload、source 数值快照、
+Graph 自有每-binding 参数；vendor estimate 和未知 driver pool/residency 不能当成实测显存峰值。
+
+调用者声明有限、非奇异输入与矩阵类别；evaluator 对每个 RHS 检查
+`||Ax-b||inf <= atol + rtol*||b||inf`。这不是每 replay 残差校验，也不保证任意病态输入。
+本轮 Windows 合同覆盖 SPD/一般非对称的变化数值、固定 SPD 与交错绑定；不泛化为所有对称不定/
+pivot 情形、Linux 部署或生产 workload 资格。
+
+preparation/selection 复用只保存 JSON 事实，不保存 CSR 数据或 vendor factors。新进程重新提供
+相同 pattern、初始数值及语义，以 `preparation=...` 恢复描述，解析保存的 selection 后只重建选中
+数值计划。provider/device/seed/resource 漂移明确报告；不会反序列化 Python executable 或 CUDA Graph。
 
 ### OptiX runtime provider
 
