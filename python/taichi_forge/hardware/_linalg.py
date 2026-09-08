@@ -1442,6 +1442,37 @@ class CudssPlan:
         matrix_view=None,
         library_path=None,
     ):
+        self._initialize(matrix, matrix_type, matrix_view, library_path, None)
+
+    @classmethod
+    def _create_configured(
+        cls,
+        matrix,
+        configuration,
+        *,
+        matrix_type="general",
+        matrix_view=None,
+        library_path=None,
+    ):
+        """Private recipe preparation, never a mutable execution option."""
+        plan = cls.__new__(cls)
+        plan._handle = None
+        try:
+            plan._initialize(
+                matrix,
+                matrix_type,
+                matrix_view,
+                library_path,
+                configuration,
+            )
+            return plan
+        except BaseException:
+            plan.close()
+            raise
+
+    def _initialize(
+        self, matrix, matrix_type, matrix_view, library_path, configuration
+    ):
         from taichi_forge.hardware._cudss import (  # pylint: disable=C0415
             _register_loaded_plan,
             cudss_dll_directories,
@@ -1485,12 +1516,18 @@ class CudssPlan:
         with hardware_provider_call("cudss", failure_phase="provider_plan_failure"):
             resolved = resolve_cudss_provider(library_path)
             with cudss_dll_directories(resolved.runtime_library_path):
-                handle = program._create_cuda_cudss_plan(
+                create = program._create_cuda_cudss_plan
+                extra = ()
+                if configuration is not None:
+                    create = program._create_cuda_cudss_configured_plan
+                    extra = (configuration,)
+                handle = create(
                     matrix.matrix,
                     self._MATRIX_TYPES[matrix_type],
                     self._MATRIX_VIEWS[matrix_view],
                     resolved.adapter_path,
                     resolved.runtime_library_path,
+                    *extra,
                 )
         self._program = program
         self._runtime_generation = impl.runtime_generation()
@@ -1541,7 +1578,14 @@ class CudssPlan:
                 "resource_handle": self._handle,
             },
             execution_scope={
-                "algorithm": "cudss_default",
+                "algorithm": (
+                    "cudss_default" if configuration is None else "cudss_configured"
+                ),
+                **(
+                    {}
+                    if configuration is None
+                    else {"configuration": tuple(configuration)}
+                ),
                 "workspace_limit_bytes": None,
                 "stream_binding": "runtime_ordered",
                 "capture_compatible": False,
@@ -1757,6 +1801,17 @@ class CudssPlan:
 
         self._ensure_open()
         return dict(self._program._cuda_cudss_plan_statistics(self._handle))
+
+    def _configuration_report(self):
+        """Return cached preparation facts without invoking the vendor runtime."""
+        self._ensure_open()
+        from taichi_forge.hardware._cudss_config import (  # pylint: disable=C0415
+            configuration_report,
+        )
+
+        return configuration_report(
+            self._program._cuda_cudss_plan_configuration(self._handle)
+        )
 
     def _debug_fail_next_refactor_solve(self):
         """Inject one post-provider refactor failure for lifecycle tests."""

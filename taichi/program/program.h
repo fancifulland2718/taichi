@@ -1397,6 +1397,18 @@ class TI_DLL_EXPORT Program {
 
   void cuda_cudss_analyze(std::uint64_t handle, SparseMatrix *matrix);
 
+  // Private complete-recipe preparation; leaves the original plan ABI intact.
+  std::uint64_t create_cuda_cudss_configured_plan(
+      SparseMatrix *matrix,
+      int matrix_type,
+      int matrix_view,
+      const std::string &adapter_path,
+      const std::string &runtime_library_path,
+      const std::vector<int> &configuration);
+
+  std::unordered_map<std::string, std::int64_t> cuda_cudss_plan_configuration(
+      std::uint64_t handle);
+
   void cuda_cudss_factorize(std::uint64_t handle,
                             SparseMatrix *matrix,
                             bool refactorize);

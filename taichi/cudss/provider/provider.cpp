@@ -30,7 +30,8 @@ thread_local std::string last_error;
 thread_local std::string probed_library_path;
 
 constexpr char kProviderName[] = "taichi-forge-cudss";
-constexpr char kBuildIdentity[] = "forge-cudss-provider-abi1-cudss-0.8";
+constexpr char kBuildIdentity[] =
+    "forge-cudss-provider-abi1-cudss-0.8-configured-plan-v1";
 constexpr uint64_t kFeatures = TI_FORGE_CUDSS_FEATURE_CSR |
                                TI_FORGE_CUDSS_FEATURE_DENSE_VECTOR |
                                TI_FORGE_CUDSS_FEATURE_STAGED_EXECUTION |
@@ -99,6 +100,9 @@ struct Runtime {
   decltype(&cudssSetStream) set_stream{nullptr};
   decltype(&cudssConfigCreate) config_create{nullptr};
   decltype(&cudssConfigDestroy) config_destroy{nullptr};
+  decltype(&cudssConfigSet) config_set{nullptr};
+  decltype(&cudssConfigGet) config_get{nullptr};
+  decltype(&cudssDataGet) data_get{nullptr};
   decltype(&cudssDataCreate) data_create{nullptr};
   decltype(&cudssDataDestroy) data_destroy{nullptr};
   decltype(&cudssMatrixCreateCsr) matrix_create_csr{nullptr};
@@ -180,6 +184,14 @@ TiForgeCudssResult make_runtime(const char *library_path,
     BIND_CUDSS(set_stream, SetStream);
     BIND_CUDSS(config_create, ConfigCreate);
     BIND_CUDSS(config_destroy, ConfigDestroy);
+    // Optional for the original execution contract; configured plans check
+    // these once during preparation, never in solve/refactor replay.
+    runtime->config_set = reinterpret_cast<decltype(runtime->config_set)>(
+        load_symbol(runtime->library, "cudssConfigSet"));
+    runtime->config_get = reinterpret_cast<decltype(runtime->config_get)>(
+        load_symbol(runtime->library, "cudssConfigGet"));
+    runtime->data_get = reinterpret_cast<decltype(runtime->data_get)>(
+        load_symbol(runtime->library, "cudssDataGet"));
     BIND_CUDSS(data_create, DataCreate);
     BIND_CUDSS(data_destroy, DataDestroy);
     BIND_CUDSS(matrix_create_csr, MatrixCreateCsr);
@@ -382,6 +394,71 @@ uint32_t execute(TiForgeCudssRuntime runtime,
       static_cast<cudssMatrix_t>(const_cast<void *>(rhs))));
 }
 
+template <typename T>
+uint32_t configure_exact(Runtime &runtime,
+                         cudssConfig_t config,
+                         cudssConfigParam_t parameter,
+                         T value) {
+  auto status = runtime.config_set(config, parameter, &value, sizeof(value));
+  if (status != CUDSS_STATUS_SUCCESS) {
+    return status;
+  }
+  T observed{};
+  size_t written = 0;
+  status = runtime.config_get(config, parameter, &observed, sizeof(observed),
+                              &written);
+  if (status != CUDSS_STATUS_SUCCESS) {
+    return status;
+  }
+  return written == sizeof(observed) && observed == value
+             ? CUDSS_STATUS_SUCCESS
+             : CUDSS_STATUS_INTERNAL_ERROR;
+}
+
+uint32_t configure(TiForgeCudssRuntime runtime,
+                   void *config,
+                   int reordering,
+                   int solve) {
+  auto *owner = checked(runtime);
+  if (!owner || !config || !owner->config_set || !owner->config_get) {
+    return CUDSS_STATUS_NOT_SUPPORTED;
+  }
+  const cudssReorderingAlg_t reorderings[] = {
+      CUDSS_REORDERING_ALG_DEFAULT, CUDSS_REORDERING_ALG_AMD,
+      CUDSS_REORDERING_ALG_NESTED_DISSECTION, CUDSS_REORDERING_ALG_NONE};
+  if (reordering < 0 || reordering >= 4 || solve < 0 || solve > 1) {
+    return CUDSS_STATUS_INVALID_VALUE;
+  }
+  auto status =
+      configure_exact(*owner, static_cast<cudssConfig_t>(config),
+                      CUDSS_CONFIG_REORDERING_ALG, reorderings[reordering]);
+  if (status != CUDSS_STATUS_SUCCESS) {
+    return status;
+  }
+  return configure_exact(
+      *owner, static_cast<cudssConfig_t>(config), CUDSS_CONFIG_SOLVE_ALG,
+      solve == 0 ? CUDSS_SOLVE_ALG_DEFAULT : CUDSS_SOLVE_ALG_GENERAL);
+}
+
+uint32_t analysis_memory_estimates(TiForgeCudssRuntime runtime,
+                                   void *handle,
+                                   void *data,
+                                   int64_t *estimates,
+                                   size_t capacity_bytes,
+                                   size_t *written_bytes) {
+  auto *owner = checked(runtime);
+  if (!owner || !owner->data_get) {
+    return CUDSS_STATUS_NOT_SUPPORTED;
+  }
+  if (!handle || !data || !estimates || !written_bytes ||
+      capacity_bytes < 16 * sizeof(int64_t)) {
+    return CUDSS_STATUS_INVALID_VALUE;
+  }
+  return owner->data_get(
+      static_cast<cudssHandle_t>(handle), static_cast<cudssData_t>(data),
+      CUDSS_DATA_MEMORY_ESTIMATES, estimates, capacity_bytes, written_bytes);
+}
+
 size_t get_last_error(char *destination, size_t destination_size) {
   const std::size_t required = last_error.size() + 1;
   if (destination != nullptr && destination_size > 0) {
@@ -434,5 +511,22 @@ taichi_forge_cudss_provider_query(uint32_t requested_abi_version,
   out_api->execute = execute;
   out_api->get_last_error = get_last_error;
   last_error.clear();
+  return TI_FORGE_CUDSS_SUCCESS;
+}
+
+extern "C" TI_FORGE_CUDSS_EXPORT TiForgeCudssResult
+taichi_forge_cudss_configuration_query(uint32_t requested_abi_version,
+                                       size_t api_size,
+                                       TiForgeCudssConfigurationApi *out_api) {
+  if (!out_api || api_size < sizeof(*out_api)) {
+    return fail(TI_FORGE_CUDSS_ERROR_INVALID_ARGUMENT,
+                "cuDSS configuration API output is null or truncated");
+  }
+  if (requested_abi_version != TI_FORGE_CUDSS_CONFIGURATION_ABI_VERSION) {
+    return fail(TI_FORGE_CUDSS_ERROR_ABI_MISMATCH,
+                "unsupported cuDSS configuration ABI");
+  }
+  *out_api = {sizeof(*out_api), TI_FORGE_CUDSS_CONFIGURATION_ABI_VERSION,
+              configure, analysis_memory_estimates};
   return TI_FORGE_CUDSS_SUCCESS;
 }

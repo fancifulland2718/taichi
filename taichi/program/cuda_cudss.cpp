@@ -1,5 +1,6 @@
 #include "taichi/program/program.h"
 
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -211,6 +212,25 @@ class CudssProviderRuntime {
     return runtime_;
   }
 
+  TiForgeCudssConfigurationApi configuration_api() const {
+    auto *symbol = loader_->load_function_optional(
+        TI_FORGE_CUDSS_CONFIGURATION_QUERY_SYMBOL);
+    TI_ERROR_IF(!symbol,
+                "CUDA cuDSS configured recipes require the optional "
+                "configuration adapter extension.");
+    const auto query =
+        reinterpret_cast<TiForgeCudssConfigurationQueryFn>(symbol);
+    TiForgeCudssConfigurationApi result{};
+    TI_ERROR_IF(
+        query(TI_FORGE_CUDSS_CONFIGURATION_ABI_VERSION, sizeof(result),
+              &result) != TI_FORGE_CUDSS_SUCCESS ||
+            result.struct_size < sizeof(result) ||
+            result.abi_version != TI_FORGE_CUDSS_CONFIGURATION_ABI_VERSION ||
+            !result.configure || !result.analysis_memory_estimates,
+        "CUDA cuDSS configuration extension is incompatible.");
+    return result;
+  }
+
   const TiForgeCudssRuntimeInfo &runtime_info() const {
     return runtime_info_;
   }
@@ -242,13 +262,25 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
                 int matrix_view,
                 const std::string &adapter_path,
                 const std::string &runtime_library_path,
-                std::shared_ptr<RuntimeFaultDomain> fault_domain)
+                std::shared_ptr<RuntimeFaultDomain> fault_domain,
+                const std::vector<int> &configuration)
       : rows_(static_cast<std::size_t>(matrix.num_rows())),
         nonzeros_(static_cast<std::size_t>(matrix.get_nnz())),
         provider_(std::make_unique<CudssProviderRuntime>(adapter_path,
                                                          runtime_library_path)),
         fault_domain_(std::move(fault_domain)) {
     validate_cudss_matrix_contract(matrix_type, matrix_view);
+    TI_ERROR_IF(!configuration.empty() &&
+                    (configuration.size() != 2 || configuration[0] < 0 ||
+                     configuration[0] > 3 || configuration[1] < 0 ||
+                     configuration[1] > 1),
+                "CUDA cuDSS private configuration must contain a supported "
+                "reordering and solve policy.");
+    if (!configuration.empty()) {
+      configuration_api_ = provider_->configuration_api();
+      reordering_ = configuration[0];
+      solve_algorithm_ = configuration[1];
+    }
     const auto &api = provider_->api();
     auto runtime = provider_->runtime();
     try {
@@ -258,6 +290,12 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
                             "runtime stream binding");
       require_cudss_success(api.config_create(runtime, &config_),
                             "configuration creation");
+      if (configuration_api_.configure) {
+        require_cudss_success(
+            configuration_api_.configure(runtime, config_, reordering_,
+                                         solve_algorithm_),
+            "frozen configuration round-trip");
+      }
       require_cudss_success(api.data_create(runtime, context_, &data_),
                             "solver-data creation");
       auto *row_start = matrix.get_row_ptr();
@@ -305,10 +343,21 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
                 "the plan shape or dtype.");
     const auto &api = provider_->api();
     auto runtime = provider_->runtime();
+    // Invalidate cached analysis facts before a potentially failing reanalysis.
+    // Only configured recipes request these estimates; ordinary plans do not
+    // acquire additional vendor queries.
+    memory_estimates_status_ = -1;
+    memory_estimates_written_ = 0;
+    memory_estimates_.fill(-1);
     require_cudss_success(
         api.execute(runtime, context_, kCudssPhaseAnalysis, config_, data_,
                     matrix_, nullptr, nullptr),
         "analysis");
+    if (configuration_api_.analysis_memory_estimates) {
+      memory_estimates_status_ = configuration_api_.analysis_memory_estimates(
+          runtime, context_, data_, memory_estimates_.data(),
+          sizeof(memory_estimates_), &memory_estimates_written_);
+    }
     analyzed_csr_row_ptr_.resize(rows_ + 1);
     analyzed_csr_col_ind_.resize(matrix.get_nnz());
     CUDADriver::get_instance().memcpy_device_to_host(
@@ -510,6 +559,27 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
             {"closed", closed_ ? 1u : 0u}};
   }
 
+  std::unordered_map<std::string, std::int64_t> configuration() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    const bool estimates_valid =
+        analyzed_ && memory_estimates_status_ == kCudssStatusSuccess &&
+        memory_estimates_written_ >= 6 * sizeof(std::int64_t);
+    return {{"configuration_abi", configuration_api_.abi_version},
+            {"reordering", reordering_},
+            {"solve", solve_algorithm_},
+            {"memory_estimates_status", memory_estimates_status_},
+            {"memory_estimates_written_bytes",
+             static_cast<std::int64_t>(memory_estimates_written_)},
+            {"estimated_device_persistent_bytes",
+             estimates_valid ? memory_estimates_[0] : -1},
+            {"estimated_device_peak_bytes",
+             estimates_valid ? memory_estimates_[1] : -1},
+            {"estimated_host_persistent_bytes",
+             estimates_valid ? memory_estimates_[2] : -1},
+            {"estimated_host_peak_bytes",
+             estimates_valid ? memory_estimates_[3] : -1}};
+  }
+
   void destroy(bool provider_calls_safe) noexcept {
     std::lock_guard<std::mutex> lock(mutex_);
     if (closed_) {
@@ -636,6 +706,12 @@ class CudaCudssPlan final : public CudaProviderCompletionResource {
   }
 
   std::size_t rows_{0};
+  TiForgeCudssConfigurationApi configuration_api_{};
+  int reordering_{-1};
+  int solve_algorithm_{-1};
+  std::array<std::int64_t, 16> memory_estimates_{};
+  std::int64_t memory_estimates_status_{-1};
+  std::size_t memory_estimates_written_{0};
   std::size_t nonzeros_{0};
   void *context_{nullptr};
   void *config_{nullptr};
@@ -678,6 +754,17 @@ std::uint64_t Program::create_cuda_cudss_plan(
     int matrix_view,
     const std::string &adapter_path,
     const std::string &runtime_library_path) {
+  return create_cuda_cudss_configured_plan(
+      matrix, matrix_type, matrix_view, adapter_path, runtime_library_path, {});
+}
+
+std::uint64_t Program::create_cuda_cudss_configured_plan(
+    SparseMatrix *matrix,
+    int matrix_type,
+    int matrix_view,
+    const std::string &adapter_path,
+    const std::string &runtime_library_path,
+    const std::vector<int> &configuration) {
   auto submission_guard = acquire_runtime_resource_submission_guard();
   TI_ERROR_IF(compile_config().arch != Arch::cuda,
               "CUDA cuDSS plans require the CUDA backend.");
@@ -690,7 +777,7 @@ std::uint64_t Program::create_cuda_cudss_plan(
   auto context_guard = CUDAContext::get_instance().get_guard();
   auto plan = std::make_shared<CudaCudssPlan>(
       csr, matrix_type, matrix_view, adapter_path, runtime_library_path,
-      runtime_fault_domain_);
+      runtime_fault_domain_, configuration);
   std::lock_guard<std::mutex> lock(cuda_cudss_plan_mutex_);
   TI_ERROR_IF(next_cuda_cudss_plan_handle_ == 0,
               "CUDA cuDSS plan handle space exhausted.");
@@ -838,6 +925,15 @@ Program::cuda_cudss_plan_statistics(std::uint64_t handle) {
   return found->second->statistics();
 }
 
+std::unordered_map<std::string, std::int64_t>
+Program::cuda_cudss_plan_configuration(std::uint64_t handle) {
+  std::lock_guard<std::mutex> lock(cuda_cudss_plan_mutex_);
+  const auto found = cuda_cudss_plans_.find(handle);
+  TI_ERROR_IF(found == cuda_cudss_plans_.end(),
+              "CUDA cuDSS plan handle is stale or closed.");
+  return found->second->configuration();
+}
+
 void Program::debug_cuda_cudss_fail_next_refactor_solve(std::uint64_t handle) {
   std::shared_ptr<CudaCudssPlan> plan;
   {
@@ -897,6 +993,21 @@ void Program::cuda_clear_cudss_plans() {
 #else
 
 namespace taichi::lang {
+
+std::uint64_t Program::create_cuda_cudss_configured_plan(
+    SparseMatrix *,
+    int,
+    int,
+    const std::string &,
+    const std::string &,
+    const std::vector<int> &) {
+  TI_ERROR("CUDA cuDSS requires TI_WITH_CUDA=ON.");
+}
+
+std::unordered_map<std::string, std::int64_t>
+Program::cuda_cudss_plan_configuration(std::uint64_t) {
+  TI_ERROR("CUDA cuDSS requires TI_WITH_CUDA=ON.");
+}
 
 std::uint64_t Program::create_cuda_cudss_plan(SparseMatrix *,
                                               int,

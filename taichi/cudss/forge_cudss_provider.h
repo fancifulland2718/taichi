@@ -164,6 +164,49 @@ taichi_forge_cudss_provider_query(uint32_t requested_abi_version,
                                   size_t api_size,
                                   TiForgeCudssProviderApi *out_api);
 
+// Optional preparation-only extension. Keep the execution ABI1 table unchanged
+// so older adapters remain usable by the ordinary explicit plan path.
+#define TI_FORGE_CUDSS_CONFIGURATION_ABI_VERSION 1u
+#define TI_FORGE_CUDSS_CONFIGURATION_QUERY_SYMBOL \
+  "taichi_forge_cudss_configuration_query"
+
+typedef enum TiForgeCudssReordering {
+  TI_FORGE_CUDSS_REORDER_DEFAULT = 0,
+  TI_FORGE_CUDSS_REORDER_AMD = 1,
+  TI_FORGE_CUDSS_REORDER_ND = 2,
+  TI_FORGE_CUDSS_REORDER_NATURAL = 3,
+} TiForgeCudssReordering;
+
+typedef struct TiForgeCudssConfigurationApi {
+  uint32_t struct_size;
+  uint32_t abi_version;
+  // reordering uses the Forge enum above; solve is 0 (default) or 1 (general).
+  // Returns the vendor status. Both requested settings must round-trip exactly;
+  // default denotes vendor policy, not an observed resolved internal algorithm.
+  uint32_t (*configure)(TiForgeCudssRuntime runtime,
+                        void *config,
+                        int reordering,
+                        int solve);
+  // Call only after analysis, for its single-RHS problem. The 16-entry vendor
+  // estimate is not a measurement and must not enter observed-memory metrics.
+  uint32_t (*analysis_memory_estimates)(TiForgeCudssRuntime runtime,
+                                       void *handle,
+                                       void *data,
+                                       int64_t *estimates,
+                                       size_t capacity_bytes,
+                                       size_t *written_bytes);
+} TiForgeCudssConfigurationApi;
+
+typedef TiForgeCudssResult (*TiForgeCudssConfigurationQueryFn)(
+    uint32_t requested_abi_version,
+    size_t api_size,
+    TiForgeCudssConfigurationApi *out_api);
+
+TI_FORGE_CUDSS_EXPORT TiForgeCudssResult
+taichi_forge_cudss_configuration_query(uint32_t requested_abi_version,
+                                       size_t api_size,
+                                       TiForgeCudssConfigurationApi *out_api);
+
 #ifdef __cplusplus
 }
 #endif

@@ -3211,6 +3211,15 @@ void export_lang(py::module &m) {
            tracked_native_program_method(&Program::cuda_cudss_analyze),
            py::arg("handle"), py::arg("matrix"),
            py::call_guard<py::gil_scoped_release>())
+      .def("_create_cuda_cudss_configured_plan",
+           tracked_native_program_method(
+               &Program::create_cuda_cudss_configured_plan),
+           py::arg("matrix"), py::arg("matrix_type"), py::arg("matrix_view"),
+           py::arg("adapter_path"), py::arg("runtime_library_path"),
+           py::arg("configuration"), py::call_guard<py::gil_scoped_release>())
+      .def("_cuda_cudss_plan_configuration",
+           &Program::cuda_cudss_plan_configuration, py::arg("handle"),
+           py::call_guard<py::gil_scoped_release>())
       .def("_cuda_cudss_factorize",
            tracked_native_program_method(&Program::cuda_cudss_factorize),
            py::arg("handle"), py::arg("matrix"),
