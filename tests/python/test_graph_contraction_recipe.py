@@ -83,7 +83,13 @@ def test_contraction_complete_dataflows_refresh_feedback_and_release(
     with monkeypatch.context() as preparation:
         preparation.setattr(_cutensor, "ScalarNdarray", _no_cold_work)
         artifact = operation.prepare()
-    assert len(artifact["choices"]) == 8
+    from taichi_forge.linalg._packing_kernels import TILED_PACKING_IMPLEMENTATION
+
+    assert len(artifact["choices"]) == (8 if batch else 14)
+    assert sum(
+        config["packing_lowering"] == TILED_PACKING_IMPLEMENTATION
+        for config in artifact["choices"].values()
+    ) == (0 if batch else 6)
     owner = operation._provider_owner
     assert not tuple(owner._plans)
     definition = _freeze(operation)
@@ -148,7 +154,7 @@ def test_contraction_complete_dataflows_refresh_feedback_and_release(
                 assert graph._graph_stats[0]["last_fallback_reason"] == "none"
         del graph, frame, plans, materialized, context
         gc.collect()
-    assert len(physical_ids) == 8
+    assert len(physical_ids) == len(artifact["choices"])
     assert all(ref() is None or ref().closed for ref in resources)
     owner.close()
 
@@ -229,6 +235,10 @@ def test_contraction_rejects_public_alias_and_preparation_drift(monkeypatch):
 
     operation = _operation(monkeypatch)
     artifact = operation.prepare()
+    corrupt = json.loads(json.dumps(artifact))
+    del corrupt["component"]["forge_packing_implementation"]
+    with pytest.raises(ValueError, match="drifted"):
+        _operation(monkeypatch, preparation=corrupt)
     for field in ("semantics", "device", "component"):
         corrupt = json.loads(json.dumps(artifact))
         corrupt[field] = {}

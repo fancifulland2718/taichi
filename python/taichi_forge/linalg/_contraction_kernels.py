@@ -7,12 +7,15 @@ from taichi_forge.lang import ops
 from taichi_forge.lang.kernel_impl import kernel
 from taichi_forge.lang.matrix import Vector
 from taichi_forge.lang.impl import static
+from taichi_forge.linalg._packing_kernels import tiled_permutation_kernel
 from taichi_forge.types import ndarray
 from taichi_forge.types.primitive_types import f32, i32
 
 
 @lru_cache(maxsize=128)
-def permutation_kernel(shape, permutation):
+def permutation_kernel(shape, permutation, *, tiled=False):
+    if tiled:
+        return tiled_permutation_kernel(shape, permutation)
     rank, count = len(shape), prod(shape)
 
     @kernel

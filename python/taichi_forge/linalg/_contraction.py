@@ -30,6 +30,7 @@ from taichi_forge.hardware._native_adapter import (
 )
 from taichi_forge.lang import impl
 from taichi_forge.lang.exception import TaichiRuntimeError
+from taichi_forge.linalg._packing_kernels import TILED_PACKING_IMPLEMENTATION
 from taichi_forge.types.primitive_types import f32
 
 
@@ -54,6 +55,7 @@ def _component(provider):
         "vendor_build_version": runtime.runtime_info["build_version"],
         "cuda_runtime_version": runtime.runtime_info["cuda_runtime_version"],
         "plan_identity_scope": "declared_dataflow_and_plan_request_not_vendor_kernel_binary",
+        "forge_packing_implementation": TILED_PACKING_IMPLEMENTATION,
     }
 
 
@@ -151,6 +153,23 @@ def _storage_bytes(semantics, config):
             if config["epilogue"] == "separate"
             else 0
         )
+    )
+
+
+def _packing_lowerings(semantics, config):
+    packed = _packing(semantics, config)
+    if not packed:
+        return (None,)
+    # Do not extend the tiled helper to the existing general-rank fallback.
+    # The tested source/destination contiguous axes must actually exchange.
+    tiled = all(
+        len(semantics[f"{name}_tensor"]["shape"]) in (2, 3)
+        and config["permutations"][name][-1]
+        != len(semantics[f"{name}_tensor"]["shape"]) - 1
+        for name in packed
+    )
+    return (
+        ("direct-f32-v1", TILED_PACKING_IMPLEMENTATION) if tiled else ("direct-f32-v1",)
     )
 
 
@@ -258,7 +277,11 @@ class _ContractionCatalog:
             buffer = builder.private_ndarray(f"{prefix}_{name}", f32, shape)
             private_args[buffer.name] = buffer
             builder.dispatch(
-                permutation_kernel(shape, tuple(config["permutations"][name])),
+                permutation_kernel(
+                    shape,
+                    tuple(config["permutations"][name]),
+                    tiled=config["packing_lowering"] == TILED_PACKING_IMPLEMENTATION,
+                ),
                 arg(names[name], shape),
                 buffer,
             )
@@ -562,9 +585,13 @@ class ContractionOperation(NativeGraphNode):
                     continue
                 try:
                     config["workspace_bytes"] = plan.workspace_required_bytes
-                    key = "contraction:" + _digest(config)
-                    choices[key] = config
-                    baseline = baseline or key
+                    # Lowerings share this vendor plan description. Only the
+                    # selected complete recipe allocates its packed operands.
+                    for lowering in _packing_lowerings(self.semantics, config):
+                        choice = {**config, "packing_lowering": lowering}
+                        key = "contraction:" + _digest(choice)
+                        choices[key] = choice
+                        baseline = baseline or key
                 finally:
                     plan.close()
             artifact = dict(
@@ -605,6 +632,7 @@ class ContractionOperation(NativeGraphNode):
                 set(config)
                 != {
                     "permutations",
+                    "packing_lowering",
                     "epilogue",
                     "workspace_limit_bytes",
                     "workspace_bytes",
@@ -615,6 +643,10 @@ class ContractionOperation(NativeGraphNode):
                 not in flows
             ):
                 raise ValueError("Contraction preparation dataflow drifted")
+            if config["packing_lowering"] not in _packing_lowerings(
+                self.semantics, config
+            ):
+                raise ValueError("Contraction packing lowering drifted")
             limit, actual = config["workspace_limit_bytes"], config["workspace_bytes"]
             if (
                 any(

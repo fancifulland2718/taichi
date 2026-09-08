@@ -75,6 +75,7 @@ class ContractionRecipeProvider(GraphRuntimeFragmentProvider):
                         {
                             "operand": name,
                             "permutation": config["permutations"][name],
+                            "lowering": config["packing_lowering"],
                             "refresh": "every_replay",
                         },
                     )
