@@ -5,6 +5,7 @@ Use ``ti.hardware.probe('vkfft', library_path=...)`` to inspect the Vulkan addon
 """
 
 from taichi_forge.hardware._vulkan_fft import VulkanFftPlan
+from taichi_forge.hardware._vulkan_fft_recipe import VulkanFftRecipeProvider
 
 from taichi_forge.hardware._fft_recipe import FftRecipeProvider
 from taichi_forge.hardware._fft import (
@@ -19,6 +20,7 @@ from taichi_forge.hardware._fft import (
 
 __all__ = [
     "VulkanFftPlan",
+    "VulkanFftRecipeProvider",
     "FftRecipeProvider",
     "CufftLayout",
     "CufftPlan1D",
