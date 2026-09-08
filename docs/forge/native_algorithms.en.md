@@ -631,6 +631,34 @@ workload metrics. Ordinary `method="auto"` is unchanged. This does **not** fuse
 arbitrary neighboring producer/consumer kernels: value semantics, visible
 intermediate stores and cross-language lowering still need a separate contract.
 
+### Complete Graph segmented reduction
+
+`GraphBuilder.segmented_reduce(values, layout, output, op="sum")` adds a
+separate CUDA recipe domain for fixed, disjoint plain 1D i32/u32 ndarrays and
+host-published immutable segment offsets. Output has one element per segment;
+empty segments produce zero and all strategies use exact modulo-2^32 sums.
+Floating-point reordering and automatic differentiation are not supported by
+this entry point. The existing `experimental_segmented_reduce()` and
+`PrimitiveSequence.segmented_reduce()` retain their broader contracts and auto
+dispatch behavior; the new Graph baseline is segment-serial, not that auto route.
+
+The default complete-recipe providers discover serial, warp-owned and
+block-owned segments, plus chunk-partial/finalize when a segment spans multiple
+internal chunks. These are full strategies, not exposed block parameters.
+The two-stage route owns frozen tile offsets, segment-to-partial offsets and
+partial results. Their exact requested bytes appear in the physical/resource
+report; they are not driver VRAM peak. Already-owned input layout storage is
+shared, not reallocated per candidate. Kernels and bindings are prepared before
+steady replay, which launches the retained nested CUDA Graph without reading
+device results back to Python. Disposal uses the existing Graph allocation
+lifetime; the operation uses one workspace lane.
+
+Use `builder.freeze().search_recipes(...)` and the existing selection/resolve
+workflow. Short segments can favor serial execution; long segments can favor
+the extra parallelism of partial/finalize at the cost of scratch and setup.
+There is no universal speedup or implicit ordinary-auto change, and adjacent
+producer/consumer kernels are not fused by this operation.
+
 ## Device-side Numeric Checks
 
 These APIs are Forge additions. They are not vanilla Taichi 1.7.4/1.8.0 APIs.

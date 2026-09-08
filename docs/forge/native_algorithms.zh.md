@@ -511,6 +511,24 @@ arena 增长/清理不影响录制。它只处理 `num_items`，保持未使用 
 不变。这不等于任意相邻 producer/consumer kernel 融合：值语义、可见中间写入与跨语言下沉
 仍需要单独的合同。
 
+### 完整 Graph 分段归约
+
+`GraphBuilder.segmented_reduce(values, layout, output, op="sum")` 为固定、互不重叠的普通
+1D i32/u32 ndarray 和 host 发布的不可变 segment offsets 增加 CUDA recipe 域。每段输出一个值，
+空段输出零，所有策略均执行精确模 2^32 求和；此入口不支持浮点重排或自动微分。已有
+`experimental_segmented_reduce()`、`PrimitiveSequence.segmented_reduce()` 的更广合同与 auto 分派不变；
+新 Graph 域的 baseline 是段内串行，并非已有 auto 路径。
+
+默认完整 recipe provider 发现段内串行、warp 协作、block 协作，以及段跨多个内部 chunk 时的
+partial/finalize 策略；不公开 block 参数。两阶段方案持有 tile offsets、段到 partial 的 offsets 和
+partial 结果，精确 requested bytes 进入物理/资源报告，不冒称 driver 显存峰值。调用者已有 layout
+存储共享，不逐候选重建。kernel 与绑定在稳态前准备，replay 提交 retained nested CUDA Graph，
+不向 Python 读回结果；释放沿用已有 Graph allocation 生命周期，只支持一个 workspace lane。
+
+通过 `builder.freeze().search_recipes(...)` 和已有选择/resolve 流程使用。短段可能更适合串行，长段
+可能受益于 partial/finalize 的并行度，但增加 scratch 与准备成本；不保证统一加速，不改变普通 auto，
+也不自动融合相邻 producer/consumer kernel。
+
 ## Device-side 数值检查
 
 这些 API 是 Forge 新增公开 API，不是 vanilla Taichi 1.7.4/1.8.0 API。它们必须在
