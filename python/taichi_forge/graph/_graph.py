@@ -16034,6 +16034,24 @@ class GraphBuilder:
         self._graph_native_algorithm_sources.append(source)
         return self
 
+    def segmented_reduce(self, values, layout, output, *, op="sum"):
+        """Append a fixed-layout CUDA i32/u32 segmented sum.
+
+        Empty segments produce zero; arithmetic is modulo 2**32. Complete
+        recipes own segment-local or chunk/partial/finalize execution and
+        workspace. Launch dimensions are provider internals, not API axes.
+        Ordinary experimental_segmented_reduce() remains unchanged.
+        """
+        from taichi_forge.graph._segmented_reduce import append_graph_segmented_reduce
+
+        source = append_graph_segmented_reduce(self, values, layout, output, op=op)
+        source._recipe_source_key = (
+            f"native_algorithm:{len(self._graph_native_algorithm_sources)}"
+        )
+        source._recipe_node_index = len(self._nodes) - 1
+        self._graph_native_algorithm_sources.append(source)
+        return self
+
     def keyed_reduce(self, keys, values, output, *, op="sum"):
         """Append one typed, fixed-resource keyed aggregation.
 
