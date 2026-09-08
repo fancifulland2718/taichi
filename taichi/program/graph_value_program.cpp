@@ -3,11 +3,13 @@
 #include <unordered_map>
 #include <utility>
 
+#include "taichi/analysis/offline_cache_util.h"
 #include "taichi/ir/analysis.h"
 #include "taichi/ir/statements.h"
 #include "taichi/ir/transforms.h"
 #include "taichi/program/compile_config.h"
 #include "taichi/program/kernel.h"
+#include "taichi/program/program.h"
 
 namespace taichi::lang {
 namespace {
@@ -233,6 +235,12 @@ GraphPointwiseValueProgram inspect_graph_pointwise_value_program(
             kernel->nested_parameters.end()) {
       return reject("unsupported_argument_type");
     }
+  }
+  if (kernel->ir_is_ast()) {
+    // A standalone query can precede ordinary compilation. Cache the source
+    // body before lowering Exprs shared with the retained frontend tree.
+    get_hashed_offline_cache_semantic_key(
+        config, kernel->program->get_device_caps(), kernel);
   }
   auto ir = irpass::analysis::clone(kernel->ir.get());
   irpass::compile_to_offloads(ir.get(), config, kernel, false,

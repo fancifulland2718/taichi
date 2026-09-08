@@ -3,6 +3,9 @@
 #include <unordered_map>
 #include <utility>
 
+#include "picosha2.h"
+#include "taichi/analysis/offline_cache_util.h"
+#include "taichi/common/serialization.h"
 #include "taichi/ir/analysis.h"
 #include "taichi/ir/statements.h"
 #include "taichi/ir/transforms.h"
@@ -11,6 +14,7 @@
 #include "taichi/program/graph_builder.h"
 #include "taichi/program/graph_value_program.h"
 #include "taichi/program/kernel.h"
+#include "taichi/program/program.h"
 
 namespace taichi::lang {
 namespace {
@@ -215,6 +219,36 @@ std::unique_ptr<aot::CompiledGraph> compile_graph_segmented_reduce_values(
               "Graph value fusion requires a live CUDA reduction kernel");
   TI_ERROR_IF(producer.kernel == nullptr && consumer.kernel == nullptr,
               "Graph value fusion requires a producer or consumer");
+  // Snapshot source AST identities before lowering any shared frontend Exprs.
+  // A newly generated reduction may not have entered the compilation manager
+  // yet. Synthetic (non-AST) kernels use context + name as their cache key,
+  // so the name must also distinguish source values, ABI and forwarding role.
+  BinaryOutputSerializer identity;
+  identity.initialize();
+  for (const auto *source : {&reduction, &producer, &consumer}) {
+    std::string key;
+    if (source->kernel != nullptr) {
+      TI_ERROR_IF(!qualified_source(*source, reduction.kernel),
+                  "Graph value source has an incompatible callable ABI");
+      key = source->kernel->ir_is_ast()
+                ? get_hashed_offline_cache_semantic_key(
+                      config, source->kernel->program->get_device_caps(),
+                      source->kernel)
+                : get_hashed_offline_cache_semantic_key_context(
+                      config, source->kernel->program->get_device_caps(),
+                      source->kernel) +
+                      source->kernel->get_name();
+    }
+    identity(key);
+    std::vector<std::string> names;
+    for (const auto &argument : source->arguments) {
+      names.push_back(argument.name);
+    }
+    identity(names);
+  }
+  identity(consumer_input_argument);
+  identity.finalize();
+  const auto identity_digest = picosha2::hash256_hex_string(identity.data);
   ArgumentUnion arguments;
   const auto reduction_remap = arguments.append(reduction);
   TI_ERROR_IF(reduction_remap != std::vector<int>({0, 1, 2}),
@@ -284,9 +318,9 @@ std::unique_ptr<aot::CompiledGraph> compile_graph_segmented_reduce_values(
     store->parent->insert_after(store, std::move(statements));
   }
 
-  auto kernel = std::make_shared<Kernel>(
-      *reduction.kernel->program, std::move(ir),
-      reduction.kernel->get_name() + "__graph_value_fused");
+  auto kernel =
+      std::make_shared<Kernel>(*reduction.kernel->program, std::move(ir),
+                               "graph_value_fused_" + identity_digest);
   kernel->parameter_list = std::move(arguments.parameters);
   for (std::size_t i = 0; i < kernel->parameter_list.size(); ++i) {
     kernel->nested_parameters[{static_cast<int>(i)}] =
