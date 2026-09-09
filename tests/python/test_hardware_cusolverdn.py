@@ -1,10 +1,54 @@
 """Bounded device/lifetime contracts, with optional unmodified vendor execution."""
 
 import os
+from types import SimpleNamespace
 import numpy as np
 import pytest
 import taichi_forge as ti
 from tests import test_utils
+
+
+@test_utils.test(arch=ti.cpu)
+def test_cusolverdn_public_probe_preserves_facts_and_does_not_enable(monkeypatch):
+    from taichi_forge.hardware import _cusolverdn_abi as abi
+
+    monkeypatch.setattr(abi, "_LIBRARIES", {})
+    unloaded = []
+    marker = object()
+    monkeypatch.setattr(abi, "_unload", unloaded.append)
+    monkeypatch.setattr(
+        abi,
+        "DenseLibrary",
+        lambda path: SimpleNamespace(library=marker, path=path, version="12.1.0"),
+    )
+
+    def probe():
+        return next(
+            o
+            for o in ti.hardware.probe(
+                "cusolverdn", library_path="vendor.dll"
+            ).to_dict()["operations"]
+            if o["provider_id"] == "cusolverdn"
+        )
+
+    result = probe()
+    assert result["discovery"] == "available"
+    assert result["provider_version"] == "12.1.0"
+    assert (
+        result["enablement"] == "disabled" and result["selection"] == "not_considered"
+    )
+    assert result["native_facts"]["external_component_probed"]
+    assert not result["native_facts"]["execution_qualified"]
+    assert unloaded == [marker] and not abi.passive_status()["library_loaded"]
+
+    def missing(path):
+        raise OSError("missing vendor dependency")
+
+    monkeypatch.setattr(abi, "DenseLibrary", missing)
+    failure = probe()
+    assert failure["unavailable_reason"] == "vendor_runtime_probe_failed"
+    assert "missing vendor dependency" in failure["last_error"]
+    assert not abi.passive_status()["library_loaded"]
 
 
 @test_utils.test(arch=ti.cpu)

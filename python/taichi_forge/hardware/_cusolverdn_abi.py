@@ -145,36 +145,39 @@ def passive_status():
 
 def probe_provider(library_path=None):
     candidate = resolve_library_path(library_path)
+    facts = {
+        "probe_policy": "transient_vendor_runtime_query",
+        "provider_enablement_changed": False,
+        "provider_selection_changed": False,
+        "execution_qualified": False,
+        "library_candidate": candidate,
+    }
+    result = {
+        "provider_id": "cusolverdn",
+        "external_component_probed": False,
+        "provider_abi": ABI,
+        "provider_version": None,
+        "native_facts": facts,
+    }
     try:
         library = DenseLibrary(candidate)
     except (OSError, AttributeError, TaichiRuntimeError) as exc:
-        return {
-            "provider_id": "cusolverdn",
-            "discovery": "missing",
-            "enablement": "disabled",
-            "selection": "not_selected",
-            "unavailable_reason": str(exc),
-            "provider_abi": ABI,
-            "native_facts": {
-                "external_component_probed": True,
-                "execution_qualified": False,
-            },
-        }
+        result.update(
+            discovery="incompatible",
+            unavailable_reason="vendor_runtime_probe_failed",
+            last_error=str(exc) or type(exc).__name__,
+            failure_scope="provider",
+        )
+        return result
     try:
-        return {
-            "provider_id": "cusolverdn",
-            "discovery": "present",
-            "enablement": "disabled",
-            "selection": "not_selected",
-            "unavailable_reason": "none",
-            "provider_abi": ABI,
-            "provider_version": library.version,
-            "library_candidate": library.path,
-            "native_facts": {
-                "external_component_probed": True,
-                "execution_qualified": False,
-            },
-        }
+        facts["library_candidate"] = library.path
+        result.update(
+            external_component_probed=True,
+            discovery="available",
+            unavailable_reason="none",
+            provider_version=library.version,
+        )
+        return result
     finally:
         _unload(library.library)
 
