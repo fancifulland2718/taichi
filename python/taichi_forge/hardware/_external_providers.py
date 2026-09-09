@@ -31,6 +31,16 @@ class ExternalProviderSpec:
 
 _EXTERNAL_PROVIDER_SPECS = (
     ExternalProviderSpec(
+        provider_id="cusolverdn",
+        adapter_kind="python_dynamic_symbols",
+        install_owner="user_cuda_environment",
+        library_path_policy="optional",
+        process_handle_policy="process_resident",
+        runtime_resource_policy="provider_plan",
+        transitive_dependencies=("cuda_runtime", "cublas", "cusparse"),
+        python_adapter_module="taichi_forge.hardware._cusolverdn",
+    ),
+    ExternalProviderSpec(
         provider_id="vkfft",
         adapter_kind="optional_jit_provider_c_abi",
         install_owner="forge_runtime_wheel",

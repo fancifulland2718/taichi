@@ -431,6 +431,53 @@ invalid JSON/status/path/checksum, or unsupported `ptxas` fails closed.
 
 ## Registered providers from the user environment
 
+### cuSOLVERDn device Cholesky
+
+`ti.hardware.linalg.CusolverDnProvider` is an explicit, user-installed dense SPD
+solver. Forge supplies a lazy thin C-ABI binding, not the vendor runtime or its
+CUDA dependencies. Pass a library file/directory, set `TI_CUSOLVERDN_LIBRARY_PATH`,
+or install a compatible NVIDIA cuSOLVER component package. Transitive libraries
+must also be discoverable. `ti.hardware.probe("cusolverdn", library_path=...)`
+checks symbols/version; it does not qualify execution or select this solver.
+
+```python
+with ti.hardware.linalg.CusolverDnProvider(library_path) as provider:
+    with provider.cholesky_plan(n, rhs_count=8, dtype=ti.f32) as plan:
+        bound = plan.bind(a, rhs, solution)
+        bound.factor_and_solve()
+        # GPU producers may replace rhs; reuse factors only while A is unchanged.
+        bound.solve()
+        # GPU consumers may inspect plan.info without a host readback.
+        status = plan.status()  # optional, explicitly synchronizes
+```
+
+A is scalar f32/f64 `(n, n)`, row-major, with the SPD matrix's **lower triangle**
+supplied. It is preserved in a private factor buffer. For one RHS, rhs/solution
+have shape `(n,)`; for multiple RHS, shape `(rhs_count, n)` stores **one vector
+per row**, avoiding transposes. RHS and solution may be the same ndarray, but
+then the RHS is overwritten and must be replenished before another solve. A
+must not alias them. Plans have one immutable binding and retained device/host
+workspace. Close plans before their provider; close/reset waits for outstanding
+work and invalidates saved bound actions.
+
+`factor()` invalidates the previous solve status, `solve()` reuses the factor,
+and `factor_and_solve()` queues both. Device `info[0]` is the factorization result
+and `info[1]` the solve API's numerical status; `-1` denotes not yet submitted
+by this binding. A successful API return is **not** proof of SPD input or a
+small residual. Consumers must use factor status and application-owned residual
+criteria. In particular, solving after an unsuccessful factorization is not a
+valid solution. No SPD scan, residual readback, retry, or implicit fallback is
+added to each call. f32 error depends on dimension and conditioning; use f64
+when the application's accuracy requires it.
+
+`plan.memory_report()` separates private factor/workspace/status bytes from
+unknown vendor/driver residency; `plan.host_workspace_bytes` reports host
+workspace, and caller arrays are excluded. Calls use Forge's existing ordered
+CUDA submission/lifetime boundary. This path is not kernel-callable, Graph
+recordable, or a CompileIQ recipe axis, and does not change runtime auto. Local
+execution evidence covers Windows, cuSOLVER 12.1.0, RTX 5090; other library/driver
+combinations are not implied qualified. See NVIDIA's [generic Cholesky contract](https://docs.nvidia.com/cuda/cusolver/index.html#cusolverdnxpotrf).
+
 ### cuBLAS, cuSPARSE, and cuFFT
 
 These providers use copied stable declarations and runtime symbol loading;

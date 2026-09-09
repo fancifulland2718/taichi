@@ -37,6 +37,7 @@ _OPERATION_IDS = (
     "matrix.mma.cuda",
     "matrix.mma.vulkan",
     "interop.external_buffer.cuda_vulkan",
+    "linalg.cholesky.cusolverdn",
     "linalg.gemm.cublas",
     "linalg.matmul.cublaslt_explicit",
     "linalg.spmv.cusparse",

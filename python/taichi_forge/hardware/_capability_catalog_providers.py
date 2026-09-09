@@ -4,6 +4,24 @@
 def d1_provider_operations(_operation):
     return (
         _operation(
+            "linalg.cholesky.cusolverdn", "linalg.dense_solve", "cusolverdn", ("cuda",),
+            "lazy_external", "vendor_algorithm", "vendor_library", "implementation_defined",
+            ("python",), "external_library", "unsupported", "runtime_ordered", "provider_owned", "existing_public",
+            activation_mode="explicit_hardware_api", dependency_name="cuSOLVERDn",
+            public_api="ti.hardware.linalg.CusolverDnProvider.cholesky_plan",
+            resource_effects=("read:a", "read:rhs", "write:solution", "read_write:factor_workspace_status"),
+            lifetime_policy="provider_plan", update_policy="immutable",
+            requirements=("user-managed cuSOLVER generic Xpotrf/Xpotrs symbols", "caller-provided SPD lower triangle"),
+            dtypes=("input/output:f32 or f64", "status:i32"),
+            layouts=("row-major square A; lower triangle", "RHS/output:(n,) or (rhs_count,n)"),
+            notes=(
+                "Explicit fixed device binding, retained factor and workspace; no automatic or Graph recipe route.",
+                "Factor and solve numerical status stays in device memory; status() is an explicit synchronized query.",
+                "A is preserved. RHS/solution may alias, in which case subsequent solves read the overwritten RHS.",
+                "API success does not certify SPD input or numerical convergence; queued consumers must respect device info.",
+            ),
+        ),
+        _operation(
             "linalg.gemm.cublas",
             "linalg.gemm",
             "cublas",

@@ -327,6 +327,42 @@ compile 阶段拥有 PTX 和静态选项，并不了解任意 kernel 的生产�
 
 ## 用户环境中的已注册 provider
 
+### cuSOLVERDn device Cholesky
+
+`ti.hardware.linalg.CusolverDnProvider` 显式使用用户安装的稠密 SPD 求解库。Forge 只提供延迟加载的薄 C-ABI
+binding，不打包 vendor runtime 或其 CUDA 依赖。可以传入库文件/目录、设置 `TI_CUSOLVERDN_LIBRARY_PATH`，
+或安装兼容的 NVIDIA cuSOLVER component package；传递依赖也必须可被加载。
+`ti.hardware.probe("cusolverdn", library_path=...)` 只检查符号和版本，不代表执行资格化或自动选用。
+
+```python
+with ti.hardware.linalg.CusolverDnProvider(library_path) as provider:
+    with provider.cholesky_plan(n, rhs_count=8, dtype=ti.f32) as plan:
+        bound = plan.bind(a, rhs, solution)
+        bound.factor_and_solve()
+        # GPU producer 可以更新 rhs；仅在 A 不变时复用因子。
+        bound.solve()
+        # GPU consumer 可读取 plan.info，无须 host readback。
+        status = plan.status()  # 可选，显式同步
+```
+
+A 是标量 f32/f64、row-major `(n,n)` ndarray，只使用 SPD 矩阵的**下三角**；私有 factor buffer 保留原 A。
+单 RHS 使用 `(n,)`，多 RHS 使用 `(rhs_count,n)`，即**每行一个向量**，不做隐式转置。
+rhs 与 solution 可以是同一个 ndarray，但此时 RHS 被覆盖，下次求解前需重新写入；A 不得与它们 alias。
+每个 plan 只有一个不可变 binding，并持有 device/host workspace。先关闭 plan，再关闭 provider；close/reset
+等待在途工作完成，并使已经保存的 bound action 失效。
+
+`factor()` 使上次 solve status 失效，`solve()` 复用因子，`factor_and_solve()` 顺序提交两步。
+device `info[0]` 是因子分解结果，`info[1]` 是 solve 的数值状态；`-1` 表示本 binding 尚未提交该步骤。
+API 成功返回**不代表**矩阵正定或残差足够小。consumer 需尊重 factor status 与应用自身的残差要求；失败分解后
+的 solve 不是有效解。每次调用不增加 SPD 扫描、残差回读、重试或隐式 fallback。f32 误差取决于规模与条件数，
+高精度需求应显式使用 f64。
+
+`plan.memory_report()` 区分私有 factor/workspace/status 请求字节与未知 vendor/driver 驻留；
+`plan.host_workspace_bytes` 单独报告 host workspace，不计入 caller arrays。执行复用 Forge 既有有序 CUDA
+submission/lifetime 边界。目前不支持 kernel 内调用、Graph recording 或 CompileIQ recipe axis，也不改变
+runtime auto。本机执行证据为 Windows、cuSOLVER 12.1.0、RTX 5090，不暗示其他组合已资格化。
+数值合同参见 NVIDIA [generic Cholesky 文档](https://docs.nvidia.com/cuda/cusolver/index.html#cusolverdnxpotrf)。
+
 ### cuBLAS、cuSPARSE 与 cuFFT
 
 这些 provider 使用复制的稳定声明与 runtime symbol loading；Forge 不使用 Toolkit header，
