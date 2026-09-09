@@ -34,14 +34,17 @@ def test_amgx_device_producers_updates_and_solution_consumer(rows, dtype):
             start = 3 * i - ti.cast(i > 0, ti.i32)
             center = start + ti.cast(i > 0, ti.i32)
             values[center] = diagonal
-            x = scale * (1.0 + 0.001 * (i % 31))
+            # The manufactured solution must not round through default_fp=f32
+            # before promotion by scale, especially for the f64 vendor check.
+            step = ti.cast(1, ti.f64) / 1000
+            x = scale * (1 + step * (i % 31))
             b = diagonal * x
             if i > 0:
                 values[start] = -1
-                b -= scale * (1.0 + 0.001 * ((i - 1) % 31))
+                b -= scale * (1 + step * ((i - 1) % 31))
             if i + 1 < rows:
                 values[center + 1] = -1
-                b -= scale * (1.0 + 0.001 * ((i + 1) % 31))
+                b -= scale * (1 + step * ((i + 1) % 31))
             rhs[i] = b
 
     @ti.kernel
