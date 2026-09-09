@@ -503,3 +503,165 @@ def test_amgx_provider_executes_host_buffers_and_blocks_early_close(monkeypatch)
     assert info["iterations"] == 4
     assert calls == ["replace", ("destroy", 404)]
     assert runtime.closed is True
+
+@pytest.fixture
+def amgx_device_contract(monkeypatch):
+    """ABI pointer/lifetime fixture, not vendor correctness or performance evidence."""
+    program = _FakeProgram()
+    registered = []
+    state = SimpleNamespace(values=None, dtype=None, calls=[], fail=False, status=0)
+
+    class DeviceArray:
+        def __init__(self, values):
+            self.data = np.asarray(values)
+            self.dtype = ti.f32 if self.data.dtype == np.float32 else ti.f64
+            self.shape = self.data.shape
+            self.element_shape = ()
+            self._runtime_prog = program
+            self.arr = self.data
+
+        def __array__(self, *_args, **_kwargs):
+            raise AssertionError("device data must not be coerced through numpy")
+
+    def read(pointer, count):
+        element = ctypes.c_float if state.dtype == np.float32 else ctypes.c_double
+        return np.ctypeslib.as_array((element * count).from_address(pointer))
+
+    def create(_runtime, desc, handle):
+        state.dtype = np.float32 if desc._obj.value_type == 1 else np.float64
+        state.values = read(desc._obj.values, desc._obj.nonzeros).copy()
+        state.calls.append("create")
+        handle._obj.value = 404
+        return 0
+
+    def replace(_solver, pointer, count):
+        state.values = read(pointer, count).copy()
+        state.calls.append("replace")
+        return 0
+
+    def solve(_solver, desc, info):
+        state.calls.append(("solve", desc._obj.zero_initial_guess))
+        if state.fail:
+            return 1
+        read(desc._obj.solution, len(state.values))[:] = read(desc._obj.rhs, len(state.values)) / state.values
+        info._obj.solve_status = state.status
+        info._obj.iterations = 2
+        info._obj.residual_norm = 0.0
+        return 0
+
+    execution = SimpleNamespace(
+        execution_abi_version=1,
+        create_solver=create,
+        replace_coefficients=replace,
+        solve=solve,
+        destroy_solver=lambda _solver: state.calls.append("destroy") or 0,
+    )
+    runtime = _FakeRuntime(execution)
+
+    def check(result):
+        if result:
+            raise RuntimeError("vendor submission failed")
+
+    runtime.check_result = check
+    program.get_ndarray_data_ptr_as_int = lambda arr: arr.ctypes.data
+    monkeypatch.setattr(_amgx, "Ndarray", DeviceArray)
+    monkeypatch.setattr(_amgx, "_require_cuda_program", lambda _name: program)
+    monkeypatch.setattr(_amgx, "_open_runtime", lambda *_args: runtime)
+    monkeypatch.setattr(_amgx.impl, "get_runtime", lambda: SimpleNamespace(register_runtime_object=registered.append))
+    monkeypatch.setattr(_amgx.impl, "runtime_generation", lambda: 7)
+    monkeypatch.setattr(_amgx, "validate_runtime_generation", lambda *_args: None)
+    monkeypatch.setattr(_amgx, "runtime_generation_matches", lambda *_args: True)
+    provider = _amgx.AmgxProvider()
+    yield SimpleNamespace(
+        array=DeviceArray, program=program, provider=provider, state=state, registered=registered, runtime=runtime
+    )
+    provider._invalidate_runtime()
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_amgx_device_binding_keeps_live_buffers_and_reuses_pointer_contract(amgx_device_contract, monkeypatch, dtype):
+    env = amgx_device_contract
+    values = env.array(np.full(3, 2.0, dtype=dtype))
+    rhs = env.array(np.array([2, 4, 6], dtype=dtype))
+    solution = env.array(np.zeros(3, dtype=dtype))
+    solver = env.provider.solver([0, 1, 2, 3], [0, 1, 2], values, "config_version=2, solver=PCG")
+    binding = solver.bind_device(rhs, solution, values=values, zero_initial_guess=False)
+
+    def cold_only(*_args):
+        raise AssertionError("device binding must not repeat cold validation or pointer queries")
+
+    monkeypatch.setattr(_amgx, "_device_buffer", cold_only)
+    monkeypatch.setattr(solver, "_validate_lifetime", cold_only)
+    monkeypatch.setattr(env.program, "get_ndarray_data_ptr_as_int", cold_only)
+    result, info = binding.solve()
+    assert result is solution and info["converged"]
+    np.testing.assert_array_equal(result.data, [1, 2, 3])
+    rhs.data *= 2
+    values.data *= 2
+    binding.replace_coefficients()
+    result, _ = binding.solve()
+    np.testing.assert_array_equal(result.data, [1, 2, 3])
+    assert env.state.calls == ["create", ("solve", 0), "replace", ("solve", 0)]
+    # Creation, solve and update all retain device arrays through the existing
+    # external submission owner. No new synchronization is added per vendor call.
+    assert len(env.program.submissions) == 4
+    assert env.program.synchronizations == 5  # provider, creation, 2 solves, update
+    with pytest.raises(ti.TaichiRuntimeError, match="resources are live"):
+        env.provider.close()
+    solver.close()
+    with pytest.raises(ti.TaichiRuntimeError, match="closed"):
+        binding.solve()
+    with pytest.raises(ti.TaichiRuntimeError, match="closed"):
+        binding.replace_coefficients()
+
+
+def test_amgx_device_binding_rejects_wrong_shape_type_owner_and_device_topology(amgx_device_contract):
+    env = amgx_device_contract
+    values = env.array(np.ones(3, dtype=np.float32))
+    solver = env.provider.solver([0, 1, 2, 3], [0, 1, 2], values, "config_version=2, solver=PCG")
+    good = env.array(np.ones(3, dtype=np.float32))
+    invalid = [env.array(np.ones((1, 3), dtype=np.float32)), env.array(np.ones(3, dtype=np.float64))]
+    stale = env.array(np.ones(3, dtype=np.float32))
+    stale._runtime_prog = object()
+    invalid.append(stale)
+    for bad in invalid:
+        with pytest.raises((ValueError, TypeError, ti.TaichiRuntimeError)):
+            solver.bind_device(bad, good)
+    with pytest.raises(TypeError, match="host array"):
+        env.provider.solver(good, [0, 1, 2], values, "config_version=2, solver=PCG")
+    with pytest.raises(TypeError, match="scalar"):
+        solver.bind_device(np.ones(3, dtype=np.float32), good)
+    binding = solver.bind_device(good, good)
+    with pytest.raises(ti.TaichiRuntimeError, match="values="):
+        binding.replace_coefficients()
+    binding.close()
+    with pytest.raises(ti.TaichiRuntimeError, match="closed"):
+        binding.solve()
+
+
+def test_amgx_device_binding_preserves_failure_retirement_and_numeric_status(amgx_device_contract):
+    env = amgx_device_contract
+    solver = env.provider.solver([0, 1, 2, 3], [0, 1, 2], np.ones(3), "config_version=2, solver=PCG")
+    rhs, solution = (env.array(np.ones(3)) for _ in range(2))
+    binding = solver.bind_device(rhs, solution)
+    env.state.fail = True
+    with pytest.raises(ti.TaichiRuntimeError, match="vendor submission failed"):
+        binding.solve()
+    assert env.program.submissions[-1][1] is True
+    env.state.fail = False
+    env.state.status = 3  # Nonconvergence remains a numerical result, not success.
+    result, info = binding.solve()
+    assert result is solution and not info["converged"] and info["solve_status"] == 3
+
+
+def test_amgx_runtime_retirement_invalidates_bound_device_calls(amgx_device_contract):
+    env = amgx_device_contract
+    solver = env.provider.solver([0, 1, 2, 3], [0, 1, 2], np.ones(3), "config_version=2, solver=PCG")
+    binding = solver.bind_device(env.array(np.ones(3)), env.array(np.zeros(3)))
+    saved_solve = binding.solve
+    assert env.registered == [env.provider]
+    env.provider._invalidate_runtime()
+    assert solver.closed and env.provider.closed and env.runtime.closed
+    with pytest.raises(ti.TaichiRuntimeError, match="reset"):
+        saved_solve()
+    assert env.state.calls == ["create", "destroy"]

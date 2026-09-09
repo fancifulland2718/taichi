@@ -1,6 +1,6 @@
 """Public optional hardware linear-algebra provider API."""
 
-from taichi_forge.hardware._amgx import AmgxProvider, AmgxSolver
+from taichi_forge.hardware._amgx import AmgxDeviceBinding, AmgxProvider, AmgxSolver
 from taichi_forge.hardware._spmm_recipe import SparseSpmmRecipeProvider
 from taichi_forge.hardware._matmul_recipe import MatmulRecipeProvider
 from taichi_forge.hardware._sparse_solve_recipe import SparseSolveRecipeProvider
@@ -28,6 +28,7 @@ from taichi_forge.hardware._linalg import (
 )
 
 __all__ = [
+    "AmgxDeviceBinding",
     "AmgxProvider",
     "AmgxSolver",
     "SparseSpmmRecipeProvider",

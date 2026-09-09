@@ -289,8 +289,10 @@ typedef struct TiForgeAmgxSolverDesc {
   uint32_t reserved;
   int32_t rows;
   int32_t nonzeros;
+  /* Topology is host memory: the adapter validates it during creation. */
   const int32_t *row_offsets;
   const int32_t *column_indices;
+  /* Numeric data may be host or device memory (AmgX UVA copy semantics). */
   const void *values;
   const char *config;
 } TiForgeAmgxSolverDesc;
@@ -298,6 +300,7 @@ typedef struct TiForgeAmgxSolverDesc {
 typedef struct TiForgeAmgxSolveDesc {
   uint32_t struct_size;
   uint32_t zero_initial_guess;
+  /* Both buffers may be host or device memory; no stream/capture promise. */
   const void *rhs;
   void *solution;
 } TiForgeAmgxSolveDesc;
