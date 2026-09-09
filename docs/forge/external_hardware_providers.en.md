@@ -18,6 +18,7 @@ APIs for the bounded operations below; discovery probes remain non-executing.
 | Library | Forge status | Installation owner | Forge discovery | Call position |
 | --- | --- | --- | --- | --- |
 | cuBLAS | Registered D1 provider | User CUDA environment | `ti.hardware.probe("cublas")` | Direct Python or root Graph; not kernel-callable |
+| cuSOLVERDn | Explicit device Cholesky | User CUDA environment | `ti.hardware.probe("cusolverdn")` | Fixed buffers, optional retained CUDA Graph/root command; no automatic selection or built-in solver recipe generator |
 | cuSPARSE | Registered D1 provider | User CUDA environment | `ti.hardware.probe("cusparse")` | Domain auto/explicit or root Graph; not kernel-callable |
 | cuFFT | Registered D1 provider | User CUDA environment | `ti.hardware.probe("cufft")` | Explicit plan or root Graph; not kernel-callable |
 | VkFFT 1.3.4 | Optional ABI1 Vulkan JIT adapter | Current runtime build configuration; older artifacts may omit it | `ti.hardware.probe("vkfft")` or explicit library path | Fixed-storage plan/root Graph; explicit batch and whole-Graph secondary recipes with matching extensions |
@@ -512,10 +513,26 @@ when the application's accuracy requires it.
 `plan.memory_report()` separates private factor/workspace/status bytes from
 unknown vendor/driver residency; `plan.host_workspace_bytes` reports host
 workspace, and caller arrays are excluded. Calls use Forge's existing ordered
-CUDA submission/lifetime boundary. This path is not kernel-callable, Graph
-recordable, or a CompileIQ recipe axis, and does not change runtime auto. Local
+CUDA submission/lifetime boundary. This path is not kernel-callable or a
+CompileIQ recipe axis, and does not change runtime auto. Local
 execution evidence covers Windows, cuSOLVER 12.1.0, RTX 5090; other library/driver
 combinations are not implied qualified. See NVIDIA's [generic Cholesky contract](https://docs.nvidia.com/cuda/cusolver/index.html#cusolverdnxpotrf).
+
+After submitting `binding.factor()`, use `captured = binding.capture(mode="solve")`
+and `captured.run()` to reuse factors with current RHS data. Alternatively,
+`mode="factor_and_solve"` refreshes factors from current A on every execution.
+Capture waits for in-flight work only during preparation; it does not execute
+mathematics or establish valid factors. Replay launches the retained CUDA Graph
+without repeated vendor calls, stream settings or pointer queries.
+
+`builder.append_native(captured.record(a="a", rhs="rhs", solution="solution"))`
+adds a fixed root-ordered command, not fusion into an enclosing mixed CUDA Graph
+or a new solver search axis. Bindings require the original arrays; their contents
+may change. RHS/output alias and numerical status remain caller responsibilities.
+Graph retains the capture object; explicit capture/plan close or reset invalidates
+old execution. Close waits for retirement outside steady replay. Existing factor
+and workspace allocations are reused; CUDA Graph/driver residency is unknown,
+so no total-VRAM nonincrease is implied.
 
 ### cuBLAS, cuSPARSE, and cuFFT
 

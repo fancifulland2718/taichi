@@ -8,6 +8,65 @@ import taichi_forge as ti
 from tests import test_utils
 
 
+@pytest.mark.skipif(
+    not os.environ.get("TI_FORGE_TEST_CUSOLVERDN_LIBRARY_PATH"),
+    reason="real cuSOLVER required",
+)
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+@pytest.mark.parametrize("dtype,alias", [(ti.f32, False), (ti.f64, True)])
+def test_cusolverdn_capture_live_inputs_root_order_and_retirement(
+    dtype, alias, monkeypatch
+):
+    n = 65
+    a, rhs = ti.ndarray(dtype, (n, n)), ti.ndarray(dtype, (3, n))
+    output = rhs if alias else ti.ndarray(dtype, (3, n))
+    with ti.hardware.linalg.CusolverDnProvider(
+        os.environ["TI_FORGE_TEST_CUSOLVERDN_LIBRARY_PATH"]
+    ) as provider:
+        with provider.cholesky_plan(n, rhs_count=3, dtype=dtype) as plan:
+            binding = plan.bind(a, rhs, output)
+            with pytest.raises(ti.TaichiRuntimeError, match="factor"):
+                binding.capture()
+            action = binding.capture(mode="factor_and_solve")
+            np.testing.assert_array_equal(plan.info.to_numpy(), [-1, -1])
+            builder = ti.graph.GraphBuilder()
+            builder.append_native(action.record())
+            graph = builder.compile()
+            published = graph.bind({"a": a, "rhs": rhs, "solution": output})
+            with pytest.raises(ti.TaichiRuntimeError, match="original"):
+                graph.bind({"a": a, "rhs": rhs, "solution": ti.ndarray(dtype, (3, n))})
+
+            def cold_only(*args):
+                raise AssertionError("vendor or capture called during replay")
+
+            monkeypatch.setattr(binding, "_invoke", cold_only)
+            for diagonal in (2, 4, 8):
+                host_a = (
+                    np.eye(n, dtype=np.float32 if dtype == ti.f32 else np.float64)
+                    * diagonal
+                )
+                a.from_numpy(host_a)
+                rhs.fill(diagonal * 3)
+                graph.run(published)
+                np.testing.assert_allclose(output.to_numpy(), 3, rtol=1e-5)
+                np.testing.assert_array_equal(a.to_numpy(), host_a)
+                assert plan.status()["solve_ok"]
+            action.close()
+            with pytest.raises(ti.TaichiRuntimeError, match="closed"):
+                action.run()
+
+    # Saved entry points must be invalidated before resetting owned CUDA context.
+    provider = ti.hardware.linalg.CusolverDnProvider(
+        os.environ["TI_FORGE_TEST_CUSOLVERDN_LIBRARY_PATH"]
+    )
+    plan = provider.cholesky_plan(n, rhs_count=3, dtype=dtype)
+    action = plan.bind(a, rhs, output).capture(mode="factor_and_solve")
+    saved = action.run
+    ti.reset()
+    with pytest.raises(ti.TaichiRuntimeError, match="closed"):
+        saved()
+
+
 @test_utils.test(arch=ti.cpu)
 def test_cusolverdn_public_probe_preserves_facts_and_does_not_enable(monkeypatch):
     from taichi_forge.hardware import _cusolverdn_abi as abi
@@ -59,7 +118,7 @@ def test_cusolverdn_is_explicit_and_requires_cuda():
         ti.hardware.capability("linalg.cholesky.cusolverdn").to_dict()[
             "graph_integration"
         ]
-        == "unsupported"
+        == "root_ordered"
     )
 
 

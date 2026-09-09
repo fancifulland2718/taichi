@@ -6,7 +6,7 @@ def d1_provider_operations(_operation):
         _operation(
             "linalg.cholesky.cusolverdn", "linalg.dense_solve", "cusolverdn", ("cuda",),
             "lazy_external", "vendor_algorithm", "vendor_library", "implementation_defined",
-            ("python",), "external_library", "unsupported", "runtime_ordered", "provider_owned", "existing_public",
+            ("python", "graph"), "external_library", "root_ordered", "runtime_ordered", "provider_owned", "existing_public",
             activation_mode="explicit_hardware_api", dependency_name="cuSOLVERDn",
             public_api="ti.hardware.linalg.CusolverDnProvider.cholesky_plan",
             resource_effects=("read:a", "read:rhs", "write:solution", "read_write:factor_workspace_status"),
@@ -15,7 +15,8 @@ def d1_provider_operations(_operation):
             dtypes=("input/output:f32 or f64", "status:i32"),
             layouts=("row-major square A; lower triangle", "RHS/output:(n,) or (rhs_count,n)"),
             notes=(
-                "Explicit fixed device binding, retained factor and workspace; no automatic or Graph recipe route.",
+                "Explicit fixed device binding, retained factor and workspace; optional captured solver root command, no automatic or complete-recipe generator.",
+                "binding.capture() prepares retained vendor CUDA Graph work; record() is root-ordered, not enclosing mixed-Graph capture.",
                 "Factor and solve numerical status stays in device memory; status() is an explicit synchronized query.",
                 "A is preserved. RHS/solution may alias, in which case subsequent solves read the overwritten RHS.",
                 "API success does not certify SPD input or numerical convergence; queued consumers must respect device info.",

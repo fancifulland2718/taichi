@@ -15,6 +15,7 @@ retained-provider API，而 discovery probe 始终不执行算法。
 | Library | Forge 状态 | 安装责任方 | Forge 发现方式 | 调用位置 |
 | --- | --- | --- | --- | --- |
 | cuBLAS | 已注册 D1 provider | 用户 CUDA 环境 | `ti.hardware.probe("cublas")` | direct Python 或 root Graph；不能在 kernel 内调用 |
+| cuSOLVERDn | 显式 device Cholesky | 用户 CUDA 环境 | `ti.hardware.probe("cusolverdn")` | 固定绑定、可选 retained CUDA Graph/root command；无自动选择或内建 solver recipe generator |
 | cuSPARSE | 已注册 D1 provider | 用户 CUDA 环境 | `ti.hardware.probe("cusparse")` | 领域级 auto/explicit 或 root Graph；不能在 kernel 内调用 |
 | cuFFT | 已注册 D1 provider | 用户 CUDA 环境 | `ti.hardware.probe("cufft")` | 显式 plan 或 root Graph；不能在 kernel 内调用 |
 | VkFFT 1.3.4 | 可选 ABI1 Vulkan JIT adapter | 当前 runtime 构建配置包含，旧产物可能没有 | `ti.hardware.probe("vkfft")` 或显式路径 | 固定存储计划/root Graph；匹配扩展支持显式 batch 与完整 Graph secondary recipe |
@@ -390,9 +391,25 @@ API 成功返回**不代表**矩阵正定或残差足够小。consumer 需尊重
 
 `plan.memory_report()` 区分私有 factor/workspace/status 请求字节与未知 vendor/driver 驻留；
 `plan.host_workspace_bytes` 单独报告 host workspace，不计入 caller arrays。执行复用 Forge 既有有序 CUDA
-submission/lifetime 边界。目前不支持 kernel 内调用、Graph recording 或 CompileIQ recipe axis，也不改变
+submission/lifetime 边界。目前不支持 kernel 内调用或 CompileIQ recipe axis，也不改变
 runtime auto。本机执行证据为 Windows、cuSOLVER 12.1.0、RTX 5090，不暗示其他组合已资格化。
 数值合同参见 NVIDIA [generic Cholesky 文档](https://docs.nvidia.com/cuda/cusolver/index.html#cusolverdnxpotrf)。
+
+固定工作可显式冷录制，减少重复 vendor 提交：
+
+```python
+binding.factor()  # 矩阵不变时仅提交一次；状态仍在 device。
+captured = binding.capture(mode="solve")
+captured.run()    # 后续读取当前 RHS，复用 factor。
+builder.append_native(captured.record(a="a", rhs="rhs", solution="solution"))
+```
+
+`mode="factor_and_solve"` 则每次执行从当前 A 刷新 factor。capture 本身不执行数学或发布有效 factor，
+准备期等待在途工作后建立固定 CUDA Graph；replay 只 launch，不重新调用 vendor、设置 stream 或查询指针。
+`record()` 是 root-ordered command，不是与相邻 Forge kernel 融为一个 CUDA Graph，也不新增 solver 搜索轴。
+绑定只接受原数组，内容可以变；调用者仍须管理 RHS/output alias 和 factor 有效性。Graph 保留 capture 对象，
+显式关闭 capture/plan 或 reset 会使旧执行失效；close 的退休等待不属于 steady replay。
+capture 不新增矩阵 scratch，复用 plan 工作区；CUDA Graph/driver 驻留未知，不宣称显存总量不增加。
 
 ### cuBLAS、cuSPARSE 与 cuFFT
 

@@ -137,6 +137,7 @@ class CusolverDnCholeskyPlan:
         self._runtime_prog = provider._runtime_prog
         self._lock = provider._lock
         self._binding = None
+        self._captures = weakref.WeakSet()
         self._handle, self._params = ct.c_void_p(), ct.c_void_p()
         self.closed = False
         self._factor = ScalarNdarray(dtype, (rows, rows))
@@ -295,6 +296,8 @@ class CusolverDnCholeskyPlan:
             # One cold retirement wait covers vendor handle, host workspace and
             # device factors. Nothing is freed while queued work still uses it.
             self._runtime_prog.synchronize()
+            for capture in tuple(self._captures):
+                capture._release()
             if self._binding is not None:
                 self._binding._invalidate()
             with self._driver.activate():
@@ -351,12 +354,32 @@ class CusolverDnBinding:
         self.solve = _unfactored
         self.factor_and_solve = partial(self._submit, "both")
 
-    def _invoke(self, mode):
+    def capture(self, *, mode="solve"):
+        """Cold-record fixed vendor work for repeated default-stream execution.
+
+        ``solve`` reuses previously submitted factors; ``factor_and_solve``
+        refreshes them from A on each execution. Recording does not execute
+        mathematical work or establish factor validity.
+        """
+        from taichi_forge.hardware._cusolverdn_capture import CusolverDnCapture
+
+        with self._plan._lock:
+            if self._plan.closed:
+                _closed()
+            if mode not in ("solve", "factor_and_solve"):
+                raise ValueError(
+                    "cuSOLVERDn capture mode must be solve or factor_and_solve"
+                )
+            if mode == "solve" and self.solve is _unfactored:
+                _unfactored()
+            return CusolverDnCapture(self, "solve" if mode == "solve" else "both")
+
+    def _invoke(self, mode, stream=None):
         plan = self._plan
         with plan._driver.activate():
             if mode != "solve":
                 check(
-                    plan._driver.clear(plan._info_pointer + 4, 0xFFFFFFFF, 1, None),
+                    plan._driver.clear(plan._info_pointer + 4, 0xFFFFFFFF, 1, stream),
                     "invalidate previous solve status",
                 )
                 check(
@@ -364,7 +387,7 @@ class CusolverDnBinding:
                         plan._factor_pointer,
                         self._a,
                         plan.rows * plan.rows * plan._element_bytes,
-                        None,
+                        stream,
                     ),
                     "copy Cholesky input",
                 )
@@ -376,7 +399,7 @@ class CusolverDnBinding:
                             self._output,
                             self._rhs,
                             plan.rows * plan.rhs_count * plan._element_bytes,
-                            None,
+                            stream,
                         ),
                         "copy RHS",
                     )
