@@ -48,6 +48,10 @@ cuTENSOR、AmgX 或 NCCL 绝不会触发 compiler rewrite。
 | --- | --- | --- |
 | 固定 pattern 稀疏-稠密乘法 | `SparseMatrix.record_spmm(...)`，随后 `operation.prepare(input_array, output_array)` | CUDA f32 CSR / 紧凑 row-major 稠密数组；通过 `GraphBuilder.append_native()` 追加。显式 `ti.hardware.linalg.SparseSpmmRecipeProvider()` 将冻结的 direct/preprocessed 策略加入完整 recipe。 |
 | Batched 2D complex FFT | `ti.linalg.record_fft(...)`，随后 `operation.prepare()` | CUDA complex-f32，紧凑 `(H, W, 2)` 或 `(batch, H, W, 2)` 数组，输入输出分离。显式 `ti.hardware.fft.FftRecipeProvider()` 在 whole-transform baseline 外提供逐图像列计划，以及 native 支持时的跨 batch 列计划。 |
+| Batched 2D real FFT | `ti.linalg.record_fft(..., transform="r2c"/"c2r")`，随后 `operation.prepare()` | 紧凑 f32 real / Hermitian 半谱数组，支持完整录制 Graph 与 binding frame；real 路线不生成 complex 专属的分解/LTO 候选。C2R 输入可能被 vendor 覆写，Graph 已声明该 effect。 |
+| cuSOLVERDn device Cholesky | `provider.cholesky_plan(...).bind(...)`，随后 `binding.capture(...)` | 固定 factor/solve CUDA Graph 与 root 有序录制；不是内建 solver recipe generator 或 enclosing mixed capture。 |
+| CUTLASS matmul addon | `ti.linalg.record_matmul(...)` 加 `CutlassMatmulRecipeProvider(manifest_path)` | 显式 FP32 SIMT 完整 direct/split-K/epilogue region，用户构建 Toolkit addon；不偷偷改 TF32，不搜索裸 kernel 参数或隐式 provider 路由。 |
+| FidelityFX Parallel Sort | `ti.hardware.sort.VulkanParallelSortPlan(...)` | 固定 u32 stable key/payload sort、源码 JIT 与 root 有序录制；属于显式执行能力，不是固定 sort CompileIQ 轴。 |
 | Toolkit reset-monoid segmented scan | 既有 `GraphBuilder.segmented_scan()` 加 `taichi_forge.hardware.source_providers` 中的 `CubSegmentedScanRecipeProvider(manifest_path)` | 可选 source-provider addon；有界 i32/u32 sum 与不可变 segmented layout。prepared capture、workspace 和 head-bitset 生命周期形成物理 recipe；addon 不在 portable runtime wheel 内。 |
 | Driver-native segmented scan | `GraphBuilder.segmented_scan()` 与默认 recipe providers | 固定、互不重叠的 i32/u32 数组和不可变 segment；global correction 使用 retained CUDA recording 与 Graph-bound scratch，不依赖外部 Toolkit 库；仍是 fixed-resource action，不是 binding-frame region。 |
 | Vulkan VkFFT | 固定存储计划/root Graph；显式 `VulkanFftRecipeProvider` | batch scratch 复用与 Vulkan 不可变 secondary Graph；不是 CUDA binding frame 或 vendor 路由轴。 |
@@ -1190,7 +1194,12 @@ Forge 提供 MIT FidelityFX Parallel Sort 源码及自有绑定；调用者显�
 设备需支持 compute subgroup basic/arithmetic/ballot/shuffle；编译器、native bridge 或能力缺失在显式创建时失败，
 不改变普通 sort。`ti.hardware.capability("sort.radix.fidelityfx")` 只是静态合同，不是编译器或设备资格探测。
 
-管线、descriptor、workspace 和 40-dispatch secondary sequence 一次准备。Root Graph 每个 sort action 仍有一次
+管线、descriptor、workspace 和 secondary sequence 一次准备，默认仍为 40 dispatch。
+显式 `fuse_prefix=True` 使用 Forge 自有 shared-memory histogram prefix，改为 24 dispatch / 25 barrier，
+代价是另一份 histogram 大小的 scratch。它改变完整阶段策略，不改上游 sort 或开放 launch 参数。
+本机 RTX 的小/中直方图有收益，但大直方图会损失前缀并行度；本机 AMD 也未证明稳定收益，需按实际规模/设备选择。
+默认计划和普通 sort 都不变；旧 bridge 对该可选策略在创建边界明确拒绝。
+Root Graph 每个 sort action 仍有一次
 host 调用；这不是 enclosing Graph capture，也不增加 CompileIQ 固定 sort/provider 路由轴。发布绑定要求原数组；
 close 拒绝后续调用，已提交命令保留 GPU 资源直到完成。reset 不会让旧 handle 命中新 runtime 的计划。
 
@@ -1216,6 +1225,11 @@ batched/rank 扩展、其他 dtype、任意 epilogue、CuTe Python DSL 不在此
 | 直接融合 | GEMM + epilogue，1 kernel | 0 |
 | 较低工作区的 split-K | 部分积 → 归约 + epilogue，2 kernels | `64 * m * n` bytes |
 | 较宽并行度的 split-K | 更多部分积 → 归约 + epilogue，2 kernels | `512 * m * n` bytes |
+
+wide 策略使用 Forge 自有协作 warp 归约与较窄的 SIMT partial tile；其他策略保留原 tile。
+addon 源码/二进制 identity 会变化，C ABI 和 workspace 合同不变；重新构建 addon 后生效。
+它能减少 long-K 的 device 活跃时间，但 host 提交受限时 Graph period 未必缩短；中规模 wide
+仍可能输给低工作区方案或 vendor baseline，不声明全局 winner，也不隐式更改精度。
 
 这些大小描述当前实现，不是稳定的 kernel 配置 API。`workspace_limit_bytes` 是显式候选资源预算，默认
 32 MiB；超过预算的方案不生成。更多分区不保证更快，额外的部分积写入/读取和归约可能成为主要成本。

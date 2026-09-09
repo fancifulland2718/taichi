@@ -56,6 +56,10 @@ entry is declared for that operation; it does not prohibit application providers
 | --- | --- | --- |
 | Fixed-pattern sparse-dense product | `SparseMatrix.record_spmm(...)`, then `operation.prepare(input_array, output_array)` | CUDA f32 CSR / compact row-major dense arrays; append the operation with `GraphBuilder.append_native()`. Explicit `ti.hardware.linalg.SparseSpmmRecipeProvider()` adds frozen direct/preprocessed strategies to complete recipes. |
 | Batched 2D complex FFT | `ti.linalg.record_fft(...)`, then `operation.prepare()` | CUDA complex-f32, compact arrays `(H, W, 2)` or `(batch, H, W, 2)`, distinct input/output. Explicit `ti.hardware.fft.FftRecipeProvider()` adds separable per-image and, on capable runtimes, cross-batch column plans alongside the whole-transform baseline. |
+| Batched 2D real FFT | `ti.linalg.record_fft(..., transform="r2c"/"c2r")`, then `operation.prepare()` | Compact f32 real / Hermitian half-spectrum arrays; complete recorded Graphs and binding frames are supported. The real path does not expose complex-only separable/LTO candidates. C2R input may be overwritten by the vendor; this effect is declared in the Graph. |
+| cuSOLVERDn device Cholesky | `provider.cholesky_plan(...).bind(...)`, then `binding.capture(...)` | Fixed factor/solve CUDA Graph execution and root-ordered Graph recording; not a built-in solver recipe generator or enclosing mixed capture. |
+| CUTLASS matmul addon | `ti.linalg.record_matmul(...)` plus `CutlassMatmulRecipeProvider(manifest_path)` | Explicit FP32 SIMT complete direct/split-K/epilogue regions; caller-built Toolkit addon. No TF32 substitution, single-kernel knob search or implicit provider route. |
+| FidelityFX Parallel Sort | `ti.hardware.sort.VulkanParallelSortPlan(...)` | Fixed u32 stable key/payload sort, source JIT and root-ordered recording. An explicit execution facility, not a fixed-sort CompileIQ axis. |
 | Driver-native segmented scan | `GraphBuilder.segmented_scan()` and default recipe providers | Fixed disjoint i32/u32 arrays and immutable segments. Global correction uses retained CUDA recording and Graph-bound scratch; no external Toolkit library is required. It remains a fixed-resource action, not a binding-frame region. |
 | Toolkit reset-monoid segmented scan | Existing `GraphBuilder.segmented_scan()` plus `CubSegmentedScanRecipeProvider(manifest_path)` from `taichi_forge.hardware.source_providers` | Optional source-provider addon; bounded i32/u32 sum and immutable segmented layout. Prepared capture, workspace and head-bitset lifetime form the physical recipe; the addon is not part of the portable runtime wheel. |
 | Other cuSPARSE / cuFFT / cuDSS expert operations | Existing explicit plans and documented root Graph recording | Recording alone does not provide a recipe generator. cuDSS root ordering must not be described as CUDA Graph capture. |
@@ -1475,8 +1479,16 @@ Missing compiler/native bridge/capabilities fail at explicit creation, without
 changing ordinary sort. `ti.hardware.capability("sort.radix.fidelityfx")` is a
 static contract, not a compiler or device qualification probe.
 
-Pipelines, descriptors, workspace, and the forty-dispatch secondary sequence
-are prepared once. Root Graphs retain a host call per sort action; this is not
+Pipelines, descriptors, workspace, and the secondary sequence are prepared once.
+The default keeps forty dispatches. Explicit `fuse_prefix=True` records 24
+dispatches/25 barriers using a Forge-owned shared-memory histogram prefix, at
+the cost of another histogram-sized scratch table. It changes a complete stage
+strategy, not the upstream sort or launch parameters. Local RTX measurements
+improved small/medium histograms, but large histograms lost prefix parallelism;
+the local AMD result also did not establish a stable benefit. Benchmark the
+actual size/device before opting in. Neither the default nor ordinary sort is
+changed, and older bridges explicitly reject this optional strategy.
+Root Graphs retain a host call per sort action; this is not
 enclosing Graph capture or a new CompileIQ fixed-sort/provider-route axis.
 Binding publication requires the original arrays. Closing a plan invalidates
 future calls; already submitted commands retain their GPU resources. Runtime
@@ -1513,6 +1525,14 @@ arbitrary epilogues, and the CuTe Python DSL are outside this addon.
 | Direct fused | GEMM + epilogue, one kernel | Zero |
 | Lower-workspace split-K | Partial products → reduction + epilogue, two kernels | `64 * m * n` bytes |
 | Wider-parallelism split-K | More partial products → reduction + epilogue, two kernels | `512 * m * n` bytes |
+
+The wide strategy uses a Forge-owned cooperating-warp reduction and a narrower
+SIMT partial-product tile; other strategies retain their original tiling.
+The addon source/binary identity changes, but the C ABI and workspace contract
+do not. Rebuild the addon to use it. This can shorten long-K device execution
+without shortening a host-submission-limited Graph period. Medium shapes can
+still lose to the lower-workspace strategy or vendor baseline; no global winner
+or silent precision change is implied.
 
 These sizes describe the implementation, not a stable kernel-configuration API.
 The explicit `workspace_limit_bytes` candidate budget defaults to 32 MiB.

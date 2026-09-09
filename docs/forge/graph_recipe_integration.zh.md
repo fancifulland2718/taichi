@@ -24,6 +24,10 @@ python -m pip install C:\artifacts\compileiq-<compatible-fork-wheel>.whl
 不是安装白名单。只运行已选 Graph 不需要启动 CompileIQ 搜索；历史测量适用性检查仍可能需要它。
 可选 vendor runtime、DXC、NVCC 等只为用到的 provider 配置，不安装整套库作为前提。
 
+在应用测试环境中明确安装这一组 shim、runtime 和 fork wheel，运行示例前确认实际 import 路径。
+安装包测试不要继承开发用的 `PYTHONPATH`、`TAICHI_NATIVE_RUNTIME_DIR` 或 `TAICHI_RUNTIME_DIR`
+覆盖。本地 headless 接入组合不是正式发布或渲染窗口资格；窗口测试需要启用 GGUI 的 runtime。
+
 ## 可运行示例与结果处理
 
 [complete_recipe_provider.py](../../python/taichi_forge/examples/graph/complete_recipe_provider.py)

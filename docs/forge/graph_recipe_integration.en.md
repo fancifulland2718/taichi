@@ -13,6 +13,14 @@ obtained by an unqualified `pip install compileiq`. Fork V2 protocol/capability 
 is required; a commit/hash is provenance, not an installation allowlist. Optional vendor
 libraries or compilers are needed only for the providers being used.
 
+Keep the shim, runtime and fork wheels together in the application's test
+environment; install the supplied files explicitly with
+`python -m pip install <runtime.whl> <shim.whl> <fork.whl>`.
+Check actual import locations before running the example. Do not carry development
+`PYTHONPATH`, `TAICHI_NATIVE_RUNTIME_DIR` or `TAICHI_RUNTIME_DIR` overrides into an
+installed-wheel test. A local headless integration set is not a public release or
+a rendering-window qualification; windowed tests require a GGUI-enabled runtime.
+
 ## Executable example
 
 [complete_recipe_provider.py](../../python/taichi_forge/examples/graph/complete_recipe_provider.py)
