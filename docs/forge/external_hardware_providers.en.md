@@ -1080,10 +1080,10 @@ qualify NCCL.
 | Windows DLL is present but will not load | Current-process `PATH`, `os.add_dll_directory()`, architecture, dependent DLLs | Configure before load and bind one CUDA-major family |
 | Linux `.so` is present but will not load | `LD_LIBRARY_PATH`/RPATH, SONAME, dependent `.so` files | Use the versioned SONAME when the package omits symlinks |
 | Provider loads but execution fails | dtype, shape, layout, device, stream, provider ABI/version | Surface the provider failure; do not silently fall back after explicit selection |
-| Correctness differs | matrix properties, pruning/precision, transpose/layout, stale plan or values | Fail the numerical gate before considering performance |
+| Correctness differs | matrix properties, pruning/precision, transpose/layout, stale plan or values | Treat the candidate as invalid for that numerical contract; diagnose correctness before comparing performance |
 | First call is slow | plan creation, JIT, analysis, compression, allocation | Separate setup from steady state and use the production reuse count |
 | Memory grows | live plans/scenes/factors, workspaces, caches, in-flight Graph leases | Inspect provider memory reports where available and close owners after retirement |
-| Performance is unstable | synchronization, cold caches, clock/power state, algorithm search, topology | Use fresh-process AB/BA runs and require a positive worst-case application gate |
+| Performance is unstable | synchronization, cold caches, clock/power state, algorithm search, topology | Compare balanced fresh-process runs at the actual workload scale; report variability and device/host/memory trade-offs without a universal positive-speedup gate |
 
 Native Windows adapters that fail during deep provider plan creation should
 also check the host thread/executable stack reserve. Treat a larger reserve as

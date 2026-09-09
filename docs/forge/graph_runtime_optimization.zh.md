@@ -822,11 +822,16 @@ CompileIQ 只看到固定的不透明 ordinal token，而不是 Forge recipe ID�
 使用不同的 provider namespace、domain version 与 semantic identity。Forge 会解码结果，检查
 搜索完整覆盖且包含 baseline，并通过显式 recipe 使用的同一 Graph execution identity 完成
 物化。所选物理控制路线在该 Graph 构造时冻结；之后改变内部 selector 不能修改已编译身份。
-搜索 winner 不等于运行时准入；必须独立验证 correctness、精确 route/binding identity、
-lifecycle、memory stability 和 worst-positive 性能。map-fusion 之后可以使用精确作用域的
-qualification cache，证据缺失、过期或作用域不匹配时 fail closed 到 baseline。
-structured-control 搜索不允许生成这类 runtime cache：winner 只能由离线流程显式重建，
-不会修改 runtime `auto` 策略。compile/search build 时间只作诊断，不是准入门禁。
+搜索 decision 是显式 recipe 选择，不是运行时准入，也不更新普通 `auto` 策略。语义、binding、
+数值与生命周期合同仍在对应准备/物化边界生效。语义合法、可物化且物理不同的候选，即使在某个
+实测 scope 更慢，也可以继续被搜索。device、host 和显存分别表达取舍，不设置统一正加速门槛。
+生产采用由调用者的实际 workload 决定；compile/search build 时间只作诊断，不是准入门禁。
+
+#### 历史精确 scope 性能证据
+
+以下记录保留旧实现 identity 和当时的资格协议，包括 worst-positive 门禁与历史 cache 政策。
+它们不是当前 HEAD 的测量、统一搜索要求或安装 runtime decision cache 的指引。
+历史负 scope 不会据此从当前完整 recipe catalog 中删除合法候选。
 
 完整 `graph_memory` 域已在 RTX 5090、driver 610.62、matching source/shim/native commit
 `835eea2cb18c49ef66470ae4a378493fb97a0db2` 上完成正式资格化。三个 scope 各使用 10 个

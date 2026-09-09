@@ -167,7 +167,9 @@ def d1_provider_operations(_operation):
             resource_effects=("read:sparse_matrix", "read:input", "write:output"),
             lifetime_policy="resource_generation",
             update_policy="rebind",
-            requirements=("compatible cuSPARSE shared library with generic SpMM symbols",),
+            requirements=(
+                "compatible cuSPARSE shared library with generic SpMM symbols",
+            ),
             public_api="ti.hardware.linalg.spmm_f32",
             recipe_semantic_api="SparseMatrix.record_spmm",
             recipe_provider_api="ti.hardware.linalg.SparseSpmmRecipeProvider",
@@ -291,20 +293,28 @@ def d1_provider_operations(_operation):
             resource_effects=("read_write:data", "write:workspace"),
             lifetime_policy="provider_plan",
             update_policy="immutable",
-            requirements=("explicit ABI1 VkFFT adapter with static glslang", "Vulkan compute device"),
+            requirements=(
+                "explicit ABI1 VkFFT adapter with static glslang",
+                "Vulkan compute device",
+            ),
             public_api="ti.hardware.fft.VulkanFftPlan",
             recipe_semantic_api="VulkanFftPlan.record",
             recipe_provider_api="ti.hardware.fft.VulkanFftRecipeProvider",
             recipe_scope=(
                 "Vulkan compact in-place complex-f32, rank 1--3",
-                "caller-owned fixed storage and open baseline plans",
+                "caller-owned fixed storage; default recording retains open source plans, recipe_owned recording detaches plan ownership at freeze",
                 "batch scratch reuse; optional complete secondary Graph frames",
                 "matching recipe/inline adapter extensions; finite caller inputs",
             ),
             dtypes=("complex-pair:f32",),
-            shapes_or_tiles=("rank 1--3; dimensions factorizable by 2,3,5,7,11,13; batched",),
+            shapes_or_tiles=(
+                "rank 1--3; dimensions factorizable by 2,3,5,7,11,13; batched",
+            ),
             layouts=("compact in-place scalar f32 complex pairs; frozen storage",),
-            numeric_contracts=("forward sign:-1", "inverse sign:+1; optional 1/volume normalization"),
+            numeric_contracts=(
+                "forward sign:-1",
+                "inverse sign:+1; optional 1/volume normalization",
+            ),
             notes=(
                 "Optional addon, not a mandatory Vulkan import or CUDA dependency.",
                 "Cold plan JIT may submit and wait for table initialization; execution has no host readback.",
@@ -452,7 +462,9 @@ def d1_provider_operations(_operation):
                 "user-managed cuDSS 0.8.x matching CUDA 12 or CUDA 13",
                 "compatible user-managed cuBLAS dependency",
             ),
-            public_api=("ti.linalg.SparseSolver(provider='auto', provider_profile=profile)"),
+            public_api=(
+                "ti.linalg.SparseSolver(provider='auto', provider_profile=profile)"
+            ),
             dtypes=("matrix:f32", "rhs:f32", "solution:f32"),
             shapes_or_tiles=("single square matrix", "single rhs"),
             layouts=("scalar CSR with i32 offsets and indices",),
@@ -610,7 +622,9 @@ def d1_provider_operations(_operation):
                 "selected vendor plan request reconstruction; not opaque vendor kernel binary reuse",
             ),
             dtypes=("A/B/C/D:f32", "compute:f32 or tf32"),
-            shapes_or_tiles=("explicit unique modes; native descriptors allow rank 1-32, Forge ndarrays allow rank 1-12",),
+            shapes_or_tiles=(
+                "explicit unique modes; native descriptors allow rank 1-32, Forge ndarrays allow rank 1-12",
+            ),
             layouts=("compact row-major scalar Taichi ndarrays",),
             numeric_contracts=("D = alpha * contract(A, B) + beta * C",),
             notes=(
@@ -689,7 +703,7 @@ def d1_provider_operations(_operation):
             public_api="ti.hardware.probe('cusparselt', library_path=...)",
             notes=(
                 "The probe audits the version and core execution symbols, then releases both adapter and vendor-runtime handles.",
-                "Execution is separately exposed through an explicit provider plan; no automatic route, Graph command, or kernel intrinsic is exposed.",
+                "This probe executes no mathematics and records no Graph command. Separate plan recording and complete sparse-matmul recipes provide Graph execution; no automatic route or kernel intrinsic is exposed.",
                 "The vendor runtime remains optional and adds no Forge wheel variant.",
             ),
         ),
@@ -719,7 +733,7 @@ def d1_provider_operations(_operation):
             public_api="ti.hardware.probe('cutensor', library_path=...)",
             notes=(
                 "The probe audits the version and contraction/reduction symbol surface without creating a cuTENSOR handle.",
-                "Execution is separately exposed through an explicit contraction plan; no Graph command, automatic route, or kernel intrinsic is exposed.",
+                "This probe executes no mathematics and records no Graph command. Separate contraction plan recording and complete contraction recipes provide Graph execution; no automatic route or kernel intrinsic is exposed.",
                 "The vendor runtime remains optional and adds no Forge wheel variant.",
             ),
         ),

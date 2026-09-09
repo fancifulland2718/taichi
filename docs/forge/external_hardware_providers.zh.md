@@ -886,10 +886,10 @@ microbenchmark 不能资格化 NCCL。
 | Windows DLL 存在但不能加载 | 当前 process `PATH`、`os.add_dll_directory()`、architecture、dependent DLL | load 前完成配置，只绑定一个 CUDA-major family |
 | Linux `.so` 存在但不能加载 | `LD_LIBRARY_PATH`/RPATH、SONAME、dependent `.so` | package 没有 symlink 时使用 versioned SONAME |
 | Provider 可加载但执行失败 | dtype、shape、layout、device、stream、provider ABI/version | 暴露 provider failure；显式选择后不能静默 fallback |
-| 正确性不同 | matrix property、pruning/precision、transpose/layout、stale plan 或 values | 性能评估前先让数值门禁失败 |
+| 正确性不同 | matrix property、pruning/precision、transpose/layout、stale plan 或 values | 此候选不满足该数值合同；先定位正确性问题，再比较性能 |
 | 首次调用很慢 | plan creation、JIT、analysis、compression、allocation | 分离 setup 与 steady state，并使用生产复用次数 |
 | 内存增长 | live plan/scene/factor、workspace、cache、in-flight Graph lease | 可用时检查 provider memory report，并在 retire 后关闭 owner |
-| 性能不稳定 | synchronization、cold cache、clock/power state、algorithm search、topology | 使用 fresh-process AB/BA，并要求最差情况仍通过应用正收益门槛 |
+| 性能不稳定 | synchronization、cold cache、clock/power state、algorithm search、topology | 在实际 workload 规模下做平衡 fresh-process 对照；报告波动及 device/host/显存取舍，不设统一正加速门槛 |
 
 若 native Windows adapter 在较深的 provider plan creation 中失败，还应检查 host
 thread/executable stack reserve。增大 reserve 只能视为特定 provider version 的部署

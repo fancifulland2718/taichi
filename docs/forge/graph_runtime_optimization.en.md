@@ -1062,14 +1062,22 @@ semantic identities. Forge decodes the result, checks complete search coverage
 including the baseline, and materializes it through the same Graph execution
 identity used by explicit recipes. The selected physical control route is
 frozen when that Graph is constructed; later internal-selector changes cannot
-mutate the compiled identity. A search winner is not runtime admission.
-Correctness, exact route and binding identity, lifecycle, memory stability, and
-worst-positive performance must be qualified independently. Map-fusion may
-then use an exact-scope qualification cache; missing, stale, or mismatched
-evidence fails closed to its baseline. Structured-control searches cannot emit
-that runtime cache: a winner is available only through explicit offline
-reconstruction and does not mutate the runtime `auto` policy. Compile/search
-build time is diagnostic only and is not an admission gate.
+mutate the compiled identity. A search decision is an explicit recipe selection,
+not runtime admission or an automatic policy update. Semantic, binding, numerical,
+and lifetime contracts still apply at their preparation/materialization boundaries.
+Semantically legal, materializable, physically distinct recipes remain searchable
+even when a measured scope is slower. Device time, host cost, and memory are
+separate trade-offs; Forge imposes no universal positive-speedup threshold.
+Production adoption belongs to the caller's actual workload. Compile/search build
+time is diagnostic only and is not an admission gate.
+
+#### Historical scope-specific performance evidence
+
+The following records retain earlier implementation identities and their original
+qualification procedures, including worst-positive gates and historical cache
+policies. They are not current-HEAD measurements, universal search requirements,
+or instructions to install a runtime decision cache. Historical negative scopes
+do not remove a legal candidate from the current complete-recipe catalog.
 
 The complete `graph_memory` domain has been formally qualified on an RTX 5090
 with driver 610.62 at matching source, shim, and native commit
