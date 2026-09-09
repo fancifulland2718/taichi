@@ -73,7 +73,10 @@ std::uint64_t Program::create_vulkan_parallel_sort_plan(
   TI_ERROR_IF(!(subgroup.supportedStages & VK_SHADER_STAGE_COMPUTE_BIT) ||
                   !(subgroup.supportedOperations & VK_SUBGROUP_FEATURE_SHUFFLE_BIT),
               "Parallel Sort requires compute subgroup shuffle support.");
-  TI_ERROR_IF(shaders.size() != 5, "Parallel Sort requires five provider shaders.");
+  TI_ERROR_IF(shaders.size() != 3 && shaders.size() != 5,
+              "Parallel Sort requires three fused or five original provider shaders.");
+  const bool fused = shaders.size() == 3;
+  const int steps = fused ? 3 : 5;
   auto resources = std::make_shared<SortResources>();
   resources->device = dev->vk_device();
   resources->storage_lease = std::move(leases);
@@ -99,10 +102,10 @@ std::uint64_t Program::create_vulkan_parallel_sort_plan(
   const auto scratch_key = allocate(uint64_t(n) * 4);
   const auto scratch_value = values ? allocate(uint64_t(n) * 4) : key;
   const auto sums = allocate(uint64_t(groups) * 16 * 4);
-  const auto reduced = allocate(uint64_t(parameters.scan_values) * 4);
+  const auto reduced = allocate(uint64_t(fused ? groups * 16 : parameters.scan_values) * 4);
   const auto value = values ? values->get_device_allocation() : key;
   constexpr const char *names[] = {"count", "reduce", "scan", "scan_add", "scatter"};
-  for (int step = 0; step < 5; ++step) {
+  for (int step = 0; step < steps; ++step) {
     const auto &shader = shaders[step];
     TI_ERROR_IF(shader.empty() || shader.front() != 0x07230203u ||
                     shader.size() > (4u << 20),
@@ -110,7 +113,8 @@ std::uint64_t Program::create_vulkan_parallel_sort_plan(
     PipelineSourceDesc source{PipelineSourceType::spirv_binary, shader.data(),
                               shader.size() * 4, PipelineStageType::compute};
     auto [pipeline, result] = dev->create_pipeline_unique(
-        source, std::string("fidelityfx_parallel_sort_") + names[step]);
+        source, std::string("fidelityfx_parallel_sort_") +
+                    (fused ? (step == 0 ? "count" : step == 1 ? "prefix" : "scatter") : names[step]));
     TI_ERROR_IF(result != RhiResult::success,
                 "Parallel Sort pipeline creation failed: {}", int(result));
     resources->pipelines.push_back(std::move(pipeline));
@@ -125,11 +129,12 @@ std::uint64_t Program::create_vulkan_parallel_sort_plan(
                                  parameters.scan_values, groups};
   for (uint32_t pass = 0; pass < 8; ++pass) {
     parameters.shift = pass * 4;
-    for (int step = 0; step < 5; ++step) {
+    for (int index = 0; index < steps; ++index) {
+      const int step = fused && index == 2 ? 4 : index;
       auto binding = std::unique_ptr<ShaderResourceSet>(dev->create_resource_set());
       if (step == 0 || step == 4) {
         binding->rw_buffer(0, pass % 2 ? scratch_key : key);
-        binding->rw_buffer(4, sums);
+        binding->rw_buffer(4, fused && step == 4 ? reduced : sums);
       }
       if (step == 4) {
         binding->rw_buffer(1, pass % 2 ? key : scratch_key);
@@ -147,11 +152,11 @@ std::uint64_t Program::create_vulkan_parallel_sort_plan(
           binding->rw_buffer(8, reduced);
         }
       }
-      list->bind_pipeline(resources->pipelines[step].get());
+      list->bind_pipeline(resources->pipelines[index].get());
       TI_ERROR_IF(list->bind_shader_resources(binding.get()) != RhiResult::success,
                   "Parallel Sort shader binding failed.");
       list->push_constants(&parameters, sizeof(parameters));
-      TI_ERROR_IF(list->dispatch(dispatches[step]) != RhiResult::success,
+      TI_ERROR_IF(list->dispatch(fused && step == 1 ? 1 : dispatches[step]) != RhiResult::success,
                   "Parallel Sort dispatch recording failed.");
       list->memory_barrier();
       resources->bindings.push_back(std::move(binding));
@@ -162,7 +167,8 @@ std::uint64_t Program::create_vulkan_parallel_sort_plan(
   TI_ERROR_IF(!plan->replay, "Parallel Sort requires secondary compute recording.");
   const auto &properties = dev->get_vk_physical_device_props();
   plan->statistics = {{"key_count", n}, {"payload", values ? 1 : 0},
-                      {"dispatch_count", 40}, {"barrier_count", 41},
+                      {"dispatch_count", uint64_t(steps * 8)}, {"barrier_count", uint64_t(steps * 8 + 1)},
+                      {"fused_prefix", fused ? 1 : 0},
                       {"threadgroups", groups}, {"workspace_bytes", workspace_bytes},
                       {"device_copy_count", 0}, {"device_vendor_id", properties.vendorID},
                       {"device_id", properties.deviceID},

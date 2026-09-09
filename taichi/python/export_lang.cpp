@@ -3218,6 +3218,10 @@ void export_lang(py::module &m) {
            tracked_native_program_method(&Program::create_vulkan_parallel_sort_plan),
            py::arg("keys"), py::arg("values"), py::arg("shaders"),
            py::call_guard<py::gil_scoped_release>())
+      .def("_create_vulkan_parallel_sort_plan_fused",
+           tracked_native_program_method(&Program::create_vulkan_parallel_sort_plan),
+           py::arg("keys"), py::arg("values"), py::arg("shaders"),
+           py::call_guard<py::gil_scoped_release>())
       .def("_vulkan_parallel_sort_execute",
            &Program::vulkan_parallel_sort_execute,
            py::arg("handle"), py::call_guard<py::gil_scoped_release>())

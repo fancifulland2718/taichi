@@ -7,7 +7,7 @@ import subprocess
 import tempfile
 
 
-def compile_shaders(compiler_path, payload):
+def compile_shaders(compiler_path, payload, *, fused_prefix=False):
     compiler = Path(compiler_path).expanduser().resolve(strict=True)
     if not compiler.is_file():
         raise ValueError("Parallel Sort compiler_path must name the DXC executable")
@@ -23,6 +23,9 @@ def compile_shaders(compiler_path, payload):
         "compiler_sha256": sha256(compiler.read_bytes()).hexdigest(),
         "target": "vulkan1.1/cs_6_0",
         "tail_policy": "guarded_preloads_exact_capacity",
+        "prefix_strategy": (
+            "separate_histogram_fused_prefix" if fused_prefix else "reduced_scan_add"
+        ),
     }
     options = {"capture_output": True, "text": True, "timeout": 120}
     version = subprocess.run([str(compiler), "--version"], check=True, **options)
@@ -31,7 +34,12 @@ def compile_shaders(compiler_path, payload):
     hashes = []
     # Temporary compiler outputs never become a global cache or runtime load.
     with tempfile.TemporaryDirectory(prefix="forge-parallel-sort-") as temporary:
-        for entry in ("Count", "Reduce", "Scan", "ScanAdd", "Scatter"):
+        entries = (
+            ("Count", "Prefix", "Scatter")
+            if fused_prefix
+            else ("Count", "Reduce", "Scan", "ScanAdd", "Scatter")
+        )
+        for entry in entries:
             output = Path(temporary) / f"{entry}.spv"
             command = [
                 str(compiler),

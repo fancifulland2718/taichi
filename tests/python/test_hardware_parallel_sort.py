@@ -17,16 +17,18 @@ def _compiler():
     return path
 
 
-@pytest.mark.parametrize("with_payload", [False, True])
+@pytest.mark.parametrize(
+    "with_payload,fused", [(False, True), (True, True), (True, False)]
+)
 @test_utils.test(arch=ti.vulkan, offline_cache=False)
-def test_parallel_sort_exact_capacity_and_stable_duplicate_payload(with_payload):
+def test_parallel_sort_exact_capacity_and_stable_duplicate_payload(with_payload, fused):
     compiler = _compiler()
     # Both sides of the shader block boundary and a middle-scale partial block.
-    for n in (1, 511, 513, 262147):
+    for n in (1, 511, 513, 131072, 131073, 262147):
         keys = ti.ndarray(ti.u32, shape=n)
         values = ti.ndarray(ti.u32, shape=n) if with_payload else None
         with ti.hardware.sort.VulkanParallelSortPlan(
-            keys, values, compiler_path=compiler
+            keys, values, compiler_path=compiler, fuse_prefix=fused
         ) as plan:
             rng = np.random.default_rng(956)
             for source in (
@@ -45,7 +47,9 @@ def test_parallel_sort_exact_capacity_and_stable_duplicate_payload(with_payload)
                         values.to_numpy(), order.astype(np.uint32)
                     )
             stats = plan.statistics()
-            assert stats["dispatch_count"] == 40 and stats["device_copy_count"] == 0
+            assert stats["dispatch_count"] == (24 if stats.get("fused_prefix") else 40)
+            assert stats["barrier_count"] == stats["dispatch_count"] + 1
+            assert stats["device_copy_count"] == 0
             assert (
                 plan.memory_report().known_capacity_requested_bytes
                 == stats["workspace_bytes"]
@@ -62,7 +66,7 @@ def test_parallel_sort_graph_publication_queue_order_and_pending_close(monkeypat
     values = ti.ndarray(ti.u32, shape=n)
     other = ti.ndarray(ti.u32, shape=n)
     plan = ti.hardware.sort.VulkanParallelSortPlan(
-        keys, values, compiler_path=_compiler()
+        keys, values, compiler_path=_compiler(), fuse_prefix=True
     )
 
     @ti.kernel

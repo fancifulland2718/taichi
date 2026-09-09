@@ -27,12 +27,17 @@ class VulkanParallelSortPlan:
     ``run()`` is asynchronous on the Forge queue; caller arrays are modified
     in place. Root Graph recording retains this plan and its exact storage.
     This is an expert execution API, not a CompileIQ fixed-sort routing axis.
+    ``fuse_prefix=True`` records a complete three-stage pass instead of five;
+    this trades prefix parallelism and additional scratch for fewer dispatches.
+    It is opt-in because size/device crossovers exist; the default is unchanged.
     """
 
     graph_runtime_lifetime_check_required = False
 
-    def __init__(self, keys, values=None, *, compiler_path):
+    def __init__(self, keys, values=None, *, compiler_path, fuse_prefix=False):
         self._closed = True
+        if not isinstance(fuse_prefix, bool):
+            raise TypeError("fuse_prefix must be a bool")
         for array in (keys,) if values is None else (keys, values):
             if (
                 not isinstance(array, ScalarNdarray)
@@ -55,7 +60,21 @@ class VulkanParallelSortPlan:
             raise RuntimeError(
                 "Parallel Sort native bridge is unavailable in this runtime build"
             )
-        shaders, facts = compile_shaders(compiler_path, values is not None)
+        # Explicit whole-prefix strategy, not a kernel launch knob or search
+        # axis. Performance crosses over by size/device; keep existing defaults.
+        fused_create = (
+            getattr(program, "_create_vulkan_parallel_sort_plan_fused", None)
+            if fuse_prefix
+            else None
+        )
+        if fuse_prefix and fused_create is None:
+            raise RuntimeError(
+                "Fused Parallel Sort prefix is unavailable in this runtime build"
+            )
+        shaders, facts = compile_shaders(
+            compiler_path, values is not None, fused_prefix=fused_create is not None
+        )
+        create = fused_create or create
         self._runtime_prog = program
         self._runtime_generation = int(impl.runtime_generation())
         self._keys, self._values = keys, values

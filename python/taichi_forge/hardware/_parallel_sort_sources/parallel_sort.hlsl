@@ -17,6 +17,40 @@ struct Parameters {
 [[vk::binding(7, 0)]] RWStructuredBuffer<uint> scanDst;
 [[vk::binding(8, 0)]] RWStructuredBuffer<uint> scanScratch;
 
+// Forge-owned, coalesced prefix of the bounded bin-major histogram. A 16 KiB
+// shared tile transposes contiguous global access to per-thread segments.
+// Padding prevents shared-memory bank conflicts in both directions.
+groupshared uint prefixTile[32][129];
+groupshared uint prefixCarry;
+[numthreads(128, 1, 1)]
+void Prefix(uint localID : SV_GroupThreadID, uint bin : SV_GroupID) {
+    if (bin != 0) return;
+    uint values = parameters.cb.NumThreadGroups * 16;
+    if (localID == 0) prefixCarry = 0;
+    for (uint base = 0; base < values; base += 4096) {
+        for (uint j = 0; j < 32; ++j) {
+            uint i = j * 128 + localID;
+            prefixTile[i % 32][i / 32] = base + i < values ? sums[base + i] : 0;
+        }
+        GroupMemoryBarrierWithGroupSync();
+        uint localSum = 0;
+        for (uint j = 0; j < 32; ++j) {
+            uint value = prefixTile[j][localID];
+            prefixTile[j][localID] = localSum;
+            localSum += value;
+        }
+        uint offset = FFX_ParallelSort_BlockScanPrefix(localSum, localID) + prefixCarry;
+        for (uint j = 0; j < 32; ++j) prefixTile[j][localID] += offset;
+        GroupMemoryBarrierWithGroupSync();
+        if (localID == 127) prefixCarry = offset + localSum;
+        for (uint j = 0; j < 32; ++j) {
+            uint i = j * 128 + localID;
+            if (base + i < values) reduced[base + i] = prefixTile[i % 32][i / 32];
+        }
+        GroupMemoryBarrierWithGroupSync();
+    }
+}
+
 [numthreads(128, 1, 1)]
 void Count(uint localID : SV_GroupThreadID, uint groupID : SV_GroupID) {
     FFX_ParallelSort_Count_uint(localID, groupID, parameters.cb, parameters.shift, src, sums);
