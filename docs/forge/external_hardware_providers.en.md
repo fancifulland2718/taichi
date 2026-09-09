@@ -1012,8 +1012,8 @@ Recommended adapter policy:
 ### AmgX recommended configuration
 
 AmgX is a full configurable algebraic-multigrid/Krylov solver, not a kernel
-intrinsic. Build it as an application dependency from an NVIDIA release whose
-CUDA and architecture support matches the deployment:
+intrinsic. Use a compatible user-installed library, or build an official NVIDIA
+release whose CUDA and architecture support matches the deployment:
 
 ```bash
 cmake -S . -B build \
@@ -1081,6 +1081,15 @@ readback is hidden inside binding. No vendor speedup or peak-VRAM reduction is
 implied by accepting device buffers: measure the actual configured AmgX build
 and application workload. Vendor hierarchy, vector copies and internal
 workspace still contribute to VRAM.
+
+Forge owns the thin adapter, buffer/lifetime integration, and its diagnostic
+call policy, not an AmgX fork.
+Local Windows checks with unmodified AmgX 2.5.0 exercised f32/f64 device inputs,
+coefficient updates, and subsequent GPU consumers. Traces showed reduced bulk
+host/device transfers, not a faster Krylov algorithm or lower vendor workspace.
+AMG coefficient setup can still allocate temporary storage and synchronize
+internally even when inputs reside on the GPU. These vendor costs do not imply
+that Forge requires patched libraries or changes the caller's solver settings.
 
 `replace_coefficients()` always refreshes solver setup after replacing numeric
 values. The adapter uses `AMGX_solver_resetup` when that optional/deprecated C

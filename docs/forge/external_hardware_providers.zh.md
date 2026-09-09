@@ -821,7 +821,7 @@ Windows capture 已使用 cuTENSOR 2.7/CUDA 13 验证，不代表所有支持的
 
 ### AmgX 推荐配置
 
-AmgX 是完整、可配置的 algebraic-multigrid/Krylov solver，不是 kernel intrinsic。应从
+AmgX 是完整、可配置的 algebraic-multigrid/Krylov solver，不是 kernel intrinsic。可使用用户安装的兼容库，或从
 CUDA 与 architecture 支持匹配部署环境的 NVIDIA release，把它构建为应用依赖：
 
 ```bash
@@ -878,6 +878,11 @@ bind 时检查 dtype、shape 和 runtime owner 并持有数组，后续使用数
 device 输出复用既有 external-submission 生命周期追踪，不成为 Graph recording 或 CompileIQ 搜索项。
 CSR 拓扑仍在 host，bind 不暗中将 device 拓扑读回。接受 device 数组不等于已有加速或峰值显存下降证据，
 需对实际 AmgX build、配置和应用 workload 测量；vendor hierarchy、向量副本和内部 workspace 仍占显存。
+
+Forge 拥有薄 adapter、buffer/生命周期接入及其诊断调用策略，不维护 AmgX fork。本机 Windows 使用未经修改的 AmgX 2.5.0
+检查了 f32/f64 device 输入、系数更新及后续 GPU 消费；trace 显示收益来自减少大数组 host/device 往返，
+不是 Krylov 算法加速或 vendor workspace 减少。即使输入驻留 GPU，AMG 系数 setup 内部仍可能分配临时空间和
+同步。这些 vendor 成本不意味着 Forge 要求魔改外部库，也不会使 Forge 自动修改调用者的 solver 配置。
 
 `replace_coefficients()` 在替换数值后总会刷新 solver setup。vendor 导出可选/已弃用的
 `AMGX_solver_resetup` C symbol 时，adapter 使用该 fast path；否则执行完整的
