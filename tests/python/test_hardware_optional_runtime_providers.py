@@ -45,6 +45,7 @@ class _FakeRuntime:
             "build_version": "test-build",
         }
         self.execution_api = execution_api
+        self.loaded = SimpleNamespace(api=SimpleNamespace(info=SimpleNamespace(features=0)))
         self.closed = False
 
     def query_execution_api(self, _api_type):
@@ -509,7 +510,7 @@ def amgx_device_contract(monkeypatch):
     """ABI pointer/lifetime fixture, not vendor correctness or performance evidence."""
     program = _FakeProgram()
     registered = []
-    state = SimpleNamespace(values=None, dtype=None, calls=[], fail=False, status=0)
+    state = SimpleNamespace(values=None, dtype=None, calls=[], fail=False, fail_replace=False, status=0, flags=0)
 
     class DeviceArray:
         def __init__(self, values):
@@ -528,6 +529,7 @@ def amgx_device_contract(monkeypatch):
         return np.ctypeslib.as_array((element * count).from_address(pointer))
 
     def create(_runtime, desc, handle):
+        state.flags = desc._obj.reserved
         state.dtype = np.float32 if desc._obj.value_type == 1 else np.float64
         state.values = read(desc._obj.values, desc._obj.nonzeros).copy()
         state.calls.append("create")
@@ -537,7 +539,7 @@ def amgx_device_contract(monkeypatch):
     def replace(_solver, pointer, count):
         state.values = read(pointer, count).copy()
         state.calls.append("replace")
-        return 0
+        return int(state.fail_replace)
 
     def solve(_solver, desc, info):
         state.calls.append(("solve", desc._obj.zero_initial_guess))
@@ -547,6 +549,7 @@ def amgx_device_contract(monkeypatch):
         info._obj.solve_status = state.status
         info._obj.iterations = 2
         info._obj.residual_norm = 0.0
+        info._obj.reserved = _amgx._RESIDUAL_NOT_COMPUTED if state.flags & _amgx._SKIP_RESIDUAL_NORM else 0
         return 0
 
     execution = SimpleNamespace(
@@ -557,6 +560,8 @@ def amgx_device_contract(monkeypatch):
         destroy_solver=lambda _solver: state.calls.append("destroy") or 0,
     )
     runtime = _FakeRuntime(execution)
+
+    runtime.loaded.api.info.features = _amgx._OPTIONAL_RESIDUAL_FEATURE
 
     def check(result):
         if result:
@@ -601,11 +606,15 @@ def test_amgx_device_binding_keeps_live_buffers_and_reuses_pointer_contract(amgx
     binding.replace_coefficients()
     result, _ = binding.solve()
     np.testing.assert_array_equal(result.data, [1, 2, 3])
-    assert env.state.calls == ["create", ("solve", 0), "replace", ("solve", 0)]
+    values.data *= 2
+    result, _ = binding.update_and_solve()
+    np.testing.assert_array_equal(result.data, [0.5, 1, 1.5])
+    assert env.state.calls == ["create", ("solve", 0), "replace", ("solve", 0), "replace", ("solve", 0)]
     # Creation, solve and update all retain device arrays through the existing
     # external submission owner. No new synchronization is added per vendor call.
-    assert len(env.program.submissions) == 4
-    assert env.program.synchronizations == 5  # provider, creation, 2 solves, update
+    assert len(env.program.submissions) == 5
+    assert env.program.synchronizations == 6  # combined update+solve waits only once
+    assert env.program.submissions[-1][0] == (values.arr, rhs.arr, solution.arr)
     with pytest.raises(ti.TaichiRuntimeError, match="resources are live"):
         env.provider.close()
     solver.close()
@@ -613,6 +622,8 @@ def test_amgx_device_binding_keeps_live_buffers_and_reuses_pointer_contract(amgx
         binding.solve()
     with pytest.raises(ti.TaichiRuntimeError, match="closed"):
         binding.replace_coefficients()
+    with pytest.raises(ti.TaichiRuntimeError, match="closed"):
+        binding.update_and_solve()
 
 
 def test_amgx_device_binding_rejects_wrong_shape_type_owner_and_device_topology(amgx_device_contract):
@@ -634,6 +645,8 @@ def test_amgx_device_binding_rejects_wrong_shape_type_owner_and_device_topology(
     binding = solver.bind_device(good, good)
     with pytest.raises(ti.TaichiRuntimeError, match="values="):
         binding.replace_coefficients()
+    with pytest.raises(ti.TaichiRuntimeError, match="values="):
+        binding.update_and_solve()
     binding.close()
     with pytest.raises(ti.TaichiRuntimeError, match="closed"):
         binding.solve()
@@ -664,4 +677,43 @@ def test_amgx_runtime_retirement_invalidates_bound_device_calls(amgx_device_cont
     assert solver.closed and env.provider.closed and env.runtime.closed
     with pytest.raises(ti.TaichiRuntimeError, match="reset"):
         saved_solve()
+    with pytest.raises(ti.TaichiRuntimeError, match="reset"):
+        binding.update_and_solve()
     assert env.state.calls == ["create", "destroy"]
+
+
+@pytest.mark.parametrize("failure", ["replace", "solve"])
+def test_amgx_combined_device_call_pins_all_buffers_on_failure(amgx_device_contract, failure):
+    env = amgx_device_contract
+    values, rhs, solution = (env.array(np.ones(3)) for _ in range(3))
+    solver = env.provider.solver([0, 1, 2, 3], [0, 1, 2], values, "config_version=2, solver=PCG")
+    binding = solver.bind_device(rhs, solution, values=values)
+    env.state.fail_replace = failure == "replace"
+    env.state.fail = failure == "solve"
+    before = env.program.synchronizations
+    with pytest.raises(ti.TaichiRuntimeError, match="vendor submission failed"):
+        binding.update_and_solve()
+    assert env.program.synchronizations == before + 1
+    assert env.program.submissions[-1] == ((values.arr, rhs.arr, solution.arr), True)
+    expected = ["create", "replace"] + ([("solve", 1)] if failure == "solve" else [])
+    assert env.state.calls == expected
+
+
+def test_amgx_residual_policy_is_cold_explicit_and_preserves_nonconvergence(amgx_device_contract):
+    env = amgx_device_contract
+    args = ([0, 1, 2, 3], [0, 1, 2], np.ones(3), "config_version=2, solver=PCG")
+    with pytest.raises(TypeError, match="compute_residual"):
+        env.provider.solver(*args, compute_residual=0)
+    env.provider._supports_optional_residual = False
+    with pytest.raises(ti.TaichiRuntimeError, match="update the Forge adapter"):
+        env.provider.solver(*args, compute_residual=False)
+    assert env.state.calls == []  # rejection precedes allocation/vendor invocation
+    env.provider._supports_optional_residual = True
+    solver = env.provider.solver(*args, compute_residual=False)
+    assert env.state.flags == _amgx._SKIP_RESIDUAL_NORM
+    env.state.status = 3
+    _, info = solver.solve(np.ones(3))
+    assert info["residual_norm"] is None and not info["converged"] and info["iterations"] == 2
+    bound = solver.bind_device(env.array(np.ones(3)), env.array(np.zeros(3)))
+    _, info = bound.solve()
+    assert info["residual_norm"] is None and info["solve_status"] == 3

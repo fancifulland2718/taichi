@@ -39,6 +39,10 @@ DEFINITION = BundledRuntimeProviderDefinition(
     supported_version_family="stable C API",
 )
 
+_OPTIONAL_RESIDUAL_FEATURE = 1 << 4
+_SKIP_RESIDUAL_NORM = 1
+_RESIDUAL_NOT_COMPUTED = 1
+
 
 class _SolverDesc(ctypes.Structure):
     _fields_ = [
@@ -155,7 +159,7 @@ def _solve_report(info):
             "solve_status": int(info.solve_status),
             "converged": int(info.solve_status) == 0,
             "iterations": int(info.iterations),
-            "residual_norm": float(info.residual_norm),
+            "residual_norm": None if info.reserved & _RESIDUAL_NOT_COMPUTED else float(info.residual_norm),
         }
     )
 
@@ -179,6 +183,7 @@ class AmgxProvider:
             raise TaichiRuntimeError(str(exc) or type(exc).__name__) from exc
         self._runtime = runtime
         self._execution_api = execution_api
+        self._supports_optional_residual = bool(runtime.loaded.api.info.features & _OPTIONAL_RESIDUAL_FEATURE)
         self._runtime_prog = program
         self._runtime_generation = int(impl.runtime_generation())
         self._lock = threading.RLock()
@@ -203,7 +208,12 @@ class AmgxProvider:
             raise TaichiRuntimeError("AmgxProvider has been closed")
         validate_runtime_generation(self, "AmgxProvider belongs to a previous Taichi runtime generation")
 
-    def solver(self, row_offsets, column_indices, values, config, *, config_file=False):
+    def solver(self, row_offsets, column_indices, values, config, *, config_file=False, compute_residual=True):
+        """Create a solver; optionally omit the adapter's extra full-residual pass.
+
+        This does not change vendor convergence tests. With compute_residual=False,
+        solve reports residual_norm=None and still returns status and iterations.
+        """
         with self._lock:
             self._validate_lifetime()
             return AmgxSolver(
@@ -213,6 +223,7 @@ class AmgxProvider:
                 values,
                 config,
                 config_file=config_file,
+                compute_residual=compute_residual,
             )
 
     def close(self):
@@ -263,9 +274,16 @@ class AmgxProvider:
 class AmgxSolver:
     """Reusable scalar CSR solver with host topology and host/device values."""
 
-    def __init__(self, provider, row_offsets, column_indices, values, config, *, config_file):
+    def __init__(self, provider, row_offsets, column_indices, values, config, *, config_file, compute_residual=True):
         if not isinstance(provider, AmgxProvider):
             raise TypeError("provider must be an AmgxProvider")
+        if not isinstance(compute_residual, bool):
+            raise TypeError("compute_residual must be a bool")
+        if not compute_residual and not provider._supports_optional_residual:
+            raise TaichiRuntimeError(
+                "This Forge AmgX adapter cannot omit the residual pass; update the Forge adapter, "
+                "or keep compute_residual=True. No vendor library modification is required."
+            )
         rows = _contiguous(row_offsets, np.int32, "row_offsets")
         columns = _contiguous(column_indices, np.int32, "column_indices")
         if rows.size < 2:
@@ -299,7 +317,7 @@ class AmgxSolver:
             ctypes.sizeof(_SolverDesc),
             1 if dtype == np.float32 else 2,
             int(config_file),
-            0,
+            0 if compute_residual else _SKIP_RESIDUAL_NORM,
             row_count,
             nonzeros,
             rows.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
@@ -399,14 +417,7 @@ class AmgxSolver:
                 )
             except RuntimeError as exc:
                 raise TaichiRuntimeError(str(exc)) from exc
-            return solution_array, MappingProxyType(
-                {
-                    "solve_status": int(info.solve_status),
-                    "converged": int(info.solve_status) == 0,
-                    "iterations": int(info.iterations),
-                    "residual_norm": float(info.residual_norm),
-                }
-            )
+            return solution_array, _solve_report(info)
 
     def bind_device(self, rhs, solution, *, values=None, zero_initial_guess=True):
         """Bind fixed CUDA vectors, optionally coefficients, without host staging.
@@ -417,22 +428,30 @@ class AmgxSolver:
         """
         return AmgxDeviceBinding(self, rhs, solution, values=values, zero_initial_guess=zero_initial_guess)
 
-    def _solve_device(self, desc, rhs, solution):
+    def _solve_device(self, desc, solution, resources, solve_call):
         # AmgX has no public stream setter. Complete Forge producers before the
         # vendor call; pin its default-stream output even if a vendor call fails.
         self._runtime_prog.synchronize()
         info = _SolveInfo()
         info.struct_size = ctypes.sizeof(_SolveInfo)
         try:
-            with external_cuda_submission(self._runtime_prog, (rhs, solution)) as submission:
+            with external_cuda_submission(self._runtime_prog, resources) as submission:
                 self.provider._runtime.check_result(
-                    submission.invoke(
-                        self.provider._execution_api.solve, self._handle, ctypes.byref(desc), ctypes.byref(info)
-                    )
+                    submission.invoke(solve_call, self._handle, ctypes.byref(desc), ctypes.byref(info))
                 )
         except RuntimeError as exc:
             raise TaichiRuntimeError(str(exc)) from exc
         return solution, _solve_report(info)
+
+    def _replace_and_solve(self, values_pointer, handle, desc, info):
+        # Both calls are AmgX-owned ordered operations; this sequence inserts no
+        # Forge work between them. As for individual calls, callers must not
+        # mutate bound arrays concurrently. The outer submission pins all
+        # buffers even if replacement fails after issuing vendor work.
+        self.provider._runtime.check_result(
+            self.provider._execution_api.replace_coefficients(handle, values_pointer, self.nonzeros)
+        )
+        return self.provider._execution_api.solve(handle, desc, info)
 
     def _replace_device(self, pointer, resources):
         self._runtime_prog.synchronize()
@@ -508,11 +527,24 @@ class AmgxDeviceBinding:
             )
             desc = _SolveDesc(ctypes.sizeof(_SolveDesc), int(zero_initial_guess), rhs_ptr, solution_ptr)
             self._solver = solver
-            self._solve_action = partial(solver._solve_device, desc, rhs, solution)
+            self._solve_action = partial(
+                solver._solve_device, desc, solution, (rhs, solution), solver.provider._execution_api.solve
+            )
             self._replace_action = (
                 _missing_device_coefficients
                 if values is None
                 else partial(solver._replace_device, values_ptr, (values,))
+            )
+            self._update_solve_action = (
+                _missing_device_coefficients
+                if values is None
+                else partial(
+                    solver._solve_device,
+                    desc,
+                    solution,
+                    (values, rhs, solution),
+                    partial(solver._replace_and_solve, values_ptr),
+                )
             )
             solver._device_bindings.add(self)
 
@@ -526,10 +558,20 @@ class AmgxDeviceBinding:
             self._replace_action()
         return self
 
+    def update_and_solve(self):
+        """Refresh bound coefficients then solve with one Forge producer wait.
+
+        Vendor setup and solve still run in order, with their normal convergence
+        checks. Use this when no Forge work is needed between those operations.
+        """
+        with self._solver.provider._lock, self._solver._lock:
+            return self._update_solve_action()
+
     def close(self):
         with self._solver.provider._lock, self._solver._lock:
             self._solve_action = _closed_device_binding
             self._replace_action = _closed_device_binding
+            self._update_solve_action = _closed_device_binding
 
 
 __all__ = (

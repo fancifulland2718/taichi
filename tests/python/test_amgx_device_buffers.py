@@ -16,7 +16,8 @@ from tests import test_utils
 )
 @test_utils.test(arch=ti.cuda, offline_cache=False)
 @pytest.mark.parametrize("rows,dtype", [(1024, np.float32), (32768, np.float64)])
-def test_amgx_device_producers_updates_and_solution_consumer(rows, dtype):
+@pytest.mark.parametrize("compute_residual", [True, False])
+def test_amgx_device_producers_updates_and_solution_consumer(rows, dtype, compute_residual):
     scalar = ti.f32 if dtype == np.float32 else ti.f64
     offsets = np.empty(rows + 1, dtype=np.int32)
     offsets[0] = 0
@@ -71,18 +72,27 @@ def test_amgx_device_producers_updates_and_solution_consumer(rows, dtype):
     produce(values, rhs, 4.0, 1.0)
     solution.fill(0)
     with ti.hardware.linalg.AmgxProvider(os.environ["TI_FORGE_TEST_AMGX_LIBRARY_PATH"]) as provider:
-        with provider.solver(offsets, columns, values, config) as solver:
+        with provider.solver(offsets, columns, values, config, compute_residual=compute_residual) as solver:
             binding = solver.bind_device(rhs, solution, values=values, zero_initial_guess=False)
             for iteration in range(3):
                 diagonal, scale = 4.0 + iteration, 1.0 + iteration
                 produce(values, rhs, diagonal, scale)
-                if iteration:
+                if iteration == 1:
                     binding.replace_coefficients()
-                result, info = binding.solve()
+                result, info = binding.update_and_solve() if iteration == 2 else binding.solve()
                 assert result is solution and info["converged"]
+                assert (info["residual_norm"] is not None) == compute_residual
                 consume(solution, output)  # No user synchronization between vendor output and GPU consumer.
                 expected = 2 * scale * (1.0 + 0.001 * (np.arange(rows) % 31))
                 tolerance = 2e-5 if dtype == np.float32 else 1e-9
                 np.testing.assert_allclose(output.to_numpy(), expected, rtol=tolerance, atol=tolerance)
+            # A stale solution must still be cleared by zero-initial-guess solve.
+            zero_binding = solver.bind_device(rhs, solution)
+            solution.fill(100)
+            result, info = zero_binding.solve()
+            np.testing.assert_allclose(result.to_numpy(), expected / 2, rtol=tolerance, atol=tolerance)
+            host_result, host_info = solver.solve(rhs.to_numpy())
+            assert host_info["converged"] and (host_info["residual_norm"] is not None) == compute_residual
+            np.testing.assert_allclose(host_result, expected / 2, rtol=tolerance, atol=tolerance)
         with pytest.raises(ti.TaichiRuntimeError, match="closed"):
             binding.solve()

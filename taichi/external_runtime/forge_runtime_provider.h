@@ -44,6 +44,7 @@ typedef enum TiForgeRuntimeProviderFeature {
   TI_FORGE_RUNTIME_PROVIDER_FEATURE_REQUIRED_SYMBOL_AUDIT = 1ull << 1,
   TI_FORGE_RUNTIME_PROVIDER_FEATURE_TRANSIENT_PROBE = 1ull << 2,
   TI_FORGE_RUNTIME_PROVIDER_FEATURE_EXECUTION_API = 1ull << 3,
+  TI_FORGE_RUNTIME_PROVIDER_FEATURE_AMGX_OPTIONAL_RESIDUAL = 1ull << 4,
 } TiForgeRuntimeProviderFeature;
 
 typedef struct TiForgeRuntimeProviderInfo {
@@ -282,10 +283,21 @@ typedef enum TiForgeAmgxConfigSource {
   TI_FORGE_AMGX_CONFIG_FILE = 1,
 } TiForgeAmgxConfigSource;
 
+/* The optional policy is owned by the Forge adapter, not the vendor config.
+ * Query AMGX_OPTIONAL_RESIDUAL before using these formerly reserved bits. */
+typedef enum TiForgeAmgxSolverFlags {
+  TI_FORGE_AMGX_SOLVER_SKIP_RESIDUAL_NORM = 1u << 0,
+} TiForgeAmgxSolverFlags;
+
+typedef enum TiForgeAmgxSolveInfoFlags {
+  TI_FORGE_AMGX_RESIDUAL_NOT_COMPUTED = 1u << 0,
+} TiForgeAmgxSolveInfoFlags;
+
 typedef struct TiForgeAmgxSolverDesc {
   uint32_t struct_size;
   uint32_t value_type;
   uint32_t config_source;
+  /* TiForgeAmgxSolverFlags; zero retains the original full-residual policy. */
   uint32_t reserved;
   int32_t rows;
   int32_t nonzeros;
@@ -309,6 +321,7 @@ typedef struct TiForgeAmgxSolveInfo {
   uint32_t struct_size;
   uint32_t solve_status;
   int32_t iterations;
+  /* TiForgeAmgxSolveInfoFlags; omitted residual_norm is NaN, not cached. */
   uint32_t reserved;
   double residual_norm;
 } TiForgeAmgxSolveInfo;

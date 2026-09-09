@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <mutex>
 #include <memory>
 #include <new>
@@ -34,7 +35,10 @@ constexpr uint64_t kFeatures =
     TI_FORGE_RUNTIME_PROVIDER_FEATURE_VERSION_QUERY |
     TI_FORGE_RUNTIME_PROVIDER_FEATURE_REQUIRED_SYMBOL_AUDIT |
     TI_FORGE_RUNTIME_PROVIDER_FEATURE_TRANSIENT_PROBE |
-    TI_FORGE_RUNTIME_PROVIDER_FEATURE_EXECUTION_API;
+    TI_FORGE_RUNTIME_PROVIDER_FEATURE_EXECUTION_API |
+    (TI_FORGE_RUNTIME_PROVIDER_KIND == 3
+         ? TI_FORGE_RUNTIME_PROVIDER_FEATURE_AMGX_OPTIONAL_RESIDUAL
+         : 0ull);
 
 #if TI_FORGE_RUNTIME_PROVIDER_KIND == 1
 constexpr char kProviderId[] = "cusparselt";
@@ -106,7 +110,7 @@ constexpr char kProviderId[] = "amgx";
 constexpr char kProviderName[] = "NVIDIA AmgX";
 constexpr char kSupportedVersionFamily[] = "stable C API";
 constexpr char kBuildIdentity[] =
-    "forge-runtime-provider-abi2-amgx-stable-c-api";
+    "forge-runtime-provider-abi2-amgx-stable-c-api-residual-policy";
 constexpr const char *kWindowsCandidates[] = {"amgxsh.dll"};
 constexpr const char *kLinuxCandidates[] = {"libamgxsh.so"};
 constexpr const char *kRequiredSymbols[] = {
@@ -1414,6 +1418,7 @@ struct AmgxSolver {
   int value_type{0};
   int mode{0};
   bool setup_valid{false};
+  bool compute_residual{true};
   void *config{nullptr};
   void *resources{nullptr};
   void *matrix{nullptr};
@@ -1478,6 +1483,7 @@ TiForgeRuntimeProviderResult amgx_create_solver(
       (desc->value_type != TI_FORGE_AMGX_VALUE_F32 &&
        desc->value_type != TI_FORGE_AMGX_VALUE_F64) ||
       desc->config_source > TI_FORGE_AMGX_CONFIG_FILE ||
+      (desc->reserved & ~TI_FORGE_AMGX_SOLVER_SKIP_RESIDUAL_NORM) != 0 ||
       desc->row_offsets[0] != 0 ||
       desc->row_offsets[desc->rows] != desc->nonzeros) {
     return fail(TI_FORGE_RUNTIME_PROVIDER_ERROR_INVALID_ARGUMENT,
@@ -1511,6 +1517,8 @@ TiForgeRuntimeProviderResult amgx_create_solver(
   solver->nonzeros = desc->nonzeros;
   solver->value_type = desc->value_type;
   solver->mode = desc->value_type == TI_FORGE_AMGX_VALUE_F64 ? 8193 : 8465;
+  solver->compute_residual =
+      (desc->reserved & TI_FORGE_AMGX_SOLVER_SKIP_RESIDUAL_NORM) == 0;
   auto symbol = [&](const char *name) {
     return load_symbol(runtime->library, name);
   };
@@ -1655,6 +1663,8 @@ TiForgeRuntimeProviderResult amgx_solve(TiForgeAmgxSolver solver_value,
   }
   int status = 0;
   if (desc->zero_initial_guess != 0) {
+    // xIsZero allows the solver to skip forming the initial residual; it does
+    // not guarantee that PCG's first axpy initializes the solution vector.
     status = solver->vector_zero(solver->solution, solver->rows, 1);
     if (status == 0) {
       status =
@@ -1672,8 +1682,8 @@ TiForgeRuntimeProviderResult amgx_solve(TiForgeAmgxSolver solver_value,
   }
   int iterations = 0;
   int solve_status = 1;
-  float residual_norm_f32 = 0.0f;
-  double residual_norm_f64 = 0.0;
+  float residual_norm_f32 = std::numeric_limits<float>::quiet_NaN();
+  double residual_norm_f64 = std::numeric_limits<double>::quiet_NaN();
   void *residual_norm = solver->value_type == TI_FORGE_AMGX_VALUE_F32
                             ? static_cast<void *>(&residual_norm_f32)
                             : static_cast<void *>(&residual_norm_f64);
@@ -1681,9 +1691,10 @@ TiForgeRuntimeProviderResult amgx_solve(TiForgeAmgxSolver solver_value,
               "iteration query") != TI_FORGE_RUNTIME_PROVIDER_SUCCESS ||
       checked(solver->get_status(solver->solver, &solve_status),
               "status query") != TI_FORGE_RUNTIME_PROVIDER_SUCCESS ||
-      checked(solver->residual(solver->solver, solver->matrix, solver->rhs,
+      (solver->compute_residual &&
+       checked(solver->residual(solver->solver, solver->matrix, solver->rhs,
                                solver->solution, residual_norm),
-              "residual query") != TI_FORGE_RUNTIME_PROVIDER_SUCCESS ||
+               "residual query") != TI_FORGE_RUNTIME_PROVIDER_SUCCESS) ||
       checked(solver->vector_download(solver->solution, desc->solution),
               "solution download") != TI_FORGE_RUNTIME_PROVIDER_SUCCESS) {
     return TI_FORGE_RUNTIME_PROVIDER_ERROR_VENDOR_CALL;
@@ -1692,7 +1703,11 @@ TiForgeRuntimeProviderResult amgx_solve(TiForgeAmgxSolver solver_value,
                                        ? static_cast<double>(residual_norm_f32)
                                        : residual_norm_f64;
   *out_info = {sizeof(*out_info), static_cast<uint32_t>(solve_status),
-               iterations, 0, reported_residual};
+               iterations,
+               solver->compute_residual
+                   ? 0u
+                   : static_cast<uint32_t>(TI_FORGE_AMGX_RESIDUAL_NOT_COMPUTED),
+               reported_residual};
   return TI_FORGE_RUNTIME_PROVIDER_SUCCESS;
 }
 
