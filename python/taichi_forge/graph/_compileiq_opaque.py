@@ -828,10 +828,10 @@ class _CompleteGraphRecipeSearchSessionV2:
                 # V2 memory budget sees the evaluated physical instance rather
                 # than the empty pre-binding shell.
                 from taichi_forge.graph._recipes.physical import (
-                    observe_graph_physical_manifest,
+                    CompiledGraphPhysicalManifest,
                 )
 
-                manifest = observe_graph_physical_manifest(
+                manifest = CompiledGraphPhysicalManifest.from_graph(
                     self._plans._definition,
                     recipe,
                     materialized.executor,

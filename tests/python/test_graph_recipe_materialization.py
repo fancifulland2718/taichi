@@ -39,6 +39,45 @@ from taichi_forge.graph._recipes import (
 from tests import test_utils
 
 
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_external_compiled_graph_observation_and_post_evaluator_memory():
+    import numpy as np
+    from taichi_forge.examples.graph.complete_recipe_provider import AffineProvider, make_builder
+
+    definition = make_builder().freeze()
+    provider = AffineProvider(definition)
+    source, output = ti.ndarray(ti.i32, 257), ti.ndarray(ti.i32, 257)
+    expected = np.arange(257, dtype=np.int32) * 2 + 1
+    observed = []
+
+    def evaluate(graph, recipe):
+        source.from_numpy(np.arange(257, dtype=np.int32))
+        graph.run(graph.bind({"source": source, "output": output}))
+        np.testing.assert_array_equal(output.to_numpy(), expected)
+        observed.append(recipe.recipe_id)
+        return {"dispatches": float(graph.physical_plan()["physical_dispatch_count"])}
+
+    result = definition.search_recipes(
+        providers=(provider,),
+        budget=ti.graph.GraphSearchBudget(evaluation_limit=8),
+        target=ti.graph.GraphOptimizationTarget(objectives=(("dispatches", "min"),)),
+    ).run(evaluate)
+    assert result.status == "selected"
+    assert len(set(observed)) == 2  # Both actually execute, not merely admitted.
+    assert not result.selection.manifest.is_baseline
+    with definition.materialize(result.selection) as materialized:
+        assert materialized.manifest.tasks  # One DSL dispatch may contain several native tasks.
+        assert materialized.manifest.provenance["semantic_mapping"] == "provider_declared_whole_graph"
+        assert materialized.executor.definition is not definition
+        assert evaluate(materialized.executor, result.selection) == {"dispatches": 1.0}
+        with pytest.raises(GraphPhysicalManifestError, match="whole-Graph"):
+            CompiledGraphPhysicalManifest.from_graph(
+                definition,
+                definition.recipe_catalog(providers=()).baseline.recipe,
+                materialized.executor,
+            )
+
+
 def _definition():
     nodes = (
         DispatchNode(

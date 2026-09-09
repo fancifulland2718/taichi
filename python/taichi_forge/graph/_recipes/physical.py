@@ -1,6 +1,6 @@
 """Backend-neutral manifests for materialized complete Graph recipes."""
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 
 from taichi_forge.graph._ir import ResourceEffect
 from taichi_forge.graph._recipes.definition import _canonical_json, _digest
@@ -656,6 +656,47 @@ class CompiledGraphPhysicalManifest:
     command_topology_exact: bool
     allocation_topology_exact: bool
     _provenance_json: str = field(default="{}", repr=False)
+
+    @classmethod
+    def from_graph(cls, definition, recipe, graph):
+        """Observe a provider-built Forge Graph at the materialization boundary.
+
+        This describes actual compiled work; it does not prove that an external
+        provider's replacement implements the requested mathematical semantics.
+        No observation is installed in Graph replay.
+        """
+        if graph.definition is definition:
+            return observe_graph_physical_manifest(definition, recipe, graph)
+        from taichi_forge.graph._recipes.providers import PROVIDER_OWNED_WHOLE_GRAPH_V1
+
+        if recipe.assembly_protocol != PROVIDER_OWNED_WHOLE_GRAPH_V1:
+            raise GraphPhysicalManifestError("replacement Graph requires whole-Graph provider assembly")
+        actual_definition = graph.definition
+        if actual_definition is None:
+            raise GraphPhysicalManifestError("freeze the replacement Graph before compiling it")
+        if _definition_binding_manifest(actual_definition) != _definition_binding_manifest(definition):
+            raise GraphPhysicalManifestError("replacement Graph binding ABI differs from definition")
+        baseline = actual_definition.recipe_catalog(providers=()).baseline.recipe
+        observed = observe_graph_physical_manifest(actual_definition, baseline, graph)
+        # Physical topology is observed on the actual replacement, while the
+        # mapping to original semantics is a whole-Graph provider declaration.
+        # Do not mutate either definition or install this mapping in replay.
+        coverage = tuple(sorted({region_id for step in recipe.execution_steps for region_id in step.region_ids}))
+        return cls.create(
+            definition, recipe, backend=observed.backend,
+            kernels=observed.kernels,
+            tasks=tuple(replace(task, region_ids=coverage) for task in observed.tasks),
+            commands=observed.commands, submissions=observed.submissions,
+            resources=observed.resources, binding_abi=observed.binding_abi,
+            task_topology_exact=observed.task_topology_exact,
+            command_topology_exact=observed.command_topology_exact,
+            allocation_topology_exact=observed.allocation_topology_exact,
+            provenance={
+                **observed.provenance,
+                "semantic_mapping": "provider_declared_whole_graph",
+                "replacement_semantic_graph_id": actual_definition.semantic_graph_id,
+            },
+        )
 
     @classmethod
     def create(

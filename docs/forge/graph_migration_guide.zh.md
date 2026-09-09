@@ -11,6 +11,10 @@
 使用 dense Field 的用户还应阅读 [Dense Field Graph](dense_field_graph.zh.md)中的
 静态 binding 合同。
 
+`0.6.3` 新接入请阅读[完整 recipe 与外部 provider 指南](graph_recipe_integration.zh.md)：
+`freeze/search/resolve` 是显式离线流程，不改变原 `compile/run` 或 runtime `auto`。
+部分搜索结果、跨进程合同和物化 handle 与执行器的区别均在该指南说明。
+
 Forge-only graph 与 native replay API 的精确签名见
 [Forge API 参考](forge_api_reference.zh.md)。
 

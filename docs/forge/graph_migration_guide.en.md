@@ -1,5 +1,9 @@
 # Graph Compatibility and Migration Guide
 
+For the `0.6.3` complete-recipe workflow, see the
+[integration and external provider guide](graph_recipe_integration.en.md).
+Explicit offline freeze/search/resolve does not change ordinary compile/run or runtime auto.
+
 > The base Graph modernization and native replay model shipped in `0.4.1`.
 > Dense Field Graph, replay lifetime hardening, diagnostics, and stricter
 > concurrency/AD contracts are `0.5.0` work. See

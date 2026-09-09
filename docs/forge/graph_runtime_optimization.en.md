@@ -873,9 +873,19 @@ session = definition.search_recipes(
     budget=budget,
 )
 decision = session.run(evaluator)
-materialized = definition.materialize(decision.selection)
-physical_report = materialized.materialization_report()
+if decision.status == "selected":
+    with definition.materialize(decision.selection) as materialized:
+        physical_report = materialized.materialization_report()
+        # Use materialized.executor.bind/run; the handle owns materialization.
+else:
+    print(decision.status, decision.next_action)
 ```
+
+This minimal example omits workload/evaluation/backend-environment contracts,
+so measurement reuse is `session_only`. Supply all three explicitly for
+cross-process resume and evidence applicability; see the
+[integration and provider guide](graph_recipe_integration.en.md).
+`materialize(None)` explicitly requests the baseline, not an optimization result.
 
 The evaluator receives `(graph, recipe_handle)` and returns the named target
 metrics. When requested and not supplied by the evaluator, Forge fills

@@ -679,9 +679,18 @@ session = definition.search_recipes(
     budget=budget,
 )
 decision = session.run(evaluator)
-materialized = definition.materialize(decision.selection)
-physical_report = materialized.materialization_report()
+if decision.status == "selected":
+    with definition.materialize(decision.selection) as materialized:
+        physical_report = materialized.materialization_report()
+        # 使用 materialized.executor.bind/run；handle 管理物化资源生命周期。
+else:
+    print(decision.status, decision.next_action)
 ```
+
+这个最小示例省略 workload/evaluation/backend-environment 合同，因此测量复用范围为 `session_only`。
+需要跨进程 resume 或测量适用性判断时，必须显式提供这三项；见
+[下游接入与 provider 指南](graph_recipe_integration.zh.md)。`materialize(None)` 明确表示 baseline，
+不是“搜索失败时自动采用优化结果”。
 
 evaluator 接收 `(graph, recipe_handle)` 并返回 target 中声明的命名指标；请求
 `materialized_memory_bytes` 且 evaluator 未提供该值时，Forge 注入 evaluator 结束后观测到的已知
