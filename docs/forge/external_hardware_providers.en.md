@@ -1306,6 +1306,93 @@ implementation. Local Windows comparisons found device regressions, so ordinary
 `ti.algorithms.sort` remains unchanged. No production speedup, AMD-wide advantage,
 Linux qualification, or complete-recipe search support is implied.
 
+## CUTLASS C++ complete matmul addon
+
+`ti.hardware.source_providers.CutlassMatmulRecipeProvider` discovers prepared
+`ti.linalg.record_matmul` regions and uses the existing addon C ABI to capture
+complete CUDA Graph regions at a cold boundary. It is not an ordinary matmul
+auto route. CompileIQ sees complete recipes, not library names, tiles, or split
+counts. Forge's main compilation path remains unchanged; NVCC builds only the
+explicit, separately owned addon.
+
+The current scope is one matrix operation on compact scalar f32 ndarrays,
+either operand's transposed storage, identity/ReLU, and
+`D := activation(alpha * op(A) @ op(B) + beta * D)`. Inputs stay live across
+replay; output must not alias either input. SIMT f32 does not silently switch
+to TF32, but split-K reassociates accumulation. Applications must validate finite
+inputs against their declared tolerances. Batching/rank extensions, other dtypes,
+arbitrary epilogues, and the CuTe Python DSL are outside this addon.
+
+| Complete physical strategy | GPU stages | Current requested scratch |
+| --- | --- | --- |
+| Direct fused | GEMM + epilogue, one kernel | Zero |
+| Lower-workspace split-K | Partial products → reduction + epilogue, two kernels | `64 * m * n` bytes |
+| Wider-parallelism split-K | More partial products → reduction + epilogue, two kernels | `512 * m * n` bytes |
+
+These sizes describe the implementation, not a stable kernel-configuration API.
+The explicit `workspace_limit_bytes` candidate budget defaults to 32 MiB.
+Strategies exceeding it are not generated. More partitions can increase global
+memory traffic and reduction work enough to outweigh the parallelism benefit.
+
+Building requires caller-owned CUTLASS C++ sources, compatible CUDA Toolkit/NVCC,
+and a host compiler. Windows local checks used CUTLASS 4.6.2. For example, from an
+MSVC-configured shell in a source checkout:
+
+```powershell
+python python/taichi_forge/hardware/source_providers/cutlass/build.py `
+  --cutlass-root D:/dependencies/cutlass-4.6.2 `
+  --nvcc C:/CUDA/bin/nvcc.exe --target-code sm_120 `
+  --output D:/addons/cutlass
+```
+
+`sm_120` is an example target, not a universal deployment choice. The builder
+downloads nothing and does not instantiate the full CUTLASS profiler. It emits
+the standalone binary, source-provider manifest, and `CUTLASS-LICENSE.txt`.
+The manifest binds the entire header tree, binary, NVCC/PTXAS, static CUDART,
+SM/PTX targets, and declared driver path, without pinning Forge's commit HEAD.
+Static linkage does not remove Toolkit/driver compatibility requirements. The
+addon is not a mandatory portable-wheel dependency and is not loaded on import.
+
+The compiled addon itself does not require a runtime Toolkit compiler, but its
+GPU and driver must satisfy the manifest. This integration reuses cuBLASLt-based
+semantic preparation and the existing baseline, so a complete search still needs
+a compatible, user-configured cuBLASLt runtime. The entire example is therefore
+not a driver-only deployment.
+
+```python
+from taichi_forge.hardware.source_providers import CutlassMatmulRecipeProvider
+
+provider = CutlassMatmulRecipeProvider(
+    "D:/addons/cutlass/cutlass_source_provider.json",
+    workspace_limit_bytes=32 << 20,
+)
+operation = ti.linalg.record_matmul(
+    m, n, k, activation="relu",
+    absolute_tolerance=5e-5, relative_tolerance=5e-5,
+)
+operation.prepare(heuristic_limit=2)
+builder = ti.graph.GraphBuilder()
+builder.append_native(operation)
+definition = builder.freeze()
+providers = (
+    *ti.graph.default_recipe_providers(),
+    ti.hardware.linalg.MatmulRecipeProvider(),  # retain existing alternatives
+    provider,
+)
+session = definition.search_recipes(providers=providers, target=target, budget=budget)
+decision = session.run(evaluator)  # application-owned comparable observations
+```
+
+Reports retain complete-recipe identities, resource facts, and source-build
+provenance. Resolving a saved selection requires a compatible provider again.
+Library/ABI/shape/alias checks, scratch allocation, and C ABI calls occur during
+preparation, binding, or capture, not steady replay. Replay has no Python provider
+callback or added synchronization. Requested scratch is not total VRAM: driver
+module state remains unknown, and the runtime allocator may retain a retired
+trial's high-water allocation for reuse. Local evidence shows size-dependent
+tradeoffs, not superiority over all cuBLASLt strategies. Defaults are unchanged;
+no Linux, release-qualification, or production-acceleration claim is added.
+
 ## Official references
 
 - [cuDSS documentation](https://docs.nvidia.com/cuda/cudss/index.html)
@@ -1317,3 +1404,5 @@ Linux qualification, or complete-recipe search support is implied.
 - [CUDA compiler Advanced Controls](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/nvcc.html)
 - [NVIDIA CompileIQ](https://developer.nvidia.com/cuda/compileiq)
 - [FidelityFX Parallel Sort source and MIT license](https://github.com/GPUOpen-Effects/FidelityFX-ParallelSort)
+- [CUTLASS C++ Windows build](https://docs.nvidia.com/cutlass/4.6.2/media/docs/cpp/build/building_in_windows_with_visual_studio.html)
+- [CUTLASS 4.6.2 source and BSD-3-Clause license](https://github.com/NVIDIA/cutlass/tree/v4.6.2)

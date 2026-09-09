@@ -1058,6 +1058,75 @@ scratch 及紧凑 histogram/scan table；报告不包含调用者存储、alloca
 较低 workspace、保留 host 录制与 device 工作量之间存在取舍：本地 Windows 对照发现 device 负向，因此不替换
 默认 `ti.algorithms.sort`。不据此声明生产加速、所有 AMD 设备更快、Linux 资格或完整 recipe 搜索支持。
 
+## CUTLASS C++：可选的完整矩阵区域 addon
+
+`ti.hardware.source_providers.CutlassMatmulRecipeProvider` 从已准备的
+`ti.linalg.record_matmul` 发现完整矩阵区域，通过现有 addon C ABI 在冷边界捕获 CUDA Graph。
+它不是普通 matmul 的自动路由，也不把 library、tile 或 split 数量作为 CompileIQ 裸轴。
+Forge 主编译路径不因此改为 `.cu`；NVCC 只用于调用者显式构建这个独立 addon。
+
+当前支持单矩阵、compact scalar f32 ndarray、两输入各自的转置存储、identity/ReLU，以及
+`D := activation(alpha * op(A) @ op(B) + beta * D)`。输入可在 replay 之间更新，输出不得与输入别名。
+SIMT f32 不隐式改用 TF32，但 split-K 会重排浮点求和；有限输入和调用者声明的误差容限仍需实际应用验证。
+batched/rank 扩展、其他 dtype、任意 epilogue、CuTe Python DSL 不在此接口范围内。
+
+| 完整物理方案 | GPU 阶段 | 当前请求工作区 |
+| --- | --- | --- |
+| 直接融合 | GEMM + epilogue，1 kernel | 0 |
+| 较低工作区的 split-K | 部分积 → 归约 + epilogue，2 kernels | `64 * m * n` bytes |
+| 较宽并行度的 split-K | 更多部分积 → 归约 + epilogue，2 kernels | `512 * m * n` bytes |
+
+这些大小描述当前实现，不是稳定的 kernel 配置 API。`workspace_limit_bytes` 是显式候选资源预算，默认
+32 MiB；超过预算的方案不生成。更多分区不保证更快，额外的部分积写入/读取和归约可能成为主要成本。
+
+构建需要调用者提供 CUTLASS C++ 源码、兼容的 CUDA Toolkit/NVCC 与 host compiler；Windows 本地检查使用
+CUTLASS 4.6.2。在配置好 MSVC 的 shell 中，例如：
+
+```powershell
+python python/taichi_forge/hardware/source_providers/cutlass/build.py `
+  --cutlass-root D:/dependencies/cutlass-4.6.2 `
+  --nvcc C:/CUDA/bin/nvcc.exe --target-code sm_120 `
+  --output D:/addons/cutlass
+```
+
+`sm_120` 只是目标示例，应与部署 GPU 匹配。builder 不下载 SDK，不构建 CUTLASS 全量 profiler；输出独立
+DLL/共享库、source-provider manifest 与 `CUTLASS-LICENSE.txt`。manifest 记录完整 headers tree、binary、
+NVCC/PTXAS、静态 CUDART、SM/PTX 和 driver 适用路径；不绑定 Forge commit HEAD。静态链接不意味着与
+Toolkit/driver 无关。该二进制不是 portable wheel 的必要依赖，普通 import 不加载它。
+
+addon 自身的执行不要求用户安装 Toolkit 编译器；仍需要符合 manifest 的 GPU/驱动。当前接入复用已有
+cuBLASLt 语义准备和 baseline，所以完整搜索还需要用户配置兼容的 cuBLASLt runtime，不能理解为整个示例仅需驱动。
+
+```python
+from taichi_forge.hardware.source_providers import CutlassMatmulRecipeProvider
+
+provider = CutlassMatmulRecipeProvider(
+    "D:/addons/cutlass/cutlass_source_provider.json",
+    workspace_limit_bytes=32 << 20,
+)
+operation = ti.linalg.record_matmul(
+    m, n, k, activation="relu",
+    absolute_tolerance=5e-5, relative_tolerance=5e-5,
+)
+operation.prepare(heuristic_limit=2)
+builder = ti.graph.GraphBuilder()
+builder.append_native(operation)
+definition = builder.freeze()
+providers = (
+    *ti.graph.default_recipe_providers(),
+    ti.hardware.linalg.MatmulRecipeProvider(),  # 同时保留已有完整物理方案
+    provider,
+)
+session = definition.search_recipes(providers=providers, target=target, budget=budget)
+decision = session.run(evaluator)  # 应用负责同输入、正确性、device/host/显存观测
+```
+
+报告沿用完整 recipe、物理 identity、资源和 source-build provenance；选择恢复时必须重新提供适用的 provider。
+库载入、ABI/shape/alias 检查、工作区申请和 C ABI 调用均在准备/绑定/捕获边界，steady replay 无 Python provider
+回调或新增同步。报告中的请求 workspace 不等于总显存：驱动模块开销未知，trial 退役后的 runtime 分配池可能
+保留高水位供复用。本地检查发现规模相关的性能/工作区取舍，未证明优于全部 cuBLASLt 策略；默认路线不变。
+本接口没有新增 Linux 或发行资格声明，生产收益由应用验证。
+
 ## 官方参考
 
 - [cuDSS 文档](https://docs.nvidia.com/cuda/cudss/index.html)
@@ -1069,3 +1138,5 @@ scratch 及紧凑 histogram/scan table；报告不包含调用者存储、alloca
 - [CUDA compiler Advanced Controls](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/nvcc.html)
 - [NVIDIA CompileIQ](https://developer.nvidia.com/cuda/compileiq)
 - [FidelityFX Parallel Sort 源码与 MIT 许可](https://github.com/GPUOpen-Effects/FidelityFX-ParallelSort)
+- [CUTLASS C++ Windows 构建](https://docs.nvidia.com/cutlass/4.6.2/media/docs/cpp/build/building_in_windows_with_visual_studio.html)
+- [CUTLASS 4.6.2 源码与 BSD-3-Clause 许可](https://github.com/NVIDIA/cutlass/tree/v4.6.2)
