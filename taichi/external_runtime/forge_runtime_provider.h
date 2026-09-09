@@ -45,6 +45,7 @@ typedef enum TiForgeRuntimeProviderFeature {
   TI_FORGE_RUNTIME_PROVIDER_FEATURE_TRANSIENT_PROBE = 1ull << 2,
   TI_FORGE_RUNTIME_PROVIDER_FEATURE_EXECUTION_API = 1ull << 3,
   TI_FORGE_RUNTIME_PROVIDER_FEATURE_AMGX_OPTIONAL_RESIDUAL = 1ull << 4,
+  TI_FORGE_RUNTIME_PROVIDER_FEATURE_AMGX_RETAINED_GUESS = 1ull << 5,
 } TiForgeRuntimeProviderFeature;
 
 typedef struct TiForgeRuntimeProviderInfo {
@@ -311,6 +312,9 @@ typedef struct TiForgeAmgxSolverDesc {
 
 typedef struct TiForgeAmgxSolveDesc {
   uint32_t struct_size;
+  /* 0: upload solution, 1: clear solution. 2: reuse solver-owned last solution;
+   * requires AMGX_RETAINED_GUESS and a previous successful solve on this solver.
+   * The retained guess belongs to the solver, not a caller output buffer. */
   uint32_t zero_initial_guess;
   /* Both buffers may be host or device memory; no stream/capture promise. */
   const void *rhs;

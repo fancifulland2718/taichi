@@ -40,6 +40,7 @@ DEFINITION = BundledRuntimeProviderDefinition(
 )
 
 _OPTIONAL_RESIDUAL_FEATURE = 1 << 4
+_RETAINED_GUESS_FEATURE = 1 << 5
 _SKIP_RESIDUAL_NORM = 1
 _RESIDUAL_NOT_COMPUTED = 1
 
@@ -184,6 +185,7 @@ class AmgxProvider:
         self._runtime = runtime
         self._execution_api = execution_api
         self._supports_optional_residual = bool(runtime.loaded.api.info.features & _OPTIONAL_RESIDUAL_FEATURE)
+        self._supports_retained_guess = bool(runtime.loaded.api.info.features & _RETAINED_GUESS_FEATURE)
         self._runtime_prog = program
         self._runtime_generation = int(impl.runtime_generation())
         self._lock = threading.RLock()
@@ -419,14 +421,22 @@ class AmgxSolver:
                 raise TaichiRuntimeError(str(exc)) from exc
             return solution_array, _solve_report(info)
 
-    def bind_device(self, rhs, solution, *, values=None, zero_initial_guess=True):
+    def bind_device(self, rhs, solution, *, values=None, zero_initial_guess=True, retain_initial_guess=False):
         """Bind fixed CUDA vectors, optionally coefficients, without host staging.
 
         Topology remains host-owned. Calls retain AmgX's host-controlled solver
         and the existing producer synchronization; this is not Graph capture.
         Updating the bound arrays changes the next solve/update's inputs.
+
+        ``retain_initial_guess`` initializes on the first call using
+        ``zero_initial_guess``, then uses the solver-owned last solution without
+        uploading the output buffer again. Other solves on this solver replace
+        that state; edits to the caller output do not change the retained guess.
         """
-        return AmgxDeviceBinding(self, rhs, solution, values=values, zero_initial_guess=zero_initial_guess)
+        return AmgxDeviceBinding(
+            self, rhs, solution, values=values, zero_initial_guess=zero_initial_guess,
+            retain_initial_guess=retain_initial_guess,
+        )
 
     def _solve_device(self, desc, solution, resources, solve_call):
         # AmgX has no public stream setter. Complete Forge producers before the
@@ -509,7 +519,7 @@ class AmgxSolver:
 class AmgxDeviceBinding:
     """Fixed device buffers retained until close; no shape/pointer replay queries."""
 
-    def __init__(self, solver, rhs, solution, *, values=None, zero_initial_guess=True):
+    def __init__(self, solver, rhs, solution, *, values=None, zero_initial_guess=True, retain_initial_guess=False):
         if not isinstance(solver, AmgxSolver):
             raise TypeError("solver must be an AmgxSolver")
         with solver.provider._lock, solver._lock:
@@ -518,6 +528,12 @@ class AmgxDeviceBinding:
                 zero_initial_guess = bool(zero_initial_guess)
             if not isinstance(zero_initial_guess, bool):
                 raise TypeError("zero_initial_guess must be a bool")
+            if isinstance(retain_initial_guess, np.bool_):
+                retain_initial_guess = bool(retain_initial_guess)
+            if not isinstance(retain_initial_guess, bool):
+                raise TypeError("retain_initial_guess must be a bool")
+            if retain_initial_guess and not solver.provider._supports_retained_guess:
+                raise TaichiRuntimeError("AmgX adapter does not support retained initial guesses; update the Forge adapter")
             rhs_ptr = _device_buffer(rhs, solver.dtype, solver.rows, "rhs", solver._runtime_prog)
             solution_ptr = _device_buffer(solution, solver.dtype, solver.rows, "solution", solver._runtime_prog)
             values_ptr = (
@@ -546,7 +562,22 @@ class AmgxDeviceBinding:
                     partial(solver._replace_and_solve, values_ptr),
                 )
             )
+            if retain_initial_guess:
+                solve_action, update_action = self._solve_action, self._update_solve_action
+                self._solve_action = partial(self._initialize_retained, desc, solve_action, solve_action, update_action)
+                if values is not None:
+                    self._update_solve_action = partial(
+                        self._initialize_retained, desc, update_action, solve_action, update_action
+                    )
             solver._device_bindings.add(self)
+
+    def _initialize_retained(self, desc, first_action, solve_action, update_action):
+        # Publish the initialized policy once, after an actual successful vendor
+        # call. Subsequent replay has no initialization predicate or buffer query.
+        result = first_action()
+        desc.zero_initial_guess = 2
+        self._solve_action, self._update_solve_action = solve_action, update_action
+        return result
 
     def solve(self):
         with self._solver.provider._lock, self._solver._lock:

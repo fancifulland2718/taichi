@@ -37,7 +37,8 @@ constexpr uint64_t kFeatures =
     TI_FORGE_RUNTIME_PROVIDER_FEATURE_TRANSIENT_PROBE |
     TI_FORGE_RUNTIME_PROVIDER_FEATURE_EXECUTION_API |
     (TI_FORGE_RUNTIME_PROVIDER_KIND == 3
-         ? TI_FORGE_RUNTIME_PROVIDER_FEATURE_AMGX_OPTIONAL_RESIDUAL
+         ? (TI_FORGE_RUNTIME_PROVIDER_FEATURE_AMGX_OPTIONAL_RESIDUAL |
+            TI_FORGE_RUNTIME_PROVIDER_FEATURE_AMGX_RETAINED_GUESS)
          : 0ull);
 
 #if TI_FORGE_RUNTIME_PROVIDER_KIND == 1
@@ -110,7 +111,7 @@ constexpr char kProviderId[] = "amgx";
 constexpr char kProviderName[] = "NVIDIA AmgX";
 constexpr char kSupportedVersionFamily[] = "stable C API";
 constexpr char kBuildIdentity[] =
-    "forge-runtime-provider-abi2-amgx-stable-c-api-residual-policy";
+    "forge-runtime-provider-abi2-amgx-stable-c-api-retained-state-leases";
 constexpr const char *kWindowsCandidates[] = {"amgxsh.dll"};
 constexpr const char *kLinuxCandidates[] = {"libamgxsh.so"};
 constexpr const char *kRequiredSymbols[] = {
@@ -1342,6 +1343,20 @@ std::mutex amgx_lifecycle_mutex;
 uint32_t amgx_runtime_refcount = 0;
 std::string amgx_runtime_library_path;
 
+// A vendor Resources destructor releases process-wide pools and BLAS handles,
+// even when another Resources object still owns live matrices/vectors. Retire
+// per-solver data immediately, but keep resource/config owners until the last
+// solver lease ends. This is cold lifetime management, not a solve-time check.
+std::recursive_mutex amgx_resource_mutex;
+uint32_t amgx_resource_leases = 0;
+struct AmgxRetiredResources {
+  void *resources;
+  void *config;
+  AmgxDestroyFn destroy_resources;
+  AmgxDestroyFn destroy_config;
+};
+std::vector<AmgxRetiredResources> amgx_retired_resources;
+
 TiForgeRuntimeProviderResult amgx_runtime_fail(Runtime &runtime,
                                                int status,
                                                const char *operation) {
@@ -1445,6 +1460,7 @@ struct AmgxSolver {
 };
 
 void cleanup_amgx_solver(AmgxSolver &solver) {
+  std::lock_guard<std::recursive_mutex> lock(amgx_resource_mutex);
   if (solver.solver != nullptr && solver.destroy_solver != nullptr) {
     solver.destroy_solver(solver.solver);
     solver.solver = nullptr;
@@ -1462,8 +1478,19 @@ void cleanup_amgx_solver(AmgxSolver &solver) {
     solver.matrix = nullptr;
   }
   if (solver.resources != nullptr && solver.destroy_resources != nullptr) {
-    solver.destroy_resources(solver.resources);
+    amgx_retired_resources.push_back({solver.resources, solver.config,
+                                      solver.destroy_resources,
+                                      solver.destroy_config});
     solver.resources = nullptr;
+    solver.config = nullptr;
+    --amgx_resource_leases;
+    if (amgx_resource_leases == 0) {
+      for (const auto &owner : amgx_retired_resources) {
+        owner.destroy_resources(owner.resources);
+        owner.destroy_config(owner.config);
+      }
+      amgx_retired_resources.clear();
+    }
   }
   if (solver.config != nullptr && solver.destroy_config != nullptr) {
     solver.destroy_config(solver.config);
@@ -1574,9 +1601,17 @@ TiForgeRuntimeProviderResult amgx_create_solver(
     return status == 0 ? TI_FORGE_RUNTIME_PROVIDER_SUCCESS
                        : amgx_runtime_fail(*runtime, status, operation);
   };
+  std::lock_guard<std::recursive_mutex> resource_lock(amgx_resource_mutex);
+  auto create_resources = [&]() {
+    const int status = resources_create(&solver->resources, solver->config);
+    if (solver->resources != nullptr) {
+      ++amgx_resource_leases;
+    }
+    return status;
+  };
   if (checked(config_create(&solver->config, desc->config),
               "config creation") != TI_FORGE_RUNTIME_PROVIDER_SUCCESS ||
-      checked(resources_create(&solver->resources, solver->config),
+      checked(create_resources(),
               "resource creation") != TI_FORGE_RUNTIME_PROVIDER_SUCCESS ||
       checked(matrix_create(&solver->matrix, solver->resources, solver->mode),
               "matrix creation") != TI_FORGE_RUNTIME_PROVIDER_SUCCESS ||
@@ -1643,7 +1678,7 @@ TiForgeRuntimeProviderResult amgx_solve(TiForgeAmgxSolver solver_value,
   if (solver == nullptr || desc == nullptr || out_info == nullptr ||
       desc->struct_size < sizeof(*desc) ||
       out_info->struct_size < sizeof(*out_info) || desc->rhs == nullptr ||
-      desc->solution == nullptr || desc->zero_initial_guess > 1) {
+      desc->solution == nullptr || desc->zero_initial_guess > 2) {
     return fail(TI_FORGE_RUNTIME_PROVIDER_ERROR_INVALID_ARGUMENT,
                 "invalid AmgX solve buffers");
   }
@@ -1662,7 +1697,7 @@ TiForgeRuntimeProviderResult amgx_solve(TiForgeAmgxSolver solver_value,
     return TI_FORGE_RUNTIME_PROVIDER_ERROR_VENDOR_CALL;
   }
   int status = 0;
-  if (desc->zero_initial_guess != 0) {
+  if (desc->zero_initial_guess == 1) {
     // xIsZero allows the solver to skip forming the initial residual; it does
     // not guarantee that PCG's first axpy initializes the solution vector.
     status = solver->vector_zero(solver->solution, solver->rows, 1);
@@ -1671,8 +1706,10 @@ TiForgeRuntimeProviderResult amgx_solve(TiForgeAmgxSolver solver_value,
           solver->solve_zero(solver->solver, solver->rhs, solver->solution);
     }
   } else {
-    status = solver->vector_upload(solver->solution, solver->rows, 1,
-                                   desc->solution);
+    if (desc->zero_initial_guess == 0) {
+      status = solver->vector_upload(solver->solution, solver->rows, 1,
+                                     desc->solution);
+    }
     if (status == 0) {
       status = solver->solve(solver->solver, solver->rhs, solver->solution);
     }

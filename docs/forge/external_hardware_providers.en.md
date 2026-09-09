@@ -1198,6 +1198,23 @@ not an algorithm or CompileIQ search axis. An older Forge adapter can still use
 the default path; an unsupported opt-out is rejected at solver creation using
 an adapter capability bit, without a Forge commit pin or patched AmgX runtime.
 
+`bind_device(..., retain_initial_guess=True)` initializes once according to
+`zero_initial_guess`, then reuses the solver-owned last solution. This avoids
+uploading the previous output again. Other solves on the same solver replace
+this state; editing the caller output does not change it. To restart with a
+caller-provided guess, create a new binding. This opt-in requires the adapter's
+retained-guess capability, not a patched AmgX library. It is a numerical policy:
+warm starts may change iteration count compared with zero starts. Comparing the
+same warm-start sequence on local f32 tests removed one 4 MiB D2D copy at 1M
+unknowns without changing iterations; it did **not** demonstrate reliable total
+speedup or fewer vendor synchronizations. No vendor workspace is eliminated.
+
+AmgX resource destruction releases process-wide pools and math handles. Forge
+therefore retires solver matrices/vectors immediately but holds resource/config
+owners until the last live solver lease ends, including across provider objects.
+This prevents closing one solver from invalidating another; it adds no replay
+check. Resource-owner metadata may remain until that cold lifetime boundary.
+
 This is **device-buffer interoperability, not an asynchronous or zero-copy
 solver**. The stable AmgX API copies into/from vendor-owned storage. Forge
 retains the existing producer synchronization before a vendor call; AmgX's

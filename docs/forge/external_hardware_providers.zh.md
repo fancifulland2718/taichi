@@ -957,6 +957,16 @@ bind 时检查 dtype、shape 和 runtime owner 并持有数组，后续使用数
 `solver.replace_coefficients(values_gpu)`。初值策略在 bind 固定；`zero_initial_guess=False`
 读取当前 solution buffer 作为初值。`bound.close()`、solver close 和 runtime reset 会使绑定失效。
 
+`bind_device(..., retain_initial_guess=True)` 首次按 `zero_initial_guess` 初始化，之后复用 solver 内部上次的解，
+省去再次上传输出。其他对同一 solver 的 solve 会替换该状态；修改调用者 output 不会改变内部初值。
+需重新使用调用者初值时创建新 binding。该显式策略需要 adapter 的 retained-guess capability，不需魔改 AmgX。
+warm start 相比零初值可能改变迭代数。本机相同 warm-start 序列在百万 f32 未知量下少一次 4 MiB D2D，
+迭代数相同，但未证明稳定总加速或更少 vendor 同步，也未减少 vendor workspace。
+
+AmgX resource 析构会释放进程级内存池及数学库 handle。Forge 立即退役 solver 的矩阵/向量，但将 resource/config
+owner 保留到最后一个活跃 solver lease 结束（包括不同 provider 对象），避免关闭一个 solver 破坏另一个。
+此处理只在冷生命周期边界进行，没有增加 replay 检查；部分 owner 元数据会延迟到该边界释放。
+
 这是 **device-buffer 互操作，不是异步或 zero-copy solver**。稳定 AmgX API 仍向/从 vendor 自有存储
 复制；Forge 保留 vendor 调用前既有的 producer 同步，AmgX 的求解控制和 residual 查询仍由 host 控制。
 device 输出复用既有 external-submission 生命周期追踪，不成为 Graph recording 或 CompileIQ 搜索项。

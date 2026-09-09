@@ -16,8 +16,8 @@ from tests import test_utils
 )
 @test_utils.test(arch=ti.cuda, offline_cache=False)
 @pytest.mark.parametrize("rows,dtype", [(1024, np.float32), (32768, np.float64)])
-@pytest.mark.parametrize("compute_residual", [True, False])
-def test_amgx_device_producers_updates_and_solution_consumer(rows, dtype, compute_residual):
+@pytest.mark.parametrize("compute_residual,retain", [(True, False), (False, False), (False, True)])
+def test_amgx_device_producers_updates_and_solution_consumer(rows, dtype, compute_residual, retain, monkeypatch):
     scalar = ti.f32 if dtype == np.float32 else ti.f64
     offsets = np.empty(rows + 1, dtype=np.int32)
     offsets[0] = 0
@@ -73,12 +73,22 @@ def test_amgx_device_producers_updates_and_solution_consumer(rows, dtype, comput
     solution.fill(0)
     with ti.hardware.linalg.AmgxProvider(os.environ["TI_FORGE_TEST_AMGX_LIBRARY_PATH"]) as provider:
         with provider.solver(offsets, columns, values, config, compute_residual=compute_residual) as solver:
-            binding = solver.bind_device(rhs, solution, values=values, zero_initial_guess=False)
+            if retain:
+                with monkeypatch.context() as patch:
+                    patch.setattr(provider, "_supports_retained_guess", False)
+                    with pytest.raises(ti.TaichiRuntimeError, match="adapter"):
+                        solver.bind_device(rhs, solution, retain_initial_guess=True)
+            binding = solver.bind_device(
+                rhs, solution, values=values, zero_initial_guess=False, retain_initial_guess=retain
+            )
             for iteration in range(3):
                 diagonal, scale = 4.0 + iteration, 1.0 + iteration
                 produce(values, rhs, diagonal, scale)
                 if iteration == 1:
                     binding.replace_coefficients()
+                if retain and iteration:
+                    # Retained state is vendor-owned, not the caller's output.
+                    solution.fill(float("nan"))
                 result, info = binding.update_and_solve() if iteration == 2 else binding.solve()
                 assert result is solution and info["converged"]
                 assert (info["residual_norm"] is not None) == compute_residual
@@ -96,3 +106,34 @@ def test_amgx_device_producers_updates_and_solution_consumer(rows, dtype, comput
             np.testing.assert_allclose(host_result, expected / 2, rtol=tolerance, atol=tolerance)
         with pytest.raises(ti.TaichiRuntimeError, match="closed"):
             binding.solve()
+
+
+@pytest.mark.skipif(not os.environ.get("TI_FORGE_TEST_AMGX_LIBRARY_PATH"), reason="real AmgX required")
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_amgx_independent_solver_retirement_preserves_live_vendor_resources():
+    n = 256
+    offsets, columns = np.arange(n + 1, dtype=np.int32), np.arange(n, dtype=np.int32)
+    values = np.full(n, 2, dtype=np.float32)
+    rhs, output = ti.ndarray(ti.f32, n), ti.ndarray(ti.f32, n)
+    rhs.fill(4)
+    config = json.dumps({"config_version": 2, "solver": {
+        "solver": "PCG", "preconditioner": {"solver": "NOSOLVER"}, "max_iters": 10,
+        "monitor_residual": 1, "tolerance": 1e-6, "print_solve_stats": 0,
+    }})
+    # Different providers still share the vendor's process-global pools.
+    with ti.hardware.linalg.AmgxProvider(os.environ["TI_FORGE_TEST_AMGX_LIBRARY_PATH"]) as first:
+        with ti.hardware.linalg.AmgxProvider(os.environ["TI_FORGE_TEST_AMGX_LIBRARY_PATH"]) as second:
+            retired = first.solver(offsets, columns, values, config)
+            live = second.solver(offsets, columns, values, config)
+            retired.bind_device(rhs, output).solve()
+            retired.close()
+            binding = live.bind_device(rhs, output, retain_initial_guess=True)
+            for scale in (4, 6):
+                rhs.fill(scale)
+                result, info = binding.solve()
+                assert info["converged"]
+                np.testing.assert_allclose(result.to_numpy(), scale / 2, rtol=1e-5)
+            live.close()
+            with first.solver(offsets, columns, values, config) as again:
+                _, info = again.bind_device(rhs, output).solve()
+                assert info["converged"]
