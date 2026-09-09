@@ -1254,6 +1254,58 @@ unknown driver command/pipeline memory are distinct costs. Windows local tests
 cover the implementation; Linux and production performance are not qualified by
 those tests. Ordinary runtime selection is unchanged.
 
+## Explicit FidelityFX Parallel Sort (Vulkan)
+
+```python
+keys = ti.ndarray(ti.u32, shape=1_048_579)
+values = ti.ndarray(ti.u32, shape=1_048_579)
+# Populate both arrays before running the plan.
+with ti.hardware.sort.VulkanParallelSortPlan(
+    keys, values, compiler_path=r"C:\VulkanSDK\<version>\Bin\dxc.exe"
+) as plan:
+    plan.run()  # Asynchronous, ascending stable sort; modifies original arrays.
+    builder = ti.graph.GraphBuilder()
+    builder.append_native(plan.record())
+    graph = builder.compile()
+    bindings = graph.bind({"keys": keys, "values": values})
+    graph.run(bindings)
+    facts = plan.statistics()
+    memory = plan.memory_report()
+```
+
+This bounded API supports nonempty, fixed, one-dimensional u32 keys and an
+optional distinct u32 payload of the same shape. Without payload, omit `values`
+and bind only `keys`. Stability preserves the order of equal keys. The source
+preloads are guarded for exact-capacity storage, including non-512-sized tails;
+the caller need not pad buffers. It does not add signed/floating keys, descending
+order, dynamic device counts, or arbitrary payload layouts.
+
+Forge ships the MIT FidelityFX Parallel Sort source and its own bindings. Supply
+a DXC executable with SPIR-V support explicitly; JIT compilation happens during
+plan creation. No FidelityFX framework, CUDA toolkit, extra Vulkan runtime, or
+runtime compiler is bundled or loaded implicitly. The native bridge uses the
+active Forge Vulkan device, queue, buffers, and completion-retention machinery.
+The device must support compute subgroup basic/arithmetic/ballot/shuffle.
+Missing compiler/native bridge/capabilities fail at explicit creation, without
+changing ordinary sort. `ti.hardware.capability("sort.radix.fidelityfx")` is a
+static contract, not a compiler or device qualification probe.
+
+Pipelines, descriptors, workspace, and the forty-dispatch secondary sequence
+are prepared once. Root Graphs retain a host call per sort action; this is not
+enclosing Graph capture or a new CompileIQ fixed-sort/provider-route axis.
+Binding publication requires the original arrays. Closing a plan invalidates
+future calls; already submitted commands retain their GPU resources. Runtime
+reset cannot redirect an old handle to a new plan.
+
+There is no host staging, readback, or terminal device copy in the sort sequence.
+Requested workspace is one key scratch, optional payload scratch, and compact
+histogram/scan tables; reports exclude caller storage, allocator padding, opaque
+driver allocations and physical VRAM peak. The lower workspace and retained host
+recording can trade off against more device work than Forge's default radix8
+implementation. Local Windows comparisons found device regressions, so ordinary
+`ti.algorithms.sort` remains unchanged. No production speedup, AMD-wide advantage,
+Linux qualification, or complete-recipe search support is implied.
+
 ## Official references
 
 - [cuDSS documentation](https://docs.nvidia.com/cuda/cudss/index.html)
@@ -1264,3 +1316,4 @@ those tests. Ordinary runtime selection is unchanged.
 - [OptiX SDK downloads and release requirements](https://developer.nvidia.com/designworks/optix/download)
 - [CUDA compiler Advanced Controls](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/nvcc.html)
 - [NVIDIA CompileIQ](https://developer.nvidia.com/cuda/compileiq)
+- [FidelityFX Parallel Sort source and MIT license](https://github.com/GPUOpen-Effects/FidelityFX-ParallelSort)

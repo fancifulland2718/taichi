@@ -1020,6 +1020,44 @@ baseline 恢复。并存的已物化 Graph 各自拥有独立计划；关闭/释
 每绑定参数 bytes 与未知 driver command/pipeline 内存是不同成本。当前实现证据仅为 Windows 本地测试，
 不据此声明 Linux 或生产加速；普通 runtime 默认选择不变。
 
+## 显式 FidelityFX Parallel Sort（Vulkan）
+
+```python
+keys = ti.ndarray(ti.u32, shape=1_048_579)
+values = ti.ndarray(ti.u32, shape=1_048_579)
+# 执行前填入 keys 和 values。
+with ti.hardware.sort.VulkanParallelSortPlan(
+    keys, values, compiler_path=r"C:\VulkanSDK\<version>\Bin\dxc.exe"
+) as plan:
+    plan.run()  # 异步、升序稳定排序，结果回到原数组。
+    builder = ti.graph.GraphBuilder()
+    builder.append_native(plan.record())
+    graph = builder.compile()
+    bindings = graph.bind({"keys": keys, "values": values})
+    graph.run(bindings)
+    facts = plan.statistics()
+    memory = plan.memory_report()
+```
+
+当前支持非空、固定一维 u32 keys，以及可选、独立、同形状的 u32 payload。不带 payload 时省略 `values`，Graph
+只绑定 `keys`。相同 key 的 payload 保持稳定顺序。源代码在预读取位置处理尾部，非 512 倍数也使用精确容量，
+不要求调用者 padding。尚不提供 signed/float key、降序、device 动态数量或任意 payload 布局。
+
+Forge 提供 MIT FidelityFX Parallel Sort 源码及自有绑定；调用者显式提供支持 SPIR-V 的 DXC executable，JIT
+只发生在 plan 创建时。不打包 FidelityFX framework、CUDA Toolkit、额外 Vulkan runtime 或运行时编译器，
+也不在 import/replay 时隐式加载。native bridge 复用 Forge 当前 Vulkan device、queue、buffer 和完成期资源保留。
+设备需支持 compute subgroup basic/arithmetic/ballot/shuffle；编译器、native bridge 或能力缺失在显式创建时失败，
+不改变普通 sort。`ti.hardware.capability("sort.radix.fidelityfx")` 只是静态合同，不是编译器或设备资格探测。
+
+管线、descriptor、workspace 和 40-dispatch secondary sequence 一次准备。Root Graph 每个 sort action 仍有一次
+host 调用；这不是 enclosing Graph capture，也不增加 CompileIQ 固定 sort/provider 路由轴。发布绑定要求原数组；
+close 拒绝后续调用，已提交命令保留 GPU 资源直到完成。reset 不会让旧 handle 命中新 runtime 的计划。
+
+排序序列没有 host staging、readback 或末尾 device copy。请求的 workspace 为一份 key scratch、可选 payload
+scratch 及紧凑 histogram/scan table；报告不包含调用者存储、allocator padding、未知 driver 分配和实际显存峰值。
+较低 workspace、保留 host 录制与 device 工作量之间存在取舍：本地 Windows 对照发现 device 负向，因此不替换
+默认 `ti.algorithms.sort`。不据此声明生产加速、所有 AMD 设备更快、Linux 资格或完整 recipe 搜索支持。
+
 ## 官方参考
 
 - [cuDSS 文档](https://docs.nvidia.com/cuda/cudss/index.html)
@@ -1030,3 +1068,4 @@ baseline 恢复。并存的已物化 Graph 各自拥有独立计划；关闭/释
 - [OptiX SDK 下载与 release 要求](https://developer.nvidia.com/designworks/optix/download)
 - [CUDA compiler Advanced Controls](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/nvcc.html)
 - [NVIDIA CompileIQ](https://developer.nvidia.com/cuda/compileiq)
+- [FidelityFX Parallel Sort 源码与 MIT 许可](https://github.com/GPUOpen-Effects/FidelityFX-ParallelSort)
