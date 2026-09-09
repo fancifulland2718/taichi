@@ -17,6 +17,7 @@ on:
       - "python/taichi_forge/hardware/_cub_source_provider.py"
       - "python/taichi_forge/hardware/_source_provider.py"
       - "python/taichi_forge/hardware/source_providers/cub/**"
+      - "python/taichi_forge/hardware/source_providers/_cuda_build.py"
       - "tests/python/test_hardware_source_provider.py"
 
 permissions:

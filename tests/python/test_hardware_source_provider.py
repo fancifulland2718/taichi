@@ -257,7 +257,9 @@ def test_source_provider_builder_checks_emitted_sass_and_ptx(monkeypatch):
         "--list-elf": "ELF file 1: provider.1.sm_80.cubin\n",
         "--list-ptx": "PTX file 1: provider.1.sm_80.ptx\n",
     }
-    monkeypatch.setattr(build, "_run_output", lambda command: outputs[command[1]])
+    monkeypatch.setattr(
+        build._shared, "_run_output", lambda command: outputs[command[1]]
+    )
     build._audit_target_code("cuobjdump", "provider.dll", ("sm_80", "compute_80"))
     outputs["--list-ptx"] = ""
     with pytest.raises(RuntimeError, match="emitted device code differs"):
