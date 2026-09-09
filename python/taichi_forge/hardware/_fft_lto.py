@@ -172,6 +172,37 @@ __device__ void {self.symbol}(void* output, unsigned long long offset,
 
 
 class _CufftStoreScalePlan(_CufftPlanBase):
+
+    @classmethod
+    def prepare(
+        cls,
+        dimensions,
+        batch_count,
+        scale,
+        *,
+        nvrtc_library=None,
+        nvjitlink_library=None,
+        expected=None,
+    ):
+        """Keep toolchain reconstruction out of the mathematical FFT catalog."""
+        if expected is not None:
+            nvrtc_library = expected["compiler"]["path"]
+            nvjitlink_library = expected["linker"]["path"]
+        return cls(
+            dimensions,
+            batch_count,
+            _StoreScaleCallback(
+                scale,
+                nvrtc_library=nvrtc_library,
+                nvjitlink_library=nvjitlink_library,
+                expected=expected,
+            ),
+        )
+
+    @property
+    def callback_facts(self):
+        return self._callback.facts
+
     def __init__(self, dimensions, batch_count, callback):
         # Ownership remains with the same completion-retained native plan.
         self._callback = callback

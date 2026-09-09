@@ -58,7 +58,7 @@ cuTENSOR、AmgX 或 NCCL 绝不会触发 compiler rewrite。
 | AmgX | 下文的显式 provider plan | 当前没有公开 complete-recipe provider 或通用 Graph recording 路线。 |
 
 先准备数学 operation，再 freeze Graph。SpMM/FFT/matmul/contraction 要求显式的 finite-input / f32 tolerance 合同，
-Forge 不在每次 replay 扫描数值。FFT 正向、逆向均不归一化，连续应用两者会将输入乘以 `H * W`。
+Forge 不在每次 replay 扫描数值。默认 FFT 正向、逆向均不归一化，连续应用两者会将输入乘以 `H * W`。
 layout、精度和归一化属于语义要求，不是优化器选择。vendor 不开放的内部信息报告为 unknown，
 不能据此虚构内部 kernel 数。
 
@@ -118,6 +118,37 @@ FFT Graph recording 只持有所用的物理计划，不反向持有搜索 opera
 `definition.resolve_recipe(...)` 和 `definition.materialize(...)`。这条路径不要调用 `prepare()`，否则会
 显式准备全部导入候选。freeze、catalog discovery、选择解析均不创建 FFT 计划，物化只创建所请求的计划。
 此功能需要新的 native capture-description 能力；旧兼容 runtime 仍可运行普通 FFT，但会明确拒绝该恢复路径。
+
+FFT 输出缩放是显式数学合同，不是库路由：
+
+```python
+operation = ti.linalg.record_fft(
+    (1024, 1024), batch_count=2, direction="inverse",
+    output_scale=1 / (1024 * 1024),
+    absolute_tolerance=2e-6, relative_tolerance=3e-5,
+)
+operation.prepare(
+    lto_callbacks=True,
+    nvrtc_library=nvrtc_path,       # 调用者提供的绝对库路径
+    nvjitlink_library=nvjitlink_path,
+)
+```
+
+默认 `output_scale=1` 保持不归一化行为；其他有限 f32 系数在 FFT 后应用。已有物理计划追加 Forge 缩放 kernel，
+可选 whole-transform LTO 候选则融合到 cuFFT store；两者数学目标相同。用现有 `FftRecipeProvider` 搜索完整
+recipe，准备候选不会选择它，也不启用 runtime auto。范围仍是紧凑、输入输出分离、batched 2D complex-f32；
+不开放任意 callback 代码、通用 load/store 回调或可变 callerInfo 状态。
+
+普通独立缩放不需要 NVRTC/nvJitLink。LTO 候选需要兼容的外部 cuFFT/NVRTC/nvJitLink 和 native callback-plan
+能力，不向 portable wheel 增加这些 shared runtime 依赖。Windows 动态 cuFFT 支持 LTO callback，不能与
+legacy 静态库回调混淆；版本关系遵循 [NVIDIA callback 合同](https://docs.nvidia.com/cuda/cufft/index.html#lto-load-and-store-callback-routines)，
+cuFFT 的传递依赖仍须在进程库搜索路径中可见。显式路径标识所提供的编译器/链接器，不代表已验证所有 CUDA 组合。
+缺依赖或准备失败不会静默丢掉缩放，也不会把所请求 callback 换成普通 FFT；已有非 callback 候选仍可使用。
+
+准备 artifact 保存 callback source/LTO 身份及 compiler/linker 事实；freeze/resolve 不反序列化 executable 或
+vendor plan。选中 callback 的冷物化重编译受控源码并核对这些事实，replay 没有编译、库探测、callerInfo 更新或
+新增同步。无需新增整尺寸缓冲；vendor workspace 按计划报告，opaque driver/module 驻留不因此记为零。
+JIT 准备时间属于成本，不作为性能准入门禁。
 
 SpMM 通过 `matrix.record_spmm(..., preparation=saved_preparation)` 使用同样的准备 JSON/选择恢复流程。
 native 支持计划租约时，`operation.close()` 只释放搜索拥有的计划；同一 matrix/RHS/algorithm 的计划仍与

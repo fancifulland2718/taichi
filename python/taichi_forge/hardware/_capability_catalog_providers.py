@@ -178,6 +178,7 @@ def d1_provider_operations(_operation):
                 "compact row-major dense arrays",
                 "explicit preparation or imported expected facts",
                 "caller-qualified finite-input tolerance",
+                "explicit output_scale with separate postprocess or opt-in LTO store fusion",
             ),
             dtypes=("matrix:f32", "input:f32", "output:f32"),
             layouts=(
@@ -373,7 +374,7 @@ def d1_provider_operations(_operation):
                 "inverse_scale:1/length",
             ),
             notes=(
-                "Callbacks, LTO, multi-GPU, and independently arbitrary per-axis strides are excluded.",
+                "Graph FFT output_scale may use an explicitly prepared LTO store callback with external NVRTC/nvJitLink; arbitrary callbacks, multi-GPU and independently arbitrary per-axis strides remain excluded.",
                 "Identical plan descriptors reuse a runtime-generation cuFFT plan; workspace bytes are queried from cuFFT.",
                 "Discovery verifies the operation symbol contract only; transitive provider dependencies and workspace allocation are qualified when the first plan is created.",
             ),

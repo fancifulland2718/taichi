@@ -2,6 +2,7 @@
 
 import json
 import math
+import struct
 import threading
 import time
 import weakref
@@ -33,6 +34,11 @@ class _SeparableFftPlan(_CufftPlanBase):
 
 
 class _FftDescription:
+
+    @property
+    def output_scale(self):
+        return self.semantics.get("output_scale", 1.0)
+
     @property
     def semantics(self):
         return json.loads(self._semantics_json)
@@ -58,9 +64,14 @@ class _FftDescription:
         return self.semantics["direction"]
 
     def physical_config(self, strategy):
-        if strategy not in ("whole_transform", "row_batch_column_inplace", "row_batch_cross_batch_columns"):
+        if strategy not in (
+            "whole_transform",
+            "row_batch_column_inplace",
+            "row_batch_cross_batch_columns",
+            "whole_transform_store_scale",
+        ):
             raise ValueError("Unknown FFT physical strategy")
-        return {
+        config = {
             "strategy": strategy,
             "workspace_lifetime": "completion_retained_plan_generation",
             "submission": "enclosing_graph",
@@ -68,7 +79,7 @@ class _FftDescription:
             "intermediate_dense_bytes": 0,
             "phases": (
                 ("whole_transform",)
-                if strategy == "whole_transform"
+                if strategy in ("whole_transform", "whole_transform_store_scale")
                 else (
                     ("all_rows_out_of_place", "columns_in_place_across_batches")
                     if strategy == "row_batch_cross_batch_columns"
@@ -76,9 +87,19 @@ class _FftDescription:
                 )
             ),
         }
+        if self.output_scale != 1.0:
+            config["output_scale"] = self.output_scale
+            config["postprocess"] = (
+                "cufft_lto_store_scale_v1"
+                if strategy == "whole_transform_store_scale"
+                else "forge_f32_scale_kernel_v1"
+            )
+            if strategy != "whole_transform_store_scale":
+                config["phases"] += ("separate_output_scale",)
+        return config
 
     def preparation_report(self):
-        return {strategy: dict(info) for strategy, info in self._preparation.items()}
+        return json.loads(json.dumps(self._preparation))
 
     def preparation_artifact(self):
         """JSON-safe expected plan facts for explicit, plan-free reconstruction.
@@ -133,6 +154,15 @@ class _FftPlanCatalog(_FftDescription):
                         semantics["batch_count"],
                         cross_batch=strategy == "row_batch_cross_batch_columns",
                     )
+                elif strategy == "whole_transform_store_scale":
+                    from taichi_forge.hardware._fft_lto import _CufftStoreScalePlan
+
+                    plan = _CufftStoreScalePlan.prepare(
+                        semantics["dimensions"],
+                        semantics["batch_count"],
+                        self.output_scale,
+                        expected=self._preparation[strategy]["callback"],
+                    )
                 else:
                     raise ValueError("Unknown FFT physical strategy")
                 # Rebuild only the requested plan, preserving the frozen facts.
@@ -146,13 +176,36 @@ class _FftPlanCatalog(_FftDescription):
                     raise TaichiRuntimeError("Recreated FFT plan differs from its prepared component or workspace")
                 self._plans[strategy] = plan
                 self._restoration[strategy] = {
-                    "measurement_scope": "host_elapsed_for_selected_fft_plan_recreation",
+                    "measurement_scope": (
+                        "host_elapsed_for_selected_fft_callback_compile_and_plan_recreation"
+                        if strategy == "whole_transform_store_scale"
+                        else "host_elapsed_for_selected_fft_plan_recreation"
+                    ),
                     "host_setup_seconds": time.perf_counter() - started,
                     "workspace_bytes": plan._workspace_bytes,
                     "unselected_plans_created": 0,
                 }
             plan._validate_lifetime()
             return _FftRecording(self, strategy, plan)
+
+    def append(self, builder, strategy, admission):
+        """Expand this one mathematical region using the existing provider seam."""
+        builder._append_native(self._recording(strategy), admission=admission)
+        if self.output_scale != 1.0 and strategy != "whole_transform_store_scale":
+            from taichi_forge.graph._graph import Arg, ArgKind
+            from taichi_forge.hardware._fft_kernels import output_scale_kernel
+            from taichi_forge.types.primitive_types import f32
+
+            semantics = self.semantics
+            rank = 4 if semantics["batch_count"] > 1 else 3
+            builder.dispatch(
+                output_scale_kernel(
+                    tuple(semantics["dimensions"]),
+                    semantics["batch_count"],
+                    self.output_scale,
+                ),
+                Arg(ArgKind.NDARRAY, self.output, f32, ndim=rank),
+            )
 
 
 class _FrozenFftSource(FrozenNativeRecipeSource):
@@ -169,6 +222,9 @@ class _FrozenFftSource(FrozenNativeRecipeSource):
 
     def materialize(self):
         return self._graph_fft_source._recording(self._strategy)._as_graph_native_node().compile()
+
+    def append_to_graph(self, builder, *, admission):
+        self._graph_fft_source.append(builder, self._strategy, admission)
 
 
 class _FftCaptureDescription(_CudaGraphCaptureRecipe):
@@ -226,6 +282,11 @@ def _fft_physical_id(source, strategy):
             "semantics": source.semantic_fingerprint,
             "config": source.physical_config(strategy),
             "component": source.component,
+            **(
+                {"callback": source.preparation_report()[strategy]["callback"]}
+                if strategy == "whole_transform_store_scale"
+                else {}
+            ),
         }
     )
 
@@ -265,7 +326,9 @@ class FftOperation(_FftDescription, NativeGraphNode):
 
     Input and output are distinct scalar f32 arrays shaped (H, W, 2), or
     (batch, H, W, 2) when batch > 1. The last axis is [real, imaginary].
-    Both directions are unnormalized: inverse(forward(x)) = H * W * x.
+    By default both directions are unnormalized: inverse(forward(x)) = H * W * x.
+    Explicit output_scale is rounded to finite f32 and applied after the FFT;
+    output_scale=1/(H*W) therefore describes a normalized inverse transform.
     Only CUDA is currently implemented. Values/qualification are caller-owned.
     """
 
@@ -280,6 +343,7 @@ class FftOperation(_FftDescription, NativeGraphNode):
         absolute_tolerance,
         relative_tolerance,
         preparation=None,
+        output_scale=1.0,
     ):
         dimensions = _positive_int_tuple(dimensions, "FFT dimensions")
         batch_count = _positive_int(batch_count, "FFT batch_count")
@@ -299,6 +363,16 @@ class FftOperation(_FftDescription, NativeGraphNode):
             tolerances.append(value)
         if not any(tolerances):
             raise ValueError("Graph FFT needs positive tolerance; bitwise reproducibility is not promised")
+        if isinstance(output_scale, bool) or not isinstance(output_scale, (int, float)):
+            raise TypeError("Graph FFT output_scale must be a finite f32 number")
+        try:
+            output_scale = struct.unpack("f", struct.pack("f", output_scale))[0]
+        except (OverflowError, struct.error) as exc:
+            raise ValueError(
+                "Graph FFT output_scale must be representable as finite f32"
+            ) from exc
+        if not math.isfinite(output_scale):
+            raise ValueError("Graph FFT output_scale must be finite")
         self._semantics_json = _canonical_json(
             {
                 "operation": "fft_transform",
@@ -309,6 +383,7 @@ class FftOperation(_FftDescription, NativeGraphNode):
                 "output": output,
                 "direction": direction,
                 "normalization": "none",
+                **({"output_scale": output_scale} if output_scale != 1.0 else {}),
                 "transform": "complex_to_complex",
                 "layout": "compact_row_major_interleaved_f32",
                 "numerical_contract": {
@@ -368,6 +443,14 @@ class FftOperation(_FftDescription, NativeGraphNode):
                 or elapsed < 0
             ):
                 raise ValueError("FFT preparation elapsed time must be finite and nonnegative")
+            if strategy == "whole_transform_store_scale":
+                callback = info.get("callback")
+                if (
+                    self.output_scale == 1.0
+                    or not isinstance(callback, dict)
+                    or callback.get("schema") != "cufft-store-scale-lto-v1"
+                ):
+                    raise ValueError("Invalid FFT store-scaling preparation")
         component = passive_dynamic_provider_scope("cufft", "cufft-plan-many-dynamic-symbols-v3")
         if not component["library_candidate"]:
             from taichi_forge.hardware._external_providers import probe_external_provider
@@ -390,7 +473,10 @@ class FftOperation(_FftDescription, NativeGraphNode):
     def _graph_recipe_description(self):
         if self._closed:
             raise TaichiRuntimeError("FFT operation has been closed")
-        if self._preparation_origin == "current_process_plan_creation":
+        if (
+            self._preparation_origin == "current_process_plan_creation"
+            and self.output_scale == 1.0
+        ):
             return None
         validate_runtime_generation(self._catalog, "FFT recipe catalog belongs to a retired runtime")
         return native_recording_node(
@@ -399,15 +485,33 @@ class FftOperation(_FftDescription, NativeGraphNode):
             debug_info={"kind": "fft_transform"},
         ).compile()
 
-    def prepare(self):
+    def prepare(
+        self, *, lto_callbacks=False, nvrtc_library=None, nvjitlink_library=None
+    ):
         """Prepare available decompositions before search, without executing FFT.
 
         The operation retains prepared plans until close. Graphs separately
         retain only plans they use; their lifetime does not end with this owner.
         No replay checks or per-invocation reconstruction are added.
+
+        lto_callbacks=True additionally prepares an optional cuFFT store-scale
+        fusion for non-identity output_scale. Supply absolute nvrtc_library and
+        nvjitlink_library paths to compatible external runtimes; this does not
+        select the candidate, change plain FFT support or install a compiler.
+        A failed preparation raises without substituting unscaled FFT math.
         """
         if self._closed:
             raise TaichiRuntimeError("FFT operation has been closed")
+        if not isinstance(lto_callbacks, bool):
+            raise TypeError("lto_callbacks must be bool")
+        if not lto_callbacks and (
+            nvrtc_library is not None or nvjitlink_library is not None
+        ):
+            raise ValueError("JIT libraries require explicit lto_callbacks=True")
+        if lto_callbacks and self.output_scale == 1.0:
+            raise ValueError(
+                "A store-scaling candidate requires non-identity output_scale"
+            )
         if self._preparation_origin != "current_process_plan_creation":
             for strategy in self._preparation:
                 self._plans[strategy] = self._catalog._recording(strategy).plan
@@ -437,6 +541,25 @@ class FftOperation(_FftDescription, NativeGraphNode):
                     "host_setup_seconds": time.perf_counter() - started,
                 }
                 self._catalog._plans[strategy] = plan
+        if lto_callbacks and "whole_transform_store_scale" not in self._plans:
+            from taichi_forge.hardware._fft_lto import _CufftStoreScalePlan
+
+            started = time.perf_counter()
+            plan = _CufftStoreScalePlan.prepare(
+                tuple(self.semantics["dimensions"]),
+                self.semantics["batch_count"],
+                self.output_scale,
+                nvrtc_library=nvrtc_library,
+                nvjitlink_library=nvjitlink_library,
+            )
+            strategy = "whole_transform_store_scale"
+            self._plans[strategy] = plan
+            self._preparation[strategy] = {
+                "workspace_bytes": plan._workspace_bytes,
+                "host_setup_seconds": time.perf_counter() - started,
+                "callback": plan.callback_facts,
+            }
+            self._catalog._plans[strategy] = plan
         return self.preparation_report()
 
     def _recording(self, strategy):
@@ -445,6 +568,8 @@ class FftOperation(_FftDescription, NativeGraphNode):
         return self._catalog._recording(strategy)
 
     def compile(self):
+        if self.output_scale != 1.0:
+            return self._graph_recipe_description()
         return self._recording("whole_transform")._as_graph_native_node().compile()
 
     def close(self):
@@ -467,8 +592,9 @@ def record_fft(
     absolute_tolerance,
     relative_tolerance,
     preparation=None,
+    output_scale=1.0,
 ):
-    """Describe an unnormalized 2D C2C FFT; see FftOperation for the array contract.
+    """Describe a 2D C2C FFT with optional explicit output_scale (default 1).
 
     Call operation.prepare() before using the explicit FftRecipeProvider.
     Alternatively, pass a prior operation.preparation_artifact() as preparation
@@ -485,6 +611,7 @@ def record_fft(
         absolute_tolerance=absolute_tolerance,
         relative_tolerance=relative_tolerance,
         preparation=preparation,
+        output_scale=output_scale,
     )
 
 

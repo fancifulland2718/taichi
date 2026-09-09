@@ -33,8 +33,13 @@ class FftRecipeProvider(GraphRuntimeFragmentProvider):
 
     descriptor = runtime_family_provider_descriptor(
         "fft",
-        capabilities=("c2c-fft-region", "retained-separable-plan", "cross-batch-column-plan"),
-        domain_version="fft-retained-plans-v3",
+        capabilities=(
+            "c2c-fft-region",
+            "retained-separable-plan",
+            "cross-batch-column-plan",
+            "output-scale-fusion",
+        ),
+        domain_version="fft-retained-plans-v4",
         semantic_fingerprint="compact-2d-c2c-finite-f32-v1",
     )
 
@@ -61,8 +66,29 @@ class FftRecipeProvider(GraphRuntimeFragmentProvider):
                         "component": source.component,
                         "workspace_bytes": prepared[strategy]["workspace_bytes"],
                         "vendor_internal_kernel_topology": "unknown",
+                        **(
+                            {"callback": prepared[strategy]["callback"]}
+                            if "callback" in prepared[strategy]
+                            else {}
+                        ),
                     },
                 )
+                tasks = [task]
+                if (
+                    source.output_scale != 1.0
+                    and strategy != "whole_transform_store_scale"
+                ):
+                    tasks.append(
+                        GraphFragmentTask.create(
+                            f"{path}:{strategy}:scale",
+                            "fft_output_scale",
+                            depends_on=(task.task_id,),
+                            physical={
+                                "scale": source.output_scale,
+                                "lowering": "forge_f32_scale_kernel_v1",
+                            },
+                        )
+                    )
                 fragments.append(
                     _fragment(
                         definition,
@@ -70,7 +96,7 @@ class FftRecipeProvider(GraphRuntimeFragmentProvider):
                         source_key=path,
                         choice_id=strategy,
                         coverage=(region_id,),
-                        tasks=(task,),
+                        tasks=tuple(tasks),
                         exclusive_submission=True,
                         provider_descriptor=self.descriptor,
                         compatible_executor_kinds=("cuda_immutable_argument_frames",),
@@ -88,7 +114,7 @@ class FftRecipeProvider(GraphRuntimeFragmentProvider):
             raise ValueError("FFT plan was not prepared; no physical substitution was performed")
 
         def rewrite(builder, operation):
-            builder._append_native(source._recording(strategy), admission=operation[2])
+            source.append(builder, strategy, operation[2])
 
         assembly.select_operation(executable, rewrite)
 
@@ -114,15 +140,22 @@ class FftRecipeProvider(GraphRuntimeFragmentProvider):
             "component_applicability": source.component,
             "preparation_observation": {
                 **source.preparation_report()[strategy],
-                "measurement_scope": "host_elapsed_for_fft_plan_creation",
+                "measurement_scope": (
+                    "host_elapsed_for_callback_compile_and_fft_plan_creation"
+                    if strategy == "whole_transform_store_scale"
+                    else "host_elapsed_for_fft_plan_creation"
+                ),
                 "shared_initialization": "not_separated",
                 "preparation_origin": source._preparation_origin,
-                "selected_only_restore": "observed" if strategy in source._restoration else "not_measured",
+                "selected_only_restore": (
+                    "observed" if strategy in source._restoration else "not_measured"
+                ),
                 "restoration_observation": source._restoration.get(strategy),
             },
             "limitations": (
                 "CUDA f32 complex-to-complex only; compact two-dimensional transforms and explicit batch count",
-                "both directions are unnormalized; finite inputs and downstream-qualified tolerance",
+                "both transforms are unnormalized, followed by explicit output_scale when declared; finite inputs and caller tolerances",
+                "store-scale LTO is opt-in and requires compatible external NVRTC/nvJitLink; no replay compiler or callerInfo allocation",
                 "operation.close releases search-owned plans; live Graphs retain their own plans, frozen definitions retain descriptions",
                 "prepared metadata does not retain unused plans; per-plan workspace is not total process VRAM",
                 "in-place columns use the output allocation; public input and output remain distinct",

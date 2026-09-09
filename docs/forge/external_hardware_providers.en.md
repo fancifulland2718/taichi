@@ -67,7 +67,7 @@ entry is declared for that operation; it does not prohibit application providers
 
 Prepare mathematical operations before freezing the Graph. SpMM, FFT, matmul and contraction require
 explicit finite-input / f32 tolerance contracts; Forge does not scan values on
-each replay. FFT forward and inverse are both unnormalized, so applying both
+each replay. By default FFT forward and inverse are both unnormalized, so applying both
 multiplies the input by `H * W`. Layout, precision and normalization are semantic
 requirements, not optimizer choices. Vendor internals not exposed by the library
 are reported as unknown, not fabricated kernel counts.
@@ -157,6 +157,48 @@ it explicitly prepares all imported candidates. Freeze, catalog discovery and
 selection resolution create no FFT plans; materialization creates only the
 requested plan. The new native capture-description capability is required; older
 compatible runtimes keep ordinary FFT support but reject this restoration path.
+
+FFT output scaling is an explicit mathematical contract, not a library route:
+
+```python
+operation = ti.linalg.record_fft(
+    (1024, 1024), batch_count=2, direction="inverse",
+    output_scale=1 / (1024 * 1024),
+    absolute_tolerance=2e-6, relative_tolerance=3e-5,
+)
+operation.prepare(
+    lto_callbacks=True,
+    nvrtc_library=nvrtc_path,       # caller-provided absolute library paths
+    nvjitlink_library=nvjitlink_path,
+)
+```
+
+The default `output_scale=1` preserves unnormalized FFT behavior. Other finite
+f32 scales describe the same output for every candidate: the existing plans
+append a Forge scaling kernel, while the optional whole-transform LTO candidate
+fuses scaling into cuFFT stores. Add the existing `FftRecipeProvider` to search
+these complete recipes; preparation alone does not select or enable runtime auto.
+This remains compact, out-of-place, batched 2D complex-f32. General load/store
+callbacks, arbitrary callback code and mutable callerInfo state are not exposed.
+
+Ordinary scaling needs no NVRTC/nvJitLink. The optional LTO candidate requires
+compatible external cuFFT/NVRTC/nvJitLink runtimes and native callback-plan support;
+none is added as a portable-wheel shared dependency. Windows dynamic cuFFT
+supports LTO callbacks, unlike the legacy static-library callback route. Follow
+[NVIDIA's callback compatibility rules](https://docs.nvidia.com/cuda/cufft/index.html#lto-load-and-store-callback-routines)
+and keep cuFFT's transitive dependencies discoverable in the process library path.
+The explicit paths identify the supplied compiler/linker, not a guarantee that
+all CUDA combinations have been qualified. Missing dependencies or preparation
+failure do not silently remove scaling or replace the requested callback with
+plain FFT. Existing non-callback candidates remain usable.
+
+Preparation artifacts include callback-source/LTO identity and compiler/linker
+facts. Freeze and resolve deserialize neither executable code nor a vendor plan;
+selected callback materialization recompiles the controlled source and checks
+those facts at that cold boundary. Replay performs no compilation, library probe,
+callerInfo update or added synchronization. There is no extra full-size buffer;
+vendor workspace is reported per plan, while opaque driver/module residency is
+not implied to be zero. JIT preparation time is a cost, not a performance gate.
 
 SpMM uses the same JSON preparation/selection workflow via
 `matrix.record_spmm(..., preparation=saved_preparation)`. With native plan-lease
