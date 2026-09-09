@@ -9,6 +9,7 @@ from taichi_forge.hardware import (
     raster,
     ray,
     sampling,
+    sort,
     tensor,
 )
 
@@ -73,6 +74,7 @@ from taichi_forge.hardware._telemetry import (
 )
 
 __all__ = [
+    "sort",
     "ACTIVATION_MODES",
     "DEPENDENCY_TIERS",
     "DISCOVERY_STATES",

@@ -14,6 +14,7 @@ from tests import test_utils
 
 
 _OPERATION_IDS = (
+    "sort.radix.fidelityfx",
     "runtime.buffer_commands.vulkan",
     "image.copy.vulkan",
     "raster.draw.vulkan",
@@ -202,7 +203,11 @@ def test_hardware_route_and_scoped_performance_evidence_are_separate():
         operation.performance_state == "not_measured" and not operation.performance_scope
         for operation in report.operations
     )
-    payload = report.operations[0].to_dict()
+    payload = next(
+        operation
+        for operation in report.operations
+        if operation.descriptor.operation_id == "runtime.buffer_commands.vulkan"
+    ).to_dict()
     assert payload["hardware_route"] == "qualified"
     assert payload["hardware_acceleration"] == "qualified"
     assert payload["performance_state"] == "not_measured"

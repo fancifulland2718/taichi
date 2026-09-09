@@ -8903,6 +8903,8 @@ void Program::finalize() {
     best_effort("clear Vulkan ray scenes",
                 [&] { vulkan_clear_ray_scenes(); });
     best_effort("clear Vulkan FFT plans", [&] { vulkan_clear_fft_plans(); });
+    best_effort("clear Vulkan Parallel Sort plans",
+                [&] { vulkan_clear_parallel_sort_plans(); });
     best_effort("clear Vulkan primitive caches",
                 [&] { vulkan_clear_primitive_caches(); });
   }
