@@ -23,7 +23,7 @@ retained-provider API，而 discovery probe 始终不执行算法。
 | Vulkan driver/ICD | D0 backend 依赖，不是 D1 provider | OS/GPU driver 安装 | `ti.init(arch=ti.vulkan)` 加 capability query | kernel 与已公开 native Vulkan API |
 | cuSPARSELt 0.8.x-0.9.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户安装可选包 | `ti.hardware.tensor.CusparseLtProvider` / `ti.linalg.record_sparse_matmul` | retained FP16 2:4 capture 与完整 shared-A matmul recipe；无 kernel intrinsic 或自动 rewrite |
 | cuTENSOR 2.0.x-2.7.x | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户安装可选包 | `ti.hardware.tensor.CutensorProvider` / `ti.linalg.record_contraction` | retained root Graph capture 与完整 contraction 数据流；无 kernel intrinsic 或隐式 auto rewrite |
-| AmgX stable C API | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户源码构建 | `ti.hardware.probe(...)` 或 `ti.hardware.linalg.AmgxProvider` | 显式 host-CSR solver；无 Graph/kernel/auto 路线 |
+| AmgX stable C API | 已注册 bundled-adapter ABI | Forge 提供 adapter；用户源码构建 | `ti.hardware.probe(...)` 或 `ti.hardware.linalg.AmgxProvider` | host CSR 拓扑，host/device 数值与向量；无 Graph/kernel/auto 路线 |
 | NCCL | 不属于 Forge 当前单 GPU 范围 | 用户安装系统包 | 没有公开 Forge probe 或执行 API | 仅外部 multi-GPU communication |
 
 已注册外部 provider 会出现在 `ti.hardware.providers()` 中。它们的 probe 检查有界版本族和
@@ -845,7 +845,8 @@ AmgX 不做默认 Python package 搜索。显式传入构建出的 library，或
 report = ti.hardware.probe("amgx", library_path="/opt/amgx/lib/libamgxsh.so")
 ```
 
-执行接口接受连续的 host scalar CSR array 与 host vector。AmgX 持有 device upload、
+执行接口接受连续 host i32 CSR 拓扑；f32/f64 数值可以来自 host array 或 scalar CUDA Taichi ndarray。
+AmgX 持有 device upload、
 hierarchy 和 solver resource；topology 复用时应保留 solver，并传入应用自有的精确配置：
 
 ```python
@@ -854,6 +855,29 @@ with ti.hardware.linalg.AmgxProvider(runtime_path) as provider:
         solution, info = solver.solve(rhs)
         assert info["converged"]
 ```
+
+GPU producer/consumer 可一次绑定固定 device 数组：
+
+```python
+# offsets/columns 是 host i32 数组；下面三个 *_gpu 是 dtype 匹配的
+# 固定一维 f32/f64 CUDA Taichi ndarray。
+with provider.solver(offsets, columns, values_gpu, config) as solver:
+    bound = solver.bind_device(rhs_gpu, solution_gpu, values=values_gpu)
+    # GPU producer 更新系数之后显式刷新：
+    bound.replace_coefficients()
+    solution, info = bound.solve()  # solution 就是 solution_gpu，不是 numpy 副本
+```
+
+bind 时检查 dtype、shape 和 runtime owner 并持有数组，后续使用数组当前内容，不重复查找指针。
+修改系数不会隐式刷新 solver，须调用 `bound.replace_coefficients()` 或
+`solver.replace_coefficients(values_gpu)`。初值策略在 bind 固定；`zero_initial_guess=False`
+读取当前 solution buffer 作为初值。`bound.close()`、solver close 和 runtime reset 会使绑定失效。
+
+这是 **device-buffer 互操作，不是异步或 zero-copy solver**。稳定 AmgX API 仍向/从 vendor 自有存储
+复制；Forge 保留 vendor 调用前既有的 producer 同步，AmgX 的求解控制和 residual 查询仍由 host 控制。
+device 输出复用既有 external-submission 生命周期追踪，不成为 Graph recording 或 CompileIQ 搜索项。
+CSR 拓扑仍在 host，bind 不暗中将 device 拓扑读回。接受 device 数组不等于已有加速或峰值显存下降证据，
+需对实际 AmgX build、配置和应用 workload 测量；vendor hierarchy、向量副本和内部 workspace 仍占显存。
 
 `replace_coefficients()` 在替换数值后总会刷新 solver setup。vendor 导出可选/已弃用的
 `AMGX_solver_resetup` C symbol 时，adapter 使用该 fast path；否则执行完整的

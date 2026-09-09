@@ -214,12 +214,18 @@ Three user-runtime adapters expose explicit retained execution resources:
   vendor `AMGX_solver_resetup` fast path when exported and otherwise falls back
   to a full `AMGX_solver_setup`; hierarchy reuse remains controlled by the
   application-owned AmgX configuration.
+  Numeric values may also be CUDA scalar ndarrays. `bind_device(rhs, solution,
+  values=None, zero_initial_guess=True)` returns an `AmgxDeviceBinding` whose
+  `solve()` and explicit `replace_coefficients()` reuse fixed device buffers.
+  Topology remains host i32 CSR; binding does not imply asynchronous execution,
+  zero-copy storage, Graph recording or automatic search.
 
 All require an initialized CUDA runtime and load the user library only when the
 provider is constructed. Child plans/solvers must close before their provider;
-all objects become invalid after `ti.reset()`. These APIs are direct Python
-calls, never Graph actions, kernel calls, compiler rewrites, or automatic
-provider choices. See the external-provider guide for installation, path,
+all objects become invalid after `ti.reset()`. AmgX remains a direct Python
+call with no Graph route. cuSPARSELt and cuTENSOR also have separate explicit
+recording interfaces; none becomes an automatic provider choice merely by
+installing its runtime. See the external-provider guide for installation, path,
 numeric, and memory gates.
 
 ### `ti.graph.VulkanBufferCommand` and `VulkanBufferCommandRecording` (0.6.3 in development)

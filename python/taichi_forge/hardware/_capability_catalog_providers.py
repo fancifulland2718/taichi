@@ -654,8 +654,8 @@ def d1_provider_operations(_operation):
             dependency_name="AmgX",
             resource_effects=(
                 "read:host_csr",
-                "read:host_rhs",
-                "write:host_solution",
+                "read:host_or_device_values_and_rhs",
+                "write:host_or_device_solution",
                 "read_write:provider_matrix_and_preconditioner",
             ),
             lifetime_policy="provider_plan",
@@ -667,10 +667,14 @@ def d1_provider_operations(_operation):
             ),
             public_api="ti.hardware.linalg.AmgxProvider / AmgxSolver",
             dtypes=("scalar CSR/vector:f32 or f64", "offsets/indices:i32"),
-            layouts=("host contiguous scalar CSR and vectors",),
+            layouts=("host contiguous i32 CSR topology", "host or CUDA scalar ndarray f32/f64 values and vectors"),
             numeric_contracts=("setup(matrix, config) -> solve(rhs, initial_guess)",),
             notes=(
                 "AmgX owns GPU upload, matrix, preconditioner, and solver state behind the stable C API.",
+                "bind_device retains fixed device RHS/solution and optional coefficients; "
+                "shape, dtype, owner and pointer validation occurs at binding, not repeated solve.",
+                "Device buffers avoid Forge numpy staging but still copy into/from AmgX-owned storage; "
+                "device topology, zero-copy and asynchronous stream binding are not supported.",
                 "Fixed-topology coefficient replacement uses AMGX_solver_resetup "
                 "when exported and falls back to full AMGX_solver_setup otherwise; "
                 "hierarchy reuse remains application-configured.",

@@ -170,10 +170,15 @@ Forge 不安装 cuDSS，不新增 Python package requirement，不链接或捆�
   fact，`replace_coefficients(values)` 在 fixed topology 上复用并刷新 solver setup。adapter
   在 vendor 导出可选的 `AMGX_solver_resetup` 时走 fast path，否则回退到完整
   `AMGX_solver_setup`；hierarchy 是否复用仍由应用自有的 AmgX 配置控制。
+  数值也可来自 CUDA scalar ndarray；`bind_device(rhs, solution, values=None,
+  zero_initial_guess=True)` 返回 `AmgxDeviceBinding`，其 `solve()` 和显式
+  `replace_coefficients()` 复用固定 device buffer。拓扑仍是 host i32 CSR，绑定不代表
+  异步、zero-copy、Graph recording 或自动搜索。
 
 三者都要求已初始化 CUDA runtime，只有构造 provider 时才加载用户 library。child
-plan/solver 必须先于 provider 关闭；`ti.reset()` 后所有对象失效。这些 API 只允许 direct
-Python 调用，不是 Graph action、kernel call、compiler rewrite 或 automatic provider choice。
+plan/solver 必须先于 provider 关闭；`ti.reset()` 后所有对象失效。AmgX 仍只有 direct Python
+调用、没有 Graph 路线；cuSPARSELt/cuTENSOR 另有独立显式 recording 接口，均不会因为安装
+vendor runtime 就自动成为默认 provider。
 安装、路径、数值和内存门禁见 external-provider 指南。
 
 ### `ti.graph.VulkanBufferCommand` 与 `VulkanBufferCommandRecording`（0.6.3 开发中）

@@ -26,7 +26,7 @@ APIs for the bounded operations below; discovery probes remain non-executing.
 | Vulkan driver/ICD | D0 backend dependency, not a D1 provider | OS/GPU driver installation | `ti.init(arch=ti.vulkan)` plus capability queries | Kernel and documented native Vulkan APIs |
 | cuSPARSELt 0.8.x-0.9.x | Registered bundled-adapter ABI | Forge adapter; user optional package | `ti.hardware.tensor.CusparseLtProvider` / `ti.linalg.record_sparse_matmul` | Retained FP16 2:4 capture and complete shared-A matmul recipes; no kernel intrinsic or automatic rewrite |
 | cuTENSOR 2.0.x-2.7.x | Registered bundled-adapter ABI | Forge adapter; user optional package | `ti.hardware.tensor.CutensorProvider` / `ti.linalg.record_contraction` | Retained root Graph capture and complete contraction dataflows; no kernel intrinsic or implicit auto rewrite |
-| AmgX stable C API | Registered bundled-adapter ABI | Forge adapter; user source build | `ti.hardware.probe(...)` or `ti.hardware.linalg.AmgxProvider` | Explicit host-CSR solver; no Graph/kernel/auto route |
+| AmgX stable C API | Registered bundled-adapter ABI | Forge adapter; user source build | `ti.hardware.probe(...)` or `ti.hardware.linalg.AmgxProvider` | Host CSR topology, host/device values and vectors; no Graph/kernel/auto route |
 | NCCL | Outside Forge's current single-GPU scope | User system package | No public Forge probe or execution API | External multi-GPU communication only |
 
 Registered external providers appear in `ti.hardware.providers()`. Their probe audits a
@@ -1039,7 +1039,8 @@ must remain visible to the loader:
 report = ti.hardware.probe("amgx", library_path="/opt/amgx/lib/libamgxsh.so")
 ```
 
-Execution accepts contiguous host scalar CSR arrays and host vectors. AmgX
+Execution accepts contiguous host i32 CSR topology and f32/f64 numeric values
+from host arrays or scalar CUDA Taichi ndarrays. AmgX
 owns device upload, hierarchy, and solver resources; keep the solver when the
 topology is reused and provide the exact application-owned configuration:
 
@@ -1049,6 +1050,37 @@ with ti.hardware.linalg.AmgxProvider(runtime_path) as provider:
         solution, info = solver.solve(rhs)
         assert info["converged"]
 ```
+
+For GPU producers and consumers, bind caller-owned device arrays once:
+
+```python
+# offsets/columns are host i32 arrays; values_gpu/rhs_gpu/solution_gpu are
+# scalar CUDA Taichi ndarrays of matching f32/f64 dtype and fixed 1D shape.
+with provider.solver(offsets, columns, values_gpu, config) as solver:
+    bound = solver.bind_device(rhs_gpu, solution_gpu, values=values_gpu)
+    # After a GPU producer changes numeric values, refresh explicitly:
+    bound.replace_coefficients()
+    solution, info = bound.solve()  # solution is solution_gpu, not a numpy copy
+```
+
+Binding validates dtype, shape and runtime ownership and retains buffers.
+Subsequent calls use their live contents without repeating pointer discovery.
+Changing coefficients does not implicitly update the solver: call
+`bound.replace_coefficients()` or `solver.replace_coefficients(values_gpu)`.
+The zero-initial-guess policy is fixed at bind; pass `zero_initial_guess=False`
+to read the current solution buffer as the initial guess. `bound.close()`,
+solver close and runtime reset invalidate the binding.
+
+This is **device-buffer interoperability, not an asynchronous or zero-copy
+solver**. The stable AmgX API copies into/from vendor-owned storage. Forge
+retains the existing producer synchronization before a vendor call; AmgX's
+solver control and residual query remain host-controlled. Device output uses
+the existing external-submission lifetime tracking. It is not Graph-recordable
+or CompileIQ-searchable. CSR topology stays on the host; no device topology
+readback is hidden inside binding. No vendor speedup or peak-VRAM reduction is
+implied by accepting device buffers: measure the actual configured AmgX build
+and application workload. Vendor hierarchy, vector copies and internal
+workspace still contribute to VRAM.
 
 `replace_coefficients()` always refreshes solver setup after replacing numeric
 values. The adapter uses `AMGX_solver_resetup` when that optional/deprecated C
