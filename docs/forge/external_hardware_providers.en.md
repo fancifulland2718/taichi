@@ -1071,6 +1071,30 @@ The zero-initial-guess policy is fixed at bind; pass `zero_initial_guess=False`
 to read the current solution buffer as the initial guess. `bound.close()`,
 solver close and runtime reset invalidate the binding.
 
+When coefficients and RHS are ready together, `bound.update_and_solve()` refreshes
+the bound values and solves under one retained submission. This removes the
+intermediate Forge producer wait; it does not skip vendor setup or convergence
+work. It requires `values=...` at binding and no intervening Forge operation.
+Callers must not mutate the buffers concurrently. The separate methods remain
+available, and fewer waits do not guarantee lower latency for every workload.
+
+The adapter normally recomputes a full residual after solving. Applications that
+do not need that additional observation can choose a fixed policy at creation:
+
+```python
+solver = provider.solver(offsets, columns, values_gpu, config, compute_residual=False)
+bound = solver.bind_device(rhs_gpu, solution_gpu, values=values_gpu)
+solution, info = bound.update_and_solve()
+assert info["residual_norm"] is None  # omitted, not zero or a cached residual
+```
+
+`compute_residual=True` remains the default. Opting out does not modify AmgX's
+configuration or its existing convergence checks; status and iteration count
+are still returned, including nonconvergence. This is an observation policy,
+not an algorithm or CompileIQ search axis. An older Forge adapter can still use
+the default path; an unsupported opt-out is rejected at solver creation using
+an adapter capability bit, without a Forge commit pin or patched AmgX runtime.
+
 This is **device-buffer interoperability, not an asynchronous or zero-copy
 solver**. The stable AmgX API copies into/from vendor-owned storage. Forge
 retains the existing producer synchronization before a vendor call; AmgX's

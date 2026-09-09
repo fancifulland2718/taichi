@@ -879,6 +879,24 @@ device 输出复用既有 external-submission 生命周期追踪，不成为 Gra
 CSR 拓扑仍在 host，bind 不暗中将 device 拓扑读回。接受 device 数组不等于已有加速或峰值显存下降证据，
 需对实际 AmgX build、配置和应用 workload 测量；vendor hierarchy、向量副本和内部 workspace 仍占显存。
 
+系数与 RHS 已一起就绪时，可调用 `bound.update_and_solve()`，在一次资源保留的提交内先刷新绑定的 values，
+再求解，省掉中间一次 Forge producer 等待；它不省略 vendor setup 或收敛判断。绑定时需提供 `values=...`，
+两步之间不能插入其他 Forge 操作，调用者也不能并发修改这些 buffer。原有分开调用的接口保留；等待更少不保证
+每个 workload 都更快。
+
+adapter 默认在求解后额外重算完整残差。不需要该额外观测时，可在创建 solver 时明确固定策略：
+
+```python
+solver = provider.solver(offsets, columns, values_gpu, config, compute_residual=False)
+bound = solver.bind_device(rhs_gpu, solution_gpu, values=values_gpu)
+solution, info = bound.update_and_solve()
+assert info["residual_norm"] is None  # 明确缺测，不是0或缓存残差
+```
+
+默认仍为 `compute_residual=True`。关闭额外重算不修改 AmgX 配置及其原有收敛判断；仍返回状态与迭代数，
+不收敛也不会伪装成成功。这是观测策略，不是算法或 CompileIQ 搜索轴。旧 Forge adapter 的默认路径继续可用；
+不支持显式关闭时，创建 solver 根据 adapter capability bit 明确拒绝，不绑定 Forge commit，也不要求魔改 AmgX。
+
 Forge 拥有薄 adapter、buffer/生命周期接入及其诊断调用策略，不维护 AmgX fork。本机 Windows 使用未经修改的 AmgX 2.5.0
 检查了 f32/f64 device 输入、系数更新及后续 GPU 消费；trace 显示收益来自减少大数组 host/device 往返，
 不是 Krylov 算法加速或 vendor workspace 减少。即使输入驻留 GPU，AMG 系数 setup 内部仍可能分配临时空间和
