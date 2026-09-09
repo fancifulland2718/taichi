@@ -80,6 +80,7 @@ class CusolverDnCapture:
                 )
         self._closed = False
         self._launch = partial(launch, self._exec, None)
+        self._solve_ready = partial(binding._submit, "solve")
         self._submit = self._run
         plan._captures.add(self)
         self._identity = _digest(
@@ -119,7 +120,7 @@ class CusolverDnCapture:
             ) as submission:
                 check(submission.invoke(self._launch), "launch solver capture")
             if self.mode == "both":
-                self.binding.solve = partial(self.binding._submit, "solve")
+                self.binding.solve = self._solve_ready
         return self.binding.solution
 
     def record(self, *, a="a", rhs="rhs", solution="solution"):

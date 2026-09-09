@@ -39,18 +39,22 @@ def test_cusolverdn_capture_live_inputs_root_order_and_retirement(
             def cold_only(*args):
                 raise AssertionError("vendor or capture called during replay")
 
-            monkeypatch.setattr(binding, "_invoke", cold_only)
-            for diagonal in (2, 4, 8):
-                host_a = (
-                    np.eye(n, dtype=np.float32 if dtype == ti.f32 else np.float64)
-                    * diagonal
-                )
-                a.from_numpy(host_a)
-                rhs.fill(diagonal * 3)
-                graph.run(published)
-                np.testing.assert_allclose(output.to_numpy(), 3, rtol=1e-5)
-                np.testing.assert_array_equal(a.to_numpy(), host_a)
-                assert plan.status()["solve_ok"]
+            from taichi_forge.hardware import _cusolverdn_capture as capture_module
+
+            with monkeypatch.context() as hot:
+                hot.setattr(binding, "_invoke", cold_only)
+                hot.setattr(capture_module, "partial", cold_only)
+                for diagonal in (2, 4, 8):
+                    host_a = (
+                        np.eye(n, dtype=np.float32 if dtype == ti.f32 else np.float64)
+                        * diagonal
+                    )
+                    a.from_numpy(host_a)
+                    rhs.fill(diagonal * 3)
+                    graph.run(published)
+                    np.testing.assert_allclose(output.to_numpy(), 3, rtol=1e-5)
+                    np.testing.assert_array_equal(a.to_numpy(), host_a)
+                    assert plan.status()["solve_ok"]
             action.close()
             with pytest.raises(ti.TaichiRuntimeError, match="closed"):
                 action.run()
