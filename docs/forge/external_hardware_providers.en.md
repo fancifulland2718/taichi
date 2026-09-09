@@ -124,6 +124,14 @@ profiles do not change. Exact workspace/private-buffer bytes and argument images
 are reported separately from unknown vendor/driver storage. Neither fusion nor
 packing is a universal winner; host, device and memory evidence remain separate.
 
+The shared CUDA operand-packing helper uses a padded warp-contiguous tile for
+wide axes and retains its compact tile for narrow axes, selected from frozen
+shape facts. Matmul and contraction reuse this lowering without a new vendor
+dependency or public block/tile axis. Its implementation identity is part of
+preparation provenance: old packing observations are not silently reused after
+a lowering change. Larger per-block shared storage is not additional persistent
+Graph workspace, and packing gains are not a claim of end-to-end GEMM speedup.
+
 ### FFT and SpMM preparation and reuse
 
 Both separable FFT strategies transform all rows first and use the output array

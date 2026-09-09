@@ -11,7 +11,7 @@ from taichi_forge.types import ndarray
 from taichi_forge.types.primitive_types import f32, i32
 
 
-TILED_PACKING_IMPLEMENTATION = "f32-permutation-tile16x16-padded-v1"
+TILED_PACKING_IMPLEMENTATION = "f32-permutation-warp-contiguous-padded-v2"
 
 
 @lru_cache(maxsize=128)
@@ -28,28 +28,34 @@ def tiled_permutation_kernel(shape, permutation):
     assert rank in (2, 3) and row_axis != column_axis
     rows, columns = shape[row_axis], shape[column_axis]
     outer_axes = tuple(i for i in range(rank) if i not in (row_axis, column_axis))
-    row_tiles, column_tiles = (rows + 15) // 16, (columns + 15) // 16
-    workers = prod(shape[i] for i in outer_axes) * row_tiles * column_tiles * 128
+    # A full warp accesses contiguous elements on both sides of a 32-wide
+    # transpose. Keep the compact tile for narrow axes; choose only from frozen
+    # shape facts, never by replay probing or a new public launch parameter.
+    tile_width = 32 if min(rows, columns) >= 32 else 16
+    block_size = tile_width * 8
+    row_tiles = (rows + tile_width - 1) // tile_width
+    column_tiles = (columns + tile_width - 1) // tile_width
+    workers = prod(shape[i] for i in outer_axes) * row_tiles * column_tiles * block_size
 
     @kernel
     def pack_tiled(
         source: ndarray(dtype=f32, ndim=rank),
         destination: ndarray(dtype=f32, ndim=rank),
     ):
-        loop_config(block_dim=128)
+        loop_config(block_dim=block_size)
         for worker in range(workers):
-            tile = simt.block.SharedArray((16, 17), f32)
-            lane = worker % 128
-            x, y = lane % 16, lane // 16
-            tile_index = worker // 128
-            column = (tile_index % column_tiles) * 16
-            row = ((tile_index // column_tiles) % row_tiles) * 16
+            tile = simt.block.SharedArray((tile_width, tile_width + 1), f32)
+            lane = worker % block_size
+            x, y = lane % tile_width, lane // tile_width
+            tile_index = worker // block_size
+            column = (tile_index % column_tiles) * tile_width
+            row = ((tile_index // column_tiles) % row_tiles) * tile_width
             outer = tile_index // (column_tiles * row_tiles)
             index = Vector.zero(i32, rank)
             for axis in impl.static(outer_axes[::-1]):
                 index[axis] = outer % shape[axis]
                 outer = outer // shape[axis]
-            for offset in impl.static((0, 8)):
+            for offset in impl.static(range(0, tile_width, 8)):
                 # Adjacent lanes read the source's contiguous axis.
                 index[row_axis] = row + x
                 index[column_axis] = column + y + offset
@@ -59,7 +65,7 @@ def tiled_permutation_kernel(shape, permutation):
                 if row + x < rows and column + y + offset < columns:
                     tile[y + offset, x] = source[original]
             simt.block.sync()
-            for offset in impl.static((0, 8)):
+            for offset in impl.static(range(0, tile_width, 8)):
                 index[row_axis] = row + y + offset
                 index[column_axis] = column + x
                 if row + y + offset < rows and column + x < columns:
