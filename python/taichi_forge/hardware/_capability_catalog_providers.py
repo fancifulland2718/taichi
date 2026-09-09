@@ -178,7 +178,6 @@ def d1_provider_operations(_operation):
                 "compact row-major dense arrays",
                 "explicit preparation or imported expected facts",
                 "caller-qualified finite-input tolerance",
-                "explicit output_scale with separate postprocess or opt-in LTO store fusion",
             ),
             dtypes=("matrix:f32", "input:f32", "output:f32"),
             layouts=(
@@ -356,6 +355,7 @@ def d1_provider_operations(_operation):
                 "compact out-of-place arrays",
                 "explicit preparation or imported expected facts",
                 "caller-qualified finite-input tolerance",
+                "explicit output_scale with separate postprocess or opt-in LTO store fusion",
             ),
             dtypes=("real:f32", "complex-pair:f32"),
             shapes_or_tiles=(
