@@ -361,7 +361,7 @@ def d1_provider_operations(_operation):
             "existing_public",
             activation_mode="explicit_hardware_api",
             dependency_name="cuFFT",
-            resource_effects=("read:input", "write:output", "write:workspace"),
+            resource_effects=("read:input (read_write for C2R)", "write:output", "write:workspace"),
             lifetime_policy="provider_plan",
             update_policy="rebind",
             requirements=("compatible cuFFT shared library",),
@@ -369,11 +369,12 @@ def d1_provider_operations(_operation):
             recipe_semantic_api="ti.linalg.record_fft",
             recipe_provider_api="ti.hardware.fft.FftRecipeProvider",
             recipe_scope=(
-                "CUDA batched 2D complex-f32",
+                "CUDA batched 2D C2C/R2C/C2R f32",
                 "compact out-of-place arrays",
                 "explicit preparation or imported expected facts",
                 "caller-qualified finite-input tolerance",
-                "explicit output_scale with separate postprocess or opt-in LTO store fusion",
+                "explicit output_scale with separate postprocess; optional LTO store fusion for C2C only",
+                "real transforms use whole plans and enclosing Graph executor recipes, not C2C decomposition axes",
             ),
             dtypes=("real:f32", "complex-pair:f32"),
             shapes_or_tiles=(
@@ -392,6 +393,7 @@ def d1_provider_operations(_operation):
                 "inverse_scale:1/length",
             ),
             notes=(
+                "C2R overwrites its Hermitian half-spectrum input, even out of place; replenish it before replay unless an upstream producer does so.",
                 "Graph FFT output_scale may use an explicitly prepared LTO store callback with external NVRTC/nvJitLink; arbitrary callbacks, multi-GPU and independently arbitrary per-axis strides remain excluded.",
                 "Identical plan descriptors reuse a runtime-generation cuFFT plan; workspace bytes are queried from cuFFT.",
                 "Discovery verifies the operation symbol contract only; transitive provider dependencies and workspace allocation are qualified when the first plan is created.",

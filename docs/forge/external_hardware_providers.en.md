@@ -181,6 +181,37 @@ these complete recipes; preparation alone does not select or enable runtime auto
 This remains compact, out-of-place, batched 2D complex-f32. General load/store
 callbacks, arbitrary callback code and mutable callerInfo state are not exposed.
 
+Real transforms use the same semantic entry:
+
+```python
+forward = ti.linalg.record_fft(
+    (height, width), transform="r2c", input="signal", output="spectrum",
+    absolute_tolerance=1e-4, relative_tolerance=1e-4,
+)
+inverse = ti.linalg.record_fft(
+    (height, width), transform="c2r", input="spectrum", output="reconstructed",
+    output_scale=1 / (height * width),
+    absolute_tolerance=1e-4, relative_tolerance=1e-4,
+)
+```
+
+R2C maps scalar f32 `(H,W)` to an interleaved half-spectrum `(H,W//2+1,2)`;
+C2R reverses those shapes. Prepend the batch axis when `batch_count > 1`. The
+last width can be odd or even. C2R requires a valid Hermitian spectrum, including
+real self-conjugate bins. **C2R overwrites its input even out of place**; its
+recording declares that write at freeze time. Replenish the spectrum before
+each replay, normally through an upstream FFT/producer. There is no implicit
+preservation copy or per-replay symmetry check. The default is unnormalized;
+the scale above normalizes the inverse.
+
+Real FFTs support plan-free preparation artifacts, complete Graph search and
+immutable binding frames. They currently use only the whole-transform FFT plan:
+the enclosing Graph execution strategies are searchable, but C2C decomposition
+and LTO callback candidates do not apply. `prepare()` records only applicable
+plans, and `prepare(lto_callbacks=True)` rejects real transforms before compiler
+loading. This does not change the distinct expert `CufftPlanND` scope or enable
+runtime auto. Input mutation follows the [cuFFT data-layout contract](https://docs.nvidia.com/cuda/cufft/index.html#data-layout).
+
 Ordinary scaling needs no NVRTC/nvJitLink. The optional LTO candidate requires
 compatible external cuFFT/NVRTC/nvJitLink runtimes and native callback-plan support;
 none is added as a portable-wheel shared dependency. Windows dynamic cuFFT

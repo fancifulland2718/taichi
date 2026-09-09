@@ -139,6 +139,32 @@ operation.prepare(
 recipe，准备候选不会选择它，也不启用 runtime auto。范围仍是紧凑、输入输出分离、batched 2D complex-f32；
 不开放任意 callback 代码、通用 load/store 回调或可变 callerInfo 状态。
 
+实数变换使用同一个语义入口：
+
+```python
+forward = ti.linalg.record_fft(
+    (height, width), transform="r2c", input="signal", output="spectrum",
+    absolute_tolerance=1e-4, relative_tolerance=1e-4,
+)
+inverse = ti.linalg.record_fft(
+    (height, width), transform="c2r", input="spectrum", output="reconstructed",
+    output_scale=1 / (height * width),
+    absolute_tolerance=1e-4, relative_tolerance=1e-4,
+)
+```
+
+R2C 将标量 f32 `(H,W)` 映射到 interleaved half-spectrum `(H,W//2+1,2)`；C2R 反向转换。
+`batch_count > 1` 时在前面增加 batch 轴，width 可以为奇数或偶数。C2R 要求合法 Hermitian spectrum，
+包括实数 self-conjugate bins。**C2R 即使 out-of-place 也会覆盖输入**，recording 在 freeze 时声明该写依赖。
+每次 replay 前应重新生成 spectrum，通常由 Graph 内的上游 FFT/producer 完成；不会隐式复制来保留输入，
+也不会每次检查频谱对称性。默认不归一化，上面的 output_scale 显式实现归一化逆变换。
+
+实数 FFT 支持无 plan 的 preparation artifact 恢复、完整 Graph 搜索和 immutable binding frames；目前只提供
+whole-transform FFT plan，搜索的是外层 Graph 执行策略，不适用 C2C 分解或 LTO callback 候选。
+`prepare()` 只记录适用计划，`prepare(lto_callbacks=True)` 会在加载编译器前明确拒绝实数变换。
+这不改变独立 expert `CufftPlanND` 的支持范围，也不启用 runtime auto。输入变更遵循
+[cuFFT data-layout 合同](https://docs.nvidia.com/cuda/cufft/index.html#data-layout)。
+
 普通独立缩放不需要 NVRTC/nvJitLink。LTO 候选需要兼容的外部 cuFFT/NVRTC/nvJitLink 和 native callback-plan
 能力，不向 portable wheel 增加这些 shared runtime 依赖。Windows 动态 cuFFT 支持 LTO callback，不能与
 legacy 静态库回调混淆；版本关系遵循 [NVIDIA callback 合同](https://docs.nvidia.com/cuda/cufft/index.html#lto-load-and-store-callback-routines)，

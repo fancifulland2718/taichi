@@ -230,7 +230,12 @@ class CufftRecording(BackendCommandRecording):
     @property
     def resource_effects(self):
         return (
-            ResourceEffect(self.input, GraphAccess.READ),
+            # Out-of-place C2R still overwrites its half-spectrum input. This
+            # is a freeze-time dependency, not a replay-time alias check.
+            ResourceEffect(
+                self.input,
+                GraphAccess.READ_WRITE if self.plan.transform == "c2r" else GraphAccess.READ,
+            ),
             ResourceEffect(self.output, GraphAccess.WRITE),
         )
 

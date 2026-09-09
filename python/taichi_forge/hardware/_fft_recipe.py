@@ -39,13 +39,17 @@ class FftRecipeProvider(GraphRuntimeFragmentProvider):
             "cross-batch-column-plan",
             "output-scale-fusion",
         ),
-        domain_version="fft-retained-plans-v4",
+        domain_version="fft-retained-plans-v5",
         semantic_fingerprint="compact-2d-c2c-finite-f32-v1",
     )
 
     def fragments(self, definition):
         fragments = []
         for path, region_id, source, _ in _sources(definition):
+            if source.transform != "c2c":
+                # Real regions already lower through the complete baseline and
+                # enclosing executor. Do not invent another FFT algorithm axis.
+                continue
             strategy = "row_batch_column_inplace"
             prepared = source.preparation_report()
             if strategy not in prepared:
@@ -119,11 +123,18 @@ class FftRecipeProvider(GraphRuntimeFragmentProvider):
         assembly.select_operation(executable, rewrite)
 
     def explain_discovery(self, definition):
-        count = sum(1 for _ in _sources(definition))
+        sources = tuple(_sources(definition))
+        count = sum(source.transform == "c2c" for _, _, source, _ in sources)
         return {
             "source": "provider_declared_not_measured",
-            "semantic_source_count": count,
-            "reason": "prepared_batched_2d_sources" if count else "no_frozen_fft_semantic_source",
+            "semantic_source_count": len(sources),
+            "c2c_decomposition_source_count": count,
+            "real_whole_plan_source_count": len(sources) - count,
+            "real_plan_scope": "whole-transform baseline and enclosing Graph executor; no C2C decomposition/callback",
+            "reason": (
+                "prepared_batched_2d_sources" if count else
+                ("real_whole_plan_with_enclosing_executor" if sources else "no_frozen_fft_semantic_source")
+            ),
             "semantic_api": "ti.linalg.record_fft",
             "scope": "CUDA complex-f32, compact batched 2D, prepared or imported expected facts",
         }

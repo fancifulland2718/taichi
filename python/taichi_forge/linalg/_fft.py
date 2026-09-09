@@ -18,6 +18,8 @@ from taichi_forge.hardware._fft import (
     _CufftPlanBase,
     _positive_int,
     _positive_int_tuple,
+    _resolve_direction,
+    _transform_value,
 )
 from taichi_forge.hardware._admission import _current_cuda_device_scope
 from taichi_forge.hardware._native_adapter import native_recording_node, validate_runtime_generation
@@ -34,6 +36,21 @@ class _SeparableFftPlan(_CufftPlanBase):
 
 
 class _FftDescription:
+
+    @property
+    def transform(self):
+        return {"complex_to_complex": "c2c", "real_to_complex": "r2c", "complex_to_real": "c2r"}[
+            self.semantics["transform"]
+        ]
+
+    def _shape(self, output=False):
+        semantics = self.semantics
+        height, width = semantics["dimensions"]
+        complex_values = self.transform != ("c2r" if output else "r2c")
+        if complex_values and self.transform != "c2c":
+            width = width // 2 + 1
+        shape = (height, width, 2) if complex_values else (height, width)
+        return shape if semantics["batch_count"] == 1 else (semantics["batch_count"], *shape)
 
     @property
     def output_scale(self):
@@ -64,6 +81,10 @@ class _FftDescription:
         return self.semantics["direction"]
 
     def physical_config(self, strategy):
+        if self.transform != "c2c" and strategy != "whole_transform":
+            raise ValueError(
+                "Real FFT currently has only the whole-transform plan; C2C decompositions/callbacks do not apply"
+            )
         if strategy not in (
             "whole_transform",
             "row_batch_column_inplace",
@@ -90,9 +111,7 @@ class _FftDescription:
         if self.output_scale != 1.0:
             config["output_scale"] = self.output_scale
             config["postprocess"] = (
-                "cufft_lto_store_scale_v1"
-                if strategy == "whole_transform_store_scale"
-                else "forge_f32_scale_kernel_v1"
+                "cufft_lto_store_scale_v1" if strategy == "whole_transform_store_scale" else "forge_f32_scale_kernel_v1"
             )
             if strategy != "whole_transform_store_scale":
                 config["phases"] += ("separate_output_scale",)
@@ -147,7 +166,9 @@ class _FftPlanCatalog(_FftDescription):
                 started = time.perf_counter()
                 semantics = self.semantics
                 if strategy == "whole_transform":
-                    plan = CufftPlanND(semantics["dimensions"], batch_count=semantics["batch_count"])
+                    plan = CufftPlanND(
+                        semantics["dimensions"], batch_count=semantics["batch_count"], transform=self.transform
+                    )
                 elif strategy in ("row_batch_column_inplace", "row_batch_cross_batch_columns"):
                     plan = _SeparableFftPlan(
                         semantics["dimensions"],
@@ -197,12 +218,13 @@ class _FftPlanCatalog(_FftDescription):
             from taichi_forge.types.primitive_types import f32
 
             semantics = self.semantics
-            rank = 4 if semantics["batch_count"] > 1 else 3
+            rank = len(self._shape(output=True))
             builder.dispatch(
                 output_scale_kernel(
                     tuple(semantics["dimensions"]),
                     semantics["batch_count"],
                     self.output_scale,
+                    transform=self.transform,
                 ),
                 Arg(ArgKind.NDARRAY, self.output, f32, ndim=rank),
             )
@@ -238,8 +260,10 @@ class _FftCaptureDescription(_CudaGraphCaptureRecipe):
         from taichi_forge.types.primitive_types import f32
 
         semantics = self._source.semantics
-        rank = 4 if semantics["batch_count"] > 1 else 3
-        arguments = [Arg(ArgKind.NDARRAY, name, f32, ndim=rank) for name in (self._source.input, self._source.output)]
+        arguments = [
+            Arg(ArgKind.NDARRAY, self._source.input, f32, ndim=len(self._source._shape())),
+            Arg(ArgKind.NDARRAY, self._source.output, f32, ndim=len(self._source._shape(output=True))),
+        ]
         append = getattr(builder, "_dispatch_cuda_capture_description", None)
         if append is None:
             raise TaichiRuntimeError("Plan-free FFT restoration is unavailable in this native runtime")
@@ -265,7 +289,10 @@ class _FftDescriptionRecording(BackendCommandRecording):
     @property
     def resource_effects(self):
         return (
-            ResourceEffect(self._graph_fft_source.input, GraphAccess.READ),
+            ResourceEffect(
+                self._graph_fft_source.input,
+                GraphAccess.READ_WRITE if self._graph_fft_source.transform == "c2r" else GraphAccess.READ,
+            ),
             ResourceEffect(self._graph_fft_source.output, GraphAccess.WRITE),
         )
 
@@ -322,14 +349,18 @@ class _FftRecording(CufftRecording):
 
 
 class FftOperation(_FftDescription, NativeGraphNode):
-    """A compact batched 2D complex-f32 transform with explicit tolerances.
+    """A compact batched 2D f32 transform with explicit tolerances.
 
-    Input and output are distinct scalar f32 arrays shaped (H, W, 2), or
+    C2C input and output are distinct scalar f32 arrays shaped (H, W, 2), or
     (batch, H, W, 2) when batch > 1. The last axis is [real, imaginary].
     By default both directions are unnormalized: inverse(forward(x)) = H * W * x.
     Explicit output_scale is rounded to finite f32 and applied after the FFT;
     output_scale=1/(H*W) therefore describes a normalized inverse transform.
     Only CUDA is currently implemented. Values/qualification are caller-owned.
+    R2C uses real (H,W) input and (H,W//2+1,2) half-spectrum output; C2R
+    reverses those shapes and overwrites its Hermitian half-spectrum input.
+    Add the batch axis for batch > 1. Real plans currently use whole-transform
+    execution, composable with Graph binding frames, not C2C decompositions.
     """
 
     def __init__(
@@ -337,7 +368,8 @@ class FftOperation(_FftDescription, NativeGraphNode):
         dimensions,
         *,
         batch_count=1,
-        direction="forward",
+        direction=None,
+        transform="c2c",
         input="input",
         output="output",
         absolute_tolerance,
@@ -349,8 +381,8 @@ class FftOperation(_FftDescription, NativeGraphNode):
         batch_count = _positive_int(batch_count, "FFT batch_count")
         if len(dimensions) != 2:
             raise ValueError("Graph FFT currently requires exactly two transform dimensions")
-        if direction not in ("forward", "inverse"):
-            raise ValueError("Graph FFT direction must be forward or inverse")
+        _transform_value(transform)
+        direction, _ = _resolve_direction(transform, direction)
         if any(not isinstance(name, str) or not name for name in (input, output)) or input == output:
             raise ValueError("Graph FFT needs two distinct nonempty binding names")
         tolerances = []
@@ -368,9 +400,7 @@ class FftOperation(_FftDescription, NativeGraphNode):
         try:
             output_scale = struct.unpack("f", struct.pack("f", output_scale))[0]
         except (OverflowError, struct.error) as exc:
-            raise ValueError(
-                "Graph FFT output_scale must be representable as finite f32"
-            ) from exc
+            raise ValueError("Graph FFT output_scale must be representable as finite f32") from exc
         if not math.isfinite(output_scale):
             raise ValueError("Graph FFT output_scale must be finite")
         self._semantics_json = _canonical_json(
@@ -384,11 +414,25 @@ class FftOperation(_FftDescription, NativeGraphNode):
                 "direction": direction,
                 "normalization": "none",
                 **({"output_scale": output_scale} if output_scale != 1.0 else {}),
-                "transform": "complex_to_complex",
-                "layout": "compact_row_major_interleaved_f32",
+                "transform": {"c2c": "complex_to_complex", "r2c": "real_to_complex", "c2r": "complex_to_real"}[
+                    transform
+                ],
+                "layout": (
+                    "compact_row_major_interleaved_f32"
+                    if transform == "c2c"
+                    else "compact_row_major_real_half_spectrum_f32"
+                ),
+                **(
+                    {
+                        "input_access": "read_write",
+                        "spectrum_contract": "Hermitian half-spectrum including real self-conjugate bins",
+                    }
+                    if transform == "c2r"
+                    else {}
+                ),
                 "numerical_contract": {
-                    "input_dtype": "complex_f32",
-                    "output_dtype": "complex_f32",
+                    "input_dtype": "f32" if transform == "r2c" else "complex_f32",
+                    "output_dtype": "f32" if transform == "c2r" else "complex_f32",
                     "accumulation": "f32",
                     "absolute_tolerance": tolerances[0],
                     "relative_tolerance": tolerances[1],
@@ -406,7 +450,7 @@ class FftOperation(_FftDescription, NativeGraphNode):
             self._catalog = _FftPlanCatalog(self)
             return
         started = time.perf_counter()
-        plan = CufftPlanND(dimensions, batch_count=batch_count)
+        plan = CufftPlanND(dimensions, batch_count=batch_count, transform=transform)
         self._plans["whole_transform"] = plan
         self._component_json = _canonical_json(plan._retained_identity.to_dict()["provider_scope"])
         self._preparation["whole_transform"] = {
@@ -473,10 +517,7 @@ class FftOperation(_FftDescription, NativeGraphNode):
     def _graph_recipe_description(self):
         if self._closed:
             raise TaichiRuntimeError("FFT operation has been closed")
-        if (
-            self._preparation_origin == "current_process_plan_creation"
-            and self.output_scale == 1.0
-        ):
+        if self._preparation_origin == "current_process_plan_creation" and self.output_scale == 1.0:
             return None
         validate_runtime_generation(self._catalog, "FFT recipe catalog belongs to a retired runtime")
         return native_recording_node(
@@ -485,9 +526,7 @@ class FftOperation(_FftDescription, NativeGraphNode):
             debug_info={"kind": "fft_transform"},
         ).compile()
 
-    def prepare(
-        self, *, lto_callbacks=False, nvrtc_library=None, nvjitlink_library=None
-    ):
+    def prepare(self, *, lto_callbacks=False, nvrtc_library=None, nvjitlink_library=None):
         """Prepare available decompositions before search, without executing FFT.
 
         The operation retains prepared plans until close. Graphs separately
@@ -504,20 +543,22 @@ class FftOperation(_FftDescription, NativeGraphNode):
             raise TaichiRuntimeError("FFT operation has been closed")
         if not isinstance(lto_callbacks, bool):
             raise TypeError("lto_callbacks must be bool")
-        if not lto_callbacks and (
-            nvrtc_library is not None or nvjitlink_library is not None
-        ):
+        if lto_callbacks and self.transform != "c2c":
+            raise ValueError("Real FFT does not support the C2C LTO store callback")
+        if not lto_callbacks and (nvrtc_library is not None or nvjitlink_library is not None):
             raise ValueError("JIT libraries require explicit lto_callbacks=True")
         if lto_callbacks and self.output_scale == 1.0:
-            raise ValueError(
-                "A store-scaling candidate requires non-identity output_scale"
-            )
+            raise ValueError("A store-scaling candidate requires non-identity output_scale")
         if self._preparation_origin != "current_process_plan_creation":
             for strategy in self._preparation:
                 self._plans[strategy] = self._catalog._recording(strategy).plan
             return self.preparation_report()
         baseline = self._plans["whole_transform"]
         baseline._validate_lifetime()
+        if self.transform != "c2c":
+            # A real physical plan is useful without inventing another named
+            # algorithm: enclosing Graph executor recipes remain searchable.
+            return self.preparation_report()
         info = baseline._runtime_prog._cuda_cufft_plan_memory_statistics(baseline._handle)
         if "separable" not in info:
             raise TaichiRuntimeError("Separable FFT plans are unavailable in this native runtime")
@@ -586,7 +627,8 @@ def record_fft(
     dimensions,
     *,
     batch_count=1,
-    direction="forward",
+    direction=None,
+    transform="c2c",
     input="input",
     output="output",
     absolute_tolerance,
@@ -594,7 +636,11 @@ def record_fft(
     preparation=None,
     output_scale=1.0,
 ):
-    """Describe a 2D C2C FFT with optional explicit output_scale (default 1).
+    """Describe a 2D C2C/R2C/C2R FFT with explicit output_scale (default 1).
+
+    C2R is inverse, overwrites its input, and requires a valid Hermitian
+    half-spectrum. Real transforms use the whole plan; the existing Graph
+    executor recipes can still optimize its enclosing dataflow.
 
     Call operation.prepare() before using the explicit FftRecipeProvider.
     Alternatively, pass a prior operation.preparation_artifact() as preparation
@@ -606,6 +652,7 @@ def record_fft(
         dimensions,
         batch_count=batch_count,
         direction=direction,
+        transform=transform,
         input=input,
         output=output,
         absolute_tolerance=absolute_tolerance,
