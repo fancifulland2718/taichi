@@ -1,4 +1,5 @@
 import gc
+import os
 
 import numpy as np
 import pytest
@@ -11,6 +12,89 @@ from tests.python.hardware_provider_lifecycle_qualification import (
     stress_iterations,
 )
 from tests.python.hardware_process_memory import ProcessMemoryPlateau
+
+
+def _callback_compiler_paths():
+    nvrtc = os.environ.get("TI_TEST_NVRTC_LIBRARY_PATH")
+    linker = os.environ.get("TI_TEST_NVJITLINK_LIBRARY_PATH")
+    if not nvrtc or not linker:
+        pytest.skip("explicit optional NVRTC/nvJitLink test paths are not configured")
+    return {"nvrtc_library": nvrtc, "nvjitlink_library": linker}
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_cufft_lto_scale_cache_identity_and_capture_ownership():
+    from taichi_forge._lib import core
+    from taichi_forge.hardware._fft_lto import _CufftStoreScalePlan, _StoreScaleCallback
+    from taichi_forge.lang import impl
+
+    paths = _callback_compiler_paths()
+    plain = ti.hardware.fft.CufftPlanND((32, 64), batch_count=2)
+    callback = _StoreScaleCallback(0.25, **paths)
+    scaled = _CufftStoreScalePlan((32, 64), 2, callback)
+    same = _CufftStoreScalePlan((32, 64), 2, callback)
+    other = _CufftStoreScalePlan((32, 64), 2, _StoreScaleCallback(-0.125, **paths))
+    assert ti.hardware.fft.cache_statistics().live_plans == 3
+    assert (
+        scaled._graph_provider_memory_identity()
+        != plain._graph_provider_memory_identity()
+    )
+    assert (
+        scaled._graph_provider_memory_identity()
+        != other._graph_provider_memory_identity()
+    )
+    arrays = {name: ti.ndarray(ti.f32, (2, 32, 64, 2)) for name in ("input", "output")}
+    rng = np.random.default_rng(763)
+    values = rng.uniform(-0.25, 0.25, arrays["input"].shape).astype(np.float32)
+    arrays["input"].from_numpy(values)
+    builder = ti.graph.GraphBuilder()
+    builder.append_native(scaled.record())
+    graph = builder.compile()
+    native = core._CudaGraphBindingExecutor(
+        graph._spec.nodes[0].compiled_graph, impl.current_cfg(), impl.get_runtime().prog
+    )
+    arguments = {name: array.arr for name, array in arrays.items()}
+    frame = native.prepare(arguments)
+    native.run(frame)
+    expected = np.fft.fft2(values[..., 0] + 1j * values[..., 1], axes=(-2, -1)) * 0.25
+    np.testing.assert_allclose(
+        arrays["output"].to_numpy(),
+        np.stack((expected.real, expected.imag), -1),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    same.close()
+    other.close()
+    plain.close()
+    # Immutable frames retain the native plan even after its public handle is
+    # closed; changed device values are not an implicit callback snapshot.
+    scaled.close()
+    arrays["input"].from_numpy(values * 2)
+    try:
+        for _ in range(5):
+            native.run(frame)
+        np.testing.assert_allclose(
+            arrays["output"].to_numpy(),
+            np.stack((expected.real, expected.imag), -1) * 2,
+            atol=4e-5,
+            rtol=2e-5,
+        )
+        with pytest.raises(RuntimeError, match="fixed plan"):
+            native.prepare(arguments)
+    finally:
+        native.close()
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_cufft_lto_empty_artifact_fails_before_plan_creation():
+    from taichi_forge.lang import impl
+
+    before = ti.hardware.fft.cache_statistics()
+    with pytest.raises(RuntimeError, match="LTO IR"):
+        impl.get_runtime().prog._create_cuda_cufft_store_callback_plan(
+            (32, 64), 2, b"", "store"
+        )
+    assert ti.hardware.fft.cache_statistics() == before
 
 
 @test_utils.test(arch=ti.cpu)

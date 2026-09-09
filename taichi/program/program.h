@@ -1355,6 +1355,11 @@ class TI_DLL_EXPORT Program {
 
   std::uint64_t create_cuda_cufft_cross_batch_plan(std::vector<int> dimensions,
                                                    int batch_count);
+  std::uint64_t create_cuda_cufft_store_callback_plan(
+      std::vector<int> dimensions,
+      int batch_count,
+      const std::string &lto_ir,
+      const std::string &symbol);
   std::uint64_t create_cuda_cufft_plan_many_decomposed(
       std::vector<int> dimensions,
       std::vector<int> input_embed,
@@ -1366,7 +1371,9 @@ class TI_DLL_EXPORT Program {
       int batch_count,
       int transform_kind,
       bool separable,
-      bool cross_batch);
+      bool cross_batch,
+      const std::string &store_callback_ir = {},
+      const std::string &store_callback_symbol = {});
 
   std::size_t cuda_cufft_execute(std::uint64_t handle,
                                  Ndarray *input,

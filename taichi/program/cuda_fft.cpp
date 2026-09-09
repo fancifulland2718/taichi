@@ -45,6 +45,8 @@ struct CufftPlanDescriptor {
   CufftTransformKind transform_kind{CufftTransformKind::c2c};
   bool separable{false};
   bool cross_batch{false};
+  std::string store_callback_ir;
+  std::string store_callback_symbol;
 };
 
 CufftTransformKind validate_transform_kind(int transform_kind) {
@@ -233,6 +235,12 @@ std::string cufft_plan_cache_key(const CufftPlanDescriptor &descriptor) {
     key << (descriptor.cross_batch ? ":row-batch-cross-batch-columns"
                                    : ":row-batch-column-inplace");
   }
+  if (!descriptor.store_callback_ir.empty()) {
+    // Binary-safe, exact identity: never alias a callback plan with a plain
+    // transform or with different callback math. This is a cold weak cache.
+    key << ":store-lto:" << descriptor.store_callback_symbol.size() << ':'
+        << descriptor.store_callback_symbol << ':' << descriptor.store_callback_ir;
+  }
   return key.str();
 }
 
@@ -299,7 +307,38 @@ class CudaFftPlan final : public CudaProviderCompletionResource {
                   ? kCufftR2C
                   : kCufftC2R;
     int plan_status = 0;
-    if (use_plan_many) {
+    if (!descriptor_.store_callback_ir.empty()) {
+      TI_ERROR_IF(!driver.create.available() ||
+                      !driver.make_plan_many.available() ||
+                      !driver.set_jit_callback.available(),
+                  "CUDA cuFFT LTO store callbacks are unavailable; basic FFT "
+                  "plans remain supported.");
+      plan_status = driver.create.call(&handle);
+      if (plan_status == 0 && handle != 0) {
+        // cufftXtCallbackType::CUFFT_CB_ST_COMPLEX = 4 (stable cuFFT C ABI).
+        plan_status = driver.set_jit_callback.call(
+            handle, descriptor_.store_callback_symbol.c_str(),
+            descriptor_.store_callback_ir.data(),
+            descriptor_.store_callback_ir.size(), 4, nullptr);
+        if (plan_status == 0) {
+          plan_status = driver.make_plan_many.call(
+              handle, static_cast<int>(descriptor_.dimensions.size()),
+              descriptor_.dimensions.data(), descriptor_.input_embed.data(),
+              descriptor_.input_stride, descriptor_.input_distance,
+              descriptor_.output_embed.data(), descriptor_.output_stride,
+              descriptor_.output_distance, transform_type,
+              descriptor_.batch_count, &workspace_bytes_);
+        }
+      }
+      if (plan_status != 0 || handle == 0) {
+        if (handle != 0) {
+          driver.destroy.call(handle);
+        }
+        TI_ERROR("CUDA cuFFT LTO store callback preparation failed (status {}). "
+                 "Check compatible cuFFT, NVRTC and nvJitLink runtime libraries; "
+                 "the callback was not replaced by a plain transform.", plan_status);
+      }
+    } else if (use_plan_many) {
       plan_status = driver.plan_many.call(
           &handle, static_cast<int>(descriptor_.dimensions.size()),
           descriptor_.dimensions.data(), descriptor_.input_embed.data(),
@@ -313,7 +352,7 @@ class CudaFftPlan final : public CudaProviderCompletionResource {
           descriptor_.batch_count);
     }
     TI_ERROR_IF(plan_status != 0 || handle == 0,
-                "CUDA cuFFT failed to create a 1D plan (status {}).", plan_status);
+                "CUDA cuFFT failed to create a plan (status {}).", plan_status);
     handle_ = handle;
     const auto size_status = driver.get_size.call(handle_, &workspace_bytes_);
     if (size_status != 0) {
@@ -499,6 +538,25 @@ std::uint64_t Program::create_cuda_cufft_cross_batch_plan(
       static_cast<int>(CufftTransformKind::c2c), true, true);
 }
 
+std::uint64_t Program::create_cuda_cufft_store_callback_plan(
+    std::vector<int> dimensions,
+    int batch_count,
+    const std::string &lto_ir,
+    const std::string &symbol) {
+  TI_ERROR_IF(dimensions.size() != 2 || dimensions[0] <= 0 || dimensions[1] <= 0,
+              "CUDA cuFFT store callbacks require two positive dimensions.");
+  TI_ERROR_IF(lto_ir.empty() || symbol.empty() ||
+                  symbol.find('\0') != std::string::npos,
+              "CUDA cuFFT store callback requires LTO IR and a symbol name.");
+  const auto plane = checked_multiply(dimensions[0], dimensions[1], "callback plane");
+  TI_ERROR_IF(plane > (std::numeric_limits<int>::max)(),
+              "CUDA cuFFT callback plane exceeds INT_MAX.");
+  return create_cuda_cufft_plan_many_decomposed(
+      dimensions, dimensions, 1, static_cast<int>(plane),
+      dimensions, 1, static_cast<int>(plane), batch_count, 0, false, false,
+      lto_ir, symbol);
+}
+
 std::uint64_t Program::create_cuda_cufft_plan_many_decomposed(
     std::vector<int> dimensions,
     std::vector<int> input_embed,
@@ -510,7 +568,9 @@ std::uint64_t Program::create_cuda_cufft_plan_many_decomposed(
     int batch_count,
     int transform_kind,
     bool separable,
-    bool cross_batch) {
+    bool cross_batch,
+    const std::string &store_callback_ir,
+    const std::string &store_callback_symbol) {
   auto submission_guard = acquire_runtime_resource_submission_guard();
   TI_ERROR_IF(compile_config().arch != Arch::cuda,
               "CUDA cuFFT plans require the CUDA backend.");
@@ -523,7 +583,11 @@ std::uint64_t Program::create_cuda_cufft_plan_many_decomposed(
                                  output_stride,
                                  output_distance,
                                  batch_count,
-                                 validated_transform, separable, cross_batch};
+                                 validated_transform, separable, cross_batch,
+                                 store_callback_ir, store_callback_symbol};
+  TI_ERROR_IF(!store_callback_ir.empty() &&
+                  (separable || validated_transform != CufftTransformKind::c2c),
+              "LTO store callbacks require a whole C2C plan.");
   cufft_scalar_counts(descriptor);
   TI_ERROR_IF(!CUDADriver::get_instance_without_context()
                    .nvidia_extensions_available(),
@@ -715,7 +779,8 @@ Program::cuda_cufft_plan_memory_statistics(std::uint64_t handle) {
            static_cast<std::uint64_t>(found->second->workspace_bytes())},
           {"shared_handle_count", shared_handle_count},
           {"separable", found->second->descriptor().separable ? 1 : 0},
-          {"cross_batch", found->second->descriptor().cross_batch ? 1 : 0}};
+          {"cross_batch", found->second->descriptor().cross_batch ? 1 : 0},
+          {"store_callback_lto", found->second->descriptor().store_callback_ir.empty() ? 0 : 1}};
 }
 
 std::unordered_map<std::string, std::uint64_t>
@@ -789,6 +854,11 @@ void Program::cuda_clear_cufft_plans() {
 
 namespace taichi::lang {
 
+std::uint64_t Program::create_cuda_cufft_store_callback_plan(
+    std::vector<int>, int, const std::string &, const std::string &) {
+  TI_ERROR("CUDA cuFFT requires TI_WITH_CUDA=ON.");
+}
+
 std::uint64_t Program::create_cuda_cufft_cross_batch_plan(std::vector<int>,
                                                           int) {
   TI_ERROR("CUDA cuFFT requires TI_WITH_CUDA=ON.");
@@ -804,7 +874,9 @@ std::uint64_t Program::create_cuda_cufft_plan_many_decomposed(std::vector<int>,
                                                               int,
                                                               int,
                                                               bool,
-                                                              bool) {
+                                                              bool,
+                                                              const std::string &,
+                                                              const std::string &) {
   TI_ERROR("CUDA cuFFT requires TI_WITH_CUDA=ON.");
 }
 

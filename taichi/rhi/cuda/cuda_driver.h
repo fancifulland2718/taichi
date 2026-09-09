@@ -660,6 +660,14 @@ class CUFFTDriver : protected CUDADriverBase {
 #include "taichi/rhi/cuda/cufft_functions.inc.h"
 #undef PER_CUFFT_FUNCTION
 
+  // Optional extensible-plan/LTO symbols. Basic cuFFT remains usable without
+  // these symbols or a runtime compiler/linker installation.
+  CUDADriverFunction<int *> create;
+  CUDADriverFunction<int, int, int *, int *, int, int, int *, int, int,
+                     int, int, std::size_t *> make_plan_many;
+  CUDADriverFunction<int, const char *, const void *, std::size_t, int,
+                     void **> set_jit_callback;
+
   bool load_cufft();
 
   CUFFTProviderCapabilities capabilities() const {

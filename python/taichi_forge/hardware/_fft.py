@@ -274,6 +274,7 @@ class CufftRecording(BackendCommandRecording):
 
 
 class _CufftPlanBase:
+
     def _initialize(
         self,
         dimensions,
@@ -284,6 +285,7 @@ class _CufftPlanBase:
         output_layout=None,
         _separable=False,
         _cross_batch=False,
+        _store_callback=None,
     ):
         self.dimensions = _positive_int_tuple(dimensions, "dimensions")
         self.rank = len(self.dimensions)
@@ -329,7 +331,31 @@ class _CufftPlanBase:
         self._runtime_prog = program
         self._runtime_generation = int(impl.runtime_generation())
         with hardware_provider_call("cufft", failure_phase="provider_plan_failure"):
-            if self._cross_batch:
+            if _store_callback is not None:
+                if (
+                    self.rank != 2
+                    or transform != "c2c"
+                    or not input_compact
+                    or not output_compact
+                    or self._separable
+                ):
+                    raise ValueError(
+                        "LTO store callbacks require a compact whole 2D C2C plan"
+                    )
+                create = getattr(
+                    program, "_create_cuda_cufft_store_callback_plan", None
+                )
+                if create is None:
+                    raise TaichiRuntimeError(
+                        "LTO store callbacks are unavailable in this native runtime"
+                    )
+                handle = create(
+                    self.dimensions,
+                    self.batch_count,
+                    _store_callback.ir,
+                    _store_callback.symbol,
+                )
+            elif self._cross_batch:
                 if not input_compact or not output_compact:
                     raise ValueError("Cross-batch FFT requires compact input and output")
                 create = getattr(program, "_create_cuda_cufft_cross_batch_plan", None)
@@ -385,12 +411,22 @@ class _CufftPlanBase:
             },
             execution_scope={
                 "algorithm": (
-                    "row_batch_cross_batch_columns" if self._cross_batch else "row_batch_column_inplace"
-                    if self._separable else "cufft_estimate"
+                    "row_batch_cross_batch_columns"
+                    if self._cross_batch
+                    else (
+                        "row_batch_column_inplace"
+                        if self._separable
+                        else "cufft_estimate"
+                    )
                 ),
                 "workspace_limit_bytes": self._workspace_bytes,
                 "stream_binding": "runtime_ordered",
                 "capture_compatible": True,
+                **(
+                    {"store_callback": _store_callback.facts}
+                    if _store_callback is not None
+                    else {}
+                ),
             },
         )
         self._retained_execution_contract = RetainedExecutionContract(

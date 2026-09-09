@@ -3247,6 +3247,11 @@ void export_lang(py::module &m) {
            tracked_native_program_method(&Program::create_cuda_cufft_cross_batch_plan),
            py::arg("dimensions"), py::arg("batch_count"),
            py::call_guard<py::gil_scoped_release>())
+      .def("_create_cuda_cufft_store_callback_plan",
+           tracked_native_program_method(&Program::create_cuda_cufft_store_callback_plan),
+           py::arg("dimensions"), py::arg("batch_count"),
+           py::arg("lto_ir"), py::arg("symbol"),
+           py::call_guard<py::gil_scoped_release>())
       .def("_cuda_cufft_execute",
            tracked_native_program_method(&Program::cuda_cufft_execute),
            py::arg("handle"), py::arg("input"), py::arg("output"),

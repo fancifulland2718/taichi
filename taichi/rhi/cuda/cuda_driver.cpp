@@ -744,6 +744,15 @@ bool CUFFTDriver::load_cufft() {
   symbols_available = symbols_available && name.available();
 #include "taichi/rhi/cuda/cufft_functions.inc.h"
 #undef PER_CUFFT_FUNCTION
+  create.set(loader_->load_function_optional("cufftCreate"));
+  create.set_lock(&lock_);
+  create.set_names("create", "cufftCreate");
+  make_plan_many.set(loader_->load_function_optional("cufftMakePlanMany"));
+  make_plan_many.set_lock(&lock_);
+  make_plan_many.set_names("make_plan_many", "cufftMakePlanMany");
+  set_jit_callback.set(loader_->load_function_optional("cufftXtSetJITCallback"));
+  set_jit_callback.set_lock(&lock_);
+  set_jit_callback.set_names("set_jit_callback", "cufftXtSetJITCallback");
   capabilities_ = {};
   if (!symbols_available) {
     cufft_loaded_.store(false, std::memory_order_release);
