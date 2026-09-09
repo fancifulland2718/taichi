@@ -604,6 +604,29 @@ class _GraphTemporaryArena:
         }
 
 
+class _GraphOrderedTemporaryLease:
+    """Generation storage; stream order, not completion polling, protects reuse."""
+
+    def __init__(self, bindings):
+        self.bindings = bindings
+
+    def attach(self, completion):
+        pass
+
+    def cancel(self):
+        pass
+
+
+class _GraphOrderedTemporaryArena(_GraphTemporaryArena):
+    def prepare_storage(self, allocator):
+        super().prepare_storage(allocator)
+        self._lease = _GraphOrderedTemporaryLease(self._slots[0]["bindings"])
+
+    def acquire(self):
+        self._reuses += 1
+        return self._lease
+
+
 def _copy_observation_result(result):
     return {batch: dict(values) for batch, values in result.items()}
 
@@ -12629,11 +12652,14 @@ class _GraphInstance:
         self.key = key
         storage_plans = getattr(spec, "_storage_plans", ())
         allocators, arena_allocator, arena_capacity = {}, None, None
+        ordered_temporary_reuse = False
         if storage_plans:
             from taichi_forge.graph._recipes.runtime_storage import create_storage_owners, validate_storage_plans
 
             validate_storage_plans(spec, storage_plans)
-            allocators, arena_allocator, arena_capacity = create_storage_owners(self, storage_plans)
+            allocators, arena_allocator, arena_capacity, ordered_temporary_reuse = (
+                create_storage_owners(self, storage_plans)
+            )
         (
             self._fixed_runtime_args,
             self._internal_storages,
@@ -12652,9 +12678,25 @@ class _GraphInstance:
         self._executable = None
         self._native_nodes = None
         self._run_context = None
-        self._temporary_arena = _GraphTemporaryArena(spec.temporary_memory_plan, capacity=arena_capacity)
+        arena_type = (
+            _GraphOrderedTemporaryArena
+            if ordered_temporary_reuse
+            else _GraphTemporaryArena
+        )
+        self._temporary_arena = arena_type(
+            spec.temporary_memory_plan, capacity=arena_capacity
+        )
         if arena_allocator is not None:
             self._temporary_arena.prepare_storage(arena_allocator)
+        if ordered_temporary_reuse:
+            bindings = self._temporary_arena._lease.bindings
+            resolved = spec.bind_temporary_args(bindings)
+            for action in spec.temporary_actions:
+                for symbol, name in action.temporary_bindings.items():
+                    if resolved[symbol] is not bindings[name].storage:
+                        raise ValueError(
+                            "Ordered temporary binding must use its generation-owned storage"
+                        )
         self._temporary_bindings = None
         self._observation_nodes = tuple(
             node

@@ -368,6 +368,14 @@ Graph memory plan 为每个正在执行的 invocation 分配一个有界 arena s
 重复执行时复用绑定；异步执行选择其他 slot 时重新绑定。provider 必须准确声明字节数和
 对齐，返回完整的符号映射，并在 backend 工作提交前拒绝不兼容的 storage。
 
+显式完整 recipe 搜索的 `GraphResourceLifetimeRecipeProvider` 也为已完整 lowering 的单个 CUDA CGraph
+提供队列有序 scratch 复用。最终物理 executor 必须只有普通 kernel dispatch，不含并行 lane、外部 capture
+命令、动态 provider binding 或另一个 binding executor。零偏移 temporary 映射在物化时解析并确认来自自有
+存储；每个 Graph instance 提前分配一份 scratch，依靠 runtime stream 顺序复用，不轮询或等待 arena completion。
+这不是裸 slot-count 搜索轴；不符合条件的 Graph 保留 completion ring，普通 runtime 默认行为不变。
+请求 scratch 减少时，pool 保留页数仍可能不变；host、device 和真实 reservation 分开测量，不将省 scratch
+表述为 device 加速。
+
 在 Graph root，连续的 ordinary CGraph segment 与兼容的 recordable-provider action 会
 lowering 为一个 backend region。fixed binding 与私有 temporary binding 会在编译前合并；
 冲突会明确失败。结构化 region 只有在 provider 对相应 condition/body/branch role 完成

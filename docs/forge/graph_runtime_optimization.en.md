@@ -467,6 +467,18 @@ when another asynchronous slot is selected. Providers must declare exact byte
 and alignment requirements, return the complete declared symbol mapping, and
 reject incompatible storage before backend work is submitted.
 
+Explicit complete-recipe search with `GraphResourceLifetimeRecipeProvider` also
+offers queue-ordered scratch for a fully lowered, single CUDA CGraph. The final
+physical executor must contain only ordinary kernel dispatches, without parallel
+lanes, external capture commands, dynamic provider bindings or an alternate
+binding executor. Its zero-offset temporary mappings are resolved against owned
+storage at materialization. One eagerly allocated slot per Graph instance is
+then reused by runtime stream order, without arena completion polls or waits.
+This is not a raw slot-count axis; unsupported Graphs keep the completion ring,
+and ordinary runtime defaults do not change. Pool reserved pages may remain
+unchanged even when requested scratch shrinks. Measure host, device and actual
+reservation separately; scratch reduction is not a device-speedup claim.
+
 At the Graph root, consecutive ordinary CGraph segments and compatible
 recordable-provider actions are lowered into one backend region. Fixed and
 private temporary bindings are merged before compilation; conflicting bindings

@@ -1,6 +1,6 @@
 """Generation-owned CUDA storage over complete semantic usage regions."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache, partial
 from math import prod
 
@@ -43,10 +43,26 @@ class _ResourceGroup:
     arena_capacity: int
     coverage: tuple[str, ...]
     temporary_bytes: int = 0
+    ordered_temporary_reuse: bool = False
 
     @property
     def key(self):
-        return _digest((self.bindings, self.arena_capacity, self.coverage))[:32]
+        return _digest(
+            (
+                self.bindings,
+                self.arena_capacity,
+                self.coverage,
+                self.ordered_temporary_reuse,
+            )
+        )[:32]
+
+    @property
+    def choice(self):
+        return (
+            "queue-ordered-storage"
+            if self.ordered_temporary_reuse
+            else "generation-owned-storage"
+        )
 
     @property
     def members(self):
@@ -190,9 +206,13 @@ class _CudaGraphStorageOwner:
 class GraphResourceLifetimeRecipeProvider(GraphRuntimeFragmentProvider):
     descriptor = runtime_family_provider_descriptor(
         "resource_lifetime",
-        domain_version="graph-owned-storage-domain-v1",
-        semantic_fingerprint="private-usage-components-and-eager-arena-v1",
-        capabilities=("generation-owned-storage", "usage-region-composition", "typed-runtime-fragment"),
+        domain_version="graph-owned-storage-domain-v2",
+        semantic_fingerprint="private-usage-components-and-ordered-arena-v2",
+        capabilities=(
+            "generation-owned-storage",
+            "usage-region-composition",
+            "typed-runtime-fragment",
+        ),
     )
 
     def _groups(self, definition):
@@ -206,7 +226,23 @@ class GraphResourceLifetimeRecipeProvider(GraphRuntimeFragmentProvider):
         spec = definition._runtime_spec
         root = getattr(spec, "definition_semantic_root", spec.pre_optimization_ir_root)
         nodes = _nodes_by_path(root)
-        return _resource_groups(definition, nodes), nodes
+        groups = _resource_groups(definition, nodes)
+        from taichi_forge.graph._recipes.runtime_storage import (
+            ordered_temporary_reuse_eligible,
+        )
+
+        if ordered_temporary_reuse_eligible(spec):
+            groups += tuple(
+                replace(
+                    group,
+                    temporary_bytes=group.temporary_bytes // group.arena_capacity,
+                    arena_capacity=1,
+                    ordered_temporary_reuse=True,
+                )
+                for group in groups
+                if group.arena_capacity
+            )
+        return groups, nodes
 
     def fragments(self, definition):
         groups, nodes = self._groups(definition)
@@ -217,7 +253,7 @@ class GraphResourceLifetimeRecipeProvider(GraphRuntimeFragmentProvider):
         # fragment for each selected group. No process-global resolution cache.
         groups, nodes = self._groups(definition)
         for group in groups:
-            if fragment_key == f"resource_lifetime:{group.key}:generation-owned-storage":
+            if fragment_key == f"resource_lifetime:{group.key}:{group.choice}":
                 return self._build_fragment(definition, group, nodes)
         raise KeyError(f"{self.descriptor.namespace} fragment is unavailable: {fragment_key}")
 
@@ -238,6 +274,11 @@ class GraphResourceLifetimeRecipeProvider(GraphRuntimeFragmentProvider):
                         "storage_allocator": "cuda_generation_pool",
                         "allocation_members": group.members,
                         "temporary_ring_capacity": group.arena_capacity,
+                        "temporary_reuse": (
+                            "runtime_stream_order"
+                            if group.ordered_temporary_reuse
+                            else "completion_ring"
+                        ),
                     },
                 )
             )
@@ -245,7 +286,7 @@ class GraphResourceLifetimeRecipeProvider(GraphRuntimeFragmentProvider):
             definition,
             family="resource_lifetime",
             source_key=group.key,
-            choice_id="generation-owned-storage",
+            choice_id=group.choice,
             coverage=group.coverage,
             tasks=tasks,
             provider_descriptor=self.descriptor,
@@ -264,7 +305,7 @@ class GraphResourceLifetimeRecipeProvider(GraphRuntimeFragmentProvider):
     def contribute_runtime(self, assembly, selection):
         groups, _ = self._groups(assembly.definition)
         matches = tuple(group for group in groups if group.key == selection.source_key)
-        if len(matches) != 1 or selection.choice_id != "generation-owned-storage":
+        if len(matches) != 1 or selection.choice_id != matches[0].choice:
             raise ValueError("Graph generation-owned resource selection is unavailable")
         group = matches[0]
         assembly.select_storage(
@@ -274,6 +315,7 @@ class GraphResourceLifetimeRecipeProvider(GraphRuntimeFragmentProvider):
                 bool(group.arena_capacity),
                 partial(_CudaGraphStorageOwner, group),
                 temporary_capacity=group.arena_capacity or None,
+                ordered_temporary_reuse=group.ordered_temporary_reuse,
             )
         )
 
@@ -288,14 +330,34 @@ class GraphResourceLifetimeRecipeProvider(GraphRuntimeFragmentProvider):
             "private_requested_bytes": group.private_bytes,
             "temporary_requested_bytes": group.temporary_bytes,
             "temporary_ring_capacity": group.arena_capacity,
+            "temporary_reuse": (
+                "runtime_stream_order"
+                if group.ordered_temporary_reuse
+                else "completion_ring"
+            ),
             "changes": (
-                *(("isolate private storage by complete usage region",) if group.bindings else ()),
-                *(("prepare the selected bounded temporary ring at setup",) if group.arena_capacity else ()),
+                *(
+                    ("isolate private storage by complete usage region",)
+                    if group.bindings
+                    else ()
+                ),
+                *(
+                    (
+                        (
+                            "reuse one cold-prepared scratch by proven CUDA stream order without arena polling"
+                            if group.ordered_temporary_reuse
+                            else "prepare the selected bounded temporary ring at setup"
+                        ),
+                    )
+                    if group.arena_capacity
+                    else ()
+                ),
                 "retire pool ownership after the generation and in-flight allocation leases finish",
             ),
             "limitations": (
                 "pool pages and eager ring storage can increase resident VRAM",
                 "no ownership of vendor-private workspaces",
+                "ordered reuse requires one fully lowered CUDA CGraph, no alternate executor or parallel lanes, and whole owned temporary bindings",
                 "overlapping execution fragments remain mutually exclusive in the exact-cover composer",
                 "closed factory is not proof of immediate device-memory reclamation",
                 "performance and generation break-even require workload measurements",

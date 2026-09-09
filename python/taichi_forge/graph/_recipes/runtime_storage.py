@@ -35,6 +35,7 @@ class GraphRuntimeStoragePlan:
     temporary_arena: bool
     factory: object = field(repr=False, compare=False)
     temporary_capacity: int | None = None
+    ordered_temporary_reuse: bool = False
 
     def __post_init__(self):
         if not isinstance(self.plan_id, str) or not self.plan_id:
@@ -53,7 +54,75 @@ class GraphRuntimeStoragePlan:
             or not 1 <= self.temporary_capacity <= 64
         ):
             raise ValueError("Graph storage temporary capacity requires an arena and a bounded slot count")
+        if not isinstance(self.ordered_temporary_reuse, bool) or (
+            self.ordered_temporary_reuse
+            and (not self.temporary_arena or self.temporary_capacity != 1)
+        ):
+            raise ValueError(
+                "Ordered temporary storage requires one eagerly owned slot"
+            )
         object.__setattr__(self, "binding_names", names)
+
+
+def ordered_temporary_reuse_eligible(spec):
+    """Cold proof over the final executor, not a provider's semantic promise.
+
+    A single CGraph's dispatches enqueue on the CUDA runtime stream under the
+    submission lock. No host action or unjoined parallel lane may consume this
+    generation's scratch. Temporary callbacks are resolved separately at setup.
+    """
+    from taichi_forge._lib import core
+    from taichi_forge.graph._graph import _CompiledCGraphNode
+    from taichi_forge.lang import impl
+
+    if (
+        impl.current_cfg().arch != core.Arch.cuda
+        or len(spec.nodes) != 1
+        or getattr(spec, "_binding_executor_factory", None) is not None
+        or spec.native_execution_observer_leases
+    ):
+        return False
+    node = spec.nodes[0]
+    if (
+        not isinstance(node, _CompiledCGraphNode)
+        or not node.temporary_actions
+        or node.parallel_dispatch_groups
+        or len(node.recording_dispatches) != node.dispatch_count
+        or spec.snode_tree_dependency_info
+        or spec.runtime_lifetime_leases
+    ):
+        return False
+    # Native algorithms must already be fully lowered to ordinary dispatches;
+    # a capture command's stream/host behavior is not implied by this proof.
+    if any(
+        action.backend_command_recording is not None
+        for action in node.temporary_actions
+    ):
+        return False
+    if any(
+        manifest.execution_kind != "kernel_dispatch"
+        for manifest in node.native_action_manifests
+    ):
+        return False
+    if any(
+        callable(getattr(lease, hook, None))
+        for lease in spec.lifetime_leases
+        for hook in (
+            "bind_graph_arguments",
+            "graph_submission_owners",
+            "validate_graph_bindings",
+        )
+    ):
+        return False
+    plan = spec.temporary_memory_plan
+    return (
+        bool(plan.allocations)
+        and not plan.conflicting_requirements
+        and all(
+            allocation.offset == 0 and allocation.alignment <= 16
+            for allocation in plan.allocations
+        )
+    )
 
 
 def validate_storage_plans(spec, plans):
@@ -87,6 +156,12 @@ def validate_storage_plans(spec, plans):
                 raise ValueError("Graph temporary arena has multiple allocation owners")
             if not spec.temporary_memory_plan.allocations:
                 raise ValueError("Graph storage plan selected an absent temporary arena")
+            if plan.ordered_temporary_reuse and not ordered_temporary_reuse_eligible(
+                spec
+            ):
+                raise ValueError(
+                    "Ordered temporary storage requires a fully lowered single-stream CUDA Graph"
+                )
             arena_owner = plan
 
 
@@ -95,6 +170,7 @@ def create_storage_owners(instance, plans):
     allocators = {}
     arena_allocator = None
     arena_capacity = None
+    ordered_reuse = False
     for plan in plans:
         owner = plan.factory()
         instance._storage_owners += (owner,)
@@ -103,7 +179,8 @@ def create_storage_owners(instance, plans):
         if plan.temporary_arena:
             arena_allocator = allocate
             arena_capacity = plan.temporary_capacity
-    return allocators, arena_allocator, arena_capacity
+            ordered_reuse = plan.ordered_temporary_reuse
+    return allocators, arena_allocator, arena_capacity, ordered_reuse
 
 
 def storage_pool_reports(instances):

@@ -355,6 +355,177 @@ class _TemporaryWork(NativeGraphNode, NativeGraphExecutable):
         raise AssertionError("recordable workspace was not lowered into the Graph")
 
 
+class _TaggedTemporaryWork(_TemporaryWork):
+    def __init__(self, size):
+        @ti.kernel
+        def stage(scratch: ti.types.ndarray(dtype=ti.i32, ndim=1), tag: ti.i32):
+            for i in scratch:
+                scratch[i] = i * 3 + tag
+
+        @ti.kernel
+        def finish(
+            scratch: ti.types.ndarray(dtype=ti.i32, ndim=1),
+            output: ti.types.ndarray(dtype=ti.i32, ndim=1),
+        ):
+            for i in output:
+                output[i] = scratch[i] * 2 + 5
+
+        scratch = ti.graph.Arg(
+            ti.graph.ArgKind.NDARRAY, "__arena_scratch", ti.i32, ndim=1
+        )
+        output = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "output", ti.i32, ndim=1)
+        tag = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "tag", ti.i32)
+        self.action = _TemporaryAction(
+            (
+                (gen_cpp_kernel(stage, (scratch, tag)), (scratch, tag)),
+                (gen_cpp_kernel(finish, (scratch, output)), (scratch, output)),
+            ),
+            scratch.name,
+        )
+        self.size = size
+
+    @property
+    def runtime_arg_schema(self):
+        return (RuntimeBinding("output", "ndarray"), RuntimeBinding("tag", "scalar"))
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_ordered_temporary_recipe_reuses_one_cold_slot_across_inflight_bindings(
+    monkeypatch,
+):
+    from taichi_forge.graph._graph import _GraphTemporaryArena
+
+    monkeypatch.setenv("TI_GRAPH_TEMPORARY_ARENA_SLOTS", "4")
+    builder = ti.graph.GraphBuilder()
+    builder.append_native(_TaggedTemporaryWork(65537))
+    definition = builder.freeze()
+    catalog = definition.recipe_catalog(providers=_providers())
+    fragment = next(
+        f
+        for f in catalog.fragments
+        if f.fragment_key.endswith(":queue-ordered-storage")
+    )
+    recipe = catalog.compose((fragment.fragment_id,), stage="ordered-contract").recipe
+    outputs = [ti.ndarray(ti.i32, 65537) for _ in range(9)]
+    with definition.materialize(recipe, providers=_providers()) as materialized:
+        graph = materialized.executor
+        bindings = [
+            graph.bind(dict(output=output, tag=index * 17 - 51))
+            for index, output in enumerate(outputs)
+        ]
+        before = graph.execution_stats()
+        assert before.memory.temporary_arena_slots == 1
+        assert before.storage_pools[0].requested_bytes == 65537 * 4
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError(
+                "Ordered replay touched arena allocation, polling or binding callbacks"
+            )
+
+        with monkeypatch.context() as replay:
+            replay.setattr(_GraphTemporaryArena, "_new_slot", forbidden)
+            replay.setattr(_GraphTemporaryArena, "_reclaim", forbidden)
+            replay.setattr(_TemporaryAction, "bind_graph_temporaries", forbidden)
+            tickets = [graph.submit(binding) for binding in bindings]
+            # Mixing run and submit must preserve the same queue order.
+            graph.run(bindings[0])
+            for ticket in reversed(tickets):
+                ticket.wait()
+        after = graph.execution_stats()
+        assert after.memory.temporary_arena_waits == 0
+        assert after.memory.temporary_arena_allocations == 1
+        assert after.storage_pools[0].allocation_count == 1
+        graph.submit(bindings[-1])  # Retire the Graph while work may remain.
+    for index, output in enumerate(outputs):
+        np.testing.assert_array_equal(
+            output.to_numpy(),
+            (np.arange(65537, dtype=np.int32) * 3 + index * 17 - 51) * 2 + 5,
+        )
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_ordered_temporary_final_executor_and_callback_contracts_are_cold(monkeypatch):
+    from copy import copy
+    from taichi_forge.graph._recipes.runtime_storage import (
+        ordered_temporary_reuse_eligible,
+    )
+
+    builder = ti.graph.GraphBuilder()
+    builder.append_native(_TemporaryWork(257))
+    definition = builder.freeze()
+    spec = definition._runtime_spec
+    assert ordered_temporary_reuse_eligible(spec)
+    for field, value in (
+        ("_binding_executor_factory", lambda instance: None),
+        ("runtime_lifetime_leases", (object(),)),
+        ("nodes", (*spec.nodes, *spec.nodes)),
+    ):
+        altered = copy(spec)
+        setattr(altered, field, value)
+        assert not ordered_temporary_reuse_eligible(altered)
+    altered = copy(spec)
+    node = copy(spec.nodes[0])
+    node.parallel_dispatch_groups = ((0,), (1,))
+    altered.nodes = (node,)
+    assert not ordered_temporary_reuse_eligible(altered)
+    catalog = definition.recipe_catalog(providers=_providers())
+    fragment = next(
+        f
+        for f in catalog.fragments
+        if f.fragment_key.endswith(":queue-ordered-storage")
+    )
+    recipe = catalog.compose(
+        (fragment.fragment_id,), stage="cold-binding-contract"
+    ).recipe
+    foreign = ti.ndarray(ti.i32, 257)
+    with monkeypatch.context() as invalid:
+        invalid.setattr(
+            _TemporaryAction,
+            "bind_graph_temporaries",
+            lambda action, bindings: {action.symbol: foreign},
+        )
+        with pytest.raises(
+            (ValueError, RuntimeError), match="generation-owned storage"
+        ):
+            definition.materialize(recipe, providers=_providers())
+    with definition.materialize(recipe, providers=_providers()) as selected:
+        selected.executor.run(dict(output=foreign))
+        np.testing.assert_array_equal(
+            foreign.to_numpy(), (np.arange(257, dtype=np.int32) * 3 + 11) * 2 + 5
+        )
+    observed = set()
+
+    def evaluate(graph, request):
+        graph.run(dict(output=foreign))
+        np.testing.assert_array_equal(
+            foreign.to_numpy(), (np.arange(257, dtype=np.int32) * 3 + 11) * 2 + 5
+        )
+        observed.add(request.recipe_id)
+        return {
+            "temporary_bytes": float(
+                graph._instance.temporary_arena_stats["reserved_bytes"]
+            )
+        }
+
+    decision = definition.search_recipes(
+        providers=_providers(),
+        target=ti.graph.GraphOptimizationTarget(
+            objectives=(("temporary_bytes", "min"),)
+        ),
+        budget=ti.graph.GraphSearchBudget(evaluation_limit=4, repeat_count=1),
+        strategy=ti.graph.GraphRecipeSearchStrategy(mode="exact_if_bounded"),
+    ).run(evaluate)
+    assert decision.status == "selected" and decision.report.search_complete
+    assert recipe.recipe_id in observed and len(observed) == 3
+    assert "runtime_stream_order" in decision.report.to_json()
+    fresh_builder = ti.graph.GraphBuilder()
+    fresh_builder.append_native(_TemporaryWork(257))
+    fresh = fresh_builder.freeze()
+    resolved = fresh.resolve_recipe(decision.selection_artifact, providers=_providers())
+    with fresh.materialize(resolved) as restored:
+        evaluate(restored.executor, resolved)
+
+
 @test_utils.test(arch=ti.cuda, offline_cache=False)
 def test_resource_recipe_records_real_temporary_work_and_freezes_ring_capacity(monkeypatch):
     monkeypatch.setenv("TI_GRAPH_TEMPORARY_ARENA_SLOTS", "3")
@@ -362,8 +533,12 @@ def test_resource_recipe_records_real_temporary_work_and_freezes_ring_capacity(m
     builder.append_native(_TemporaryWork(257))
     definition = builder.freeze()
     catalog = definition.recipe_catalog(providers=_providers())
-    assert len(catalog.fragments) == 1
-    recipe = next(entry.recipe for entry in catalog.entries() if entry.recipe.fragments)
+    fragment = next(
+        f
+        for f in catalog.fragments
+        if f.fragment_key.endswith(":generation-owned-storage")
+    )
+    recipe = catalog.compose((fragment.fragment_id,), stage="ring-contract").recipe
     output = ti.ndarray(ti.i32, 257)
     with definition.materialization_context(provider_set=catalog.provider_set) as context:
         with context.materialize(recipe) as materialized:
