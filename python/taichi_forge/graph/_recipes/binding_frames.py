@@ -23,6 +23,12 @@ def _eligible(spec, backend):
     retained_events = getattr(native, "retains_completion_events_until_close", None)
     if retained_events is None or not retained_events():
         return False
+    if spec._texture_binding_requirements:
+        supports_textures = getattr(native, "supports_sampled_texture_bindings", None)
+        if supports_textures is None or not supports_textures():
+            return False
+        if any(arg.tag != core.ArgKind.TEXTURE for arg in spec._texture_binding_requirements):
+            return False
     config = impl.current_cfg()
     if config.debug or config.kernel_profiler or len(spec.nodes) != 1:
         return False
@@ -70,7 +76,8 @@ class _BindingFrameExecutor:
         spec = instance.spec
         if not _eligible(spec, "cuda"):
             raise ValueError(
-                "immutable argument frames require one CUDA ndarray Graph with qualified fixed-plan commands"
+                "immutable argument frames require one CUDA buffer/sampled-Texture Graph "
+                "with qualified fixed-plan commands"
             )
         node = spec.nodes[0]
         recordings = tuple(
@@ -177,9 +184,10 @@ class GraphBindingFrameRecipeProvider(GraphRuntimeFragmentProvider):
             "whole-graph-executable-reuse",
             "typed-runtime-fragment",
             "fixed-plan-provider-capture",
+            "sampled-texture-resource-retention",
         ),
-        domain_version="immutable-binding-frame-domain-v4",
-        semantic_fingerprint="cuda-graph-composed-binding-lifetime-retained-events-v4",
+        domain_version="immutable-binding-frame-domain-v5",
+        semantic_fingerprint="cuda-graph-composed-binding-retained-textures-v5",
     )
 
     def fragments(self, definition):
@@ -231,12 +239,14 @@ class GraphBindingFrameRecipeProvider(GraphRuntimeFragmentProvider):
                 "prepare argument images when bindings are published",
                 "reuse one executable across prepared bindings without reuploading arguments",
                 "retain argument images and allocation leases until last device use",
+                "retain sampled Texture objects in each immutable binding frame",
                 "reuse completed event handles up to the observed queue peak until executor close",
             ),
             "limitations": (
                 "one CUDA Graph and one workspace lane; only certified fixed-plan FFT/SpMM/matmul commands may join JIT dispatches",
                 "no SNode, external synchronization domain or device-controlled topology; capture must contain only kernel nodes",
                 "raw mapping calls include argument preparation; use Graph.bind to amortize it",
+                "Texture content uploads remain explicit; published frames own sampled resources until retirement",
                 "prepared frames trade retained argument memory and setup for binding-switch cost",
                 "cached completion handles retain opaque driver storage, not measured ndarray or peak VRAM bytes",
                 "wraps baseline or explicitly compatible FFT/SpMM/matmul region strategies; unrelated replacements remain unavailable",

@@ -5894,6 +5894,7 @@ void export_lang(py::module &m) {
   py::class_<cuda::GraphBindingExecutor>(m, "_CudaGraphBindingExecutor")
       .def_static("available", &cuda::GraphBindingExecutor::available)
       .def_static("supports_capture_commands", [] { return true; })
+      .def_static("supports_sampled_texture_bindings", [] { return true; })
       .def_static("retains_completion_events_until_close", [] { return true; })
       .def(py::init<const aot::CompiledGraph &, const CompileConfig &,
                     Program &>(),

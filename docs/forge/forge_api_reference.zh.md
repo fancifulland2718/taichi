@@ -252,8 +252,11 @@ CUDA 也支持基于 Driver API array/texture object 的显式 sampled texture�
 sampler generation 生命周期的 cached Graph capture。固定 `Graph.bind()` 在发布前验证
 Texture 类型和维度；原位上传保持 capture，替换 Texture 使用另一有界 executable slot 或
 重新 capture。上传仍保留既有显式同步行为，本次没有添加 captured upload command。
-CUDA RW texture、texture AOT 序列化及独立 immutable-binding-frame recipe 不属于此支持声明。
-不新增 wheel 变体。
+支持此能力的 runtime 上，immutable-binding-frame 完整 recipe 也接受 sampled texture 和
+dispatch label。每个已发布 frame 保留 sampler 资源，只在准备时上传参数；切换已准备 frame
+复用同一 Graph executable，原位内容更新仍可见。frame/executor 退役前，即使原 wrapper
+退役，已发布 frame 仍持有其资源；准备新 frame 则要求源资源有效。CUDA RW texture 和
+texture AOT 序列化仍不支持，不新增 wheel 变体。
 
 ### `ti.hardware.graphics.VulkanGraphicsPipeline`（0.6.3 开发中）
 

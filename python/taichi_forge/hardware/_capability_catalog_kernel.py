@@ -90,7 +90,7 @@ def kernel_intrinsic_operations(_operation):
                 "The current one-mip contract exposes sampled fetch and sample_lod only; CUDA RW textures remain unsupported.",
                 "fetch is lowered to a hardware texture instruction at the normalized texel center so integer coordinates remain exact.",
                 "Formats that cannot satisfy the existing vec4-f32 sampled contract fail before CUDA array allocation.",
-                "Cached CUDA Graph capture retains sampled texture generations; content uploads preserve the object and replacement uses a bounded executable slot. Immutable-binding-frame recipes remain separate.",
+                "Cached CUDA Graph capture retains sampled texture generations; content uploads preserve the object and replacement uses a bounded executable slot. Capable runtimes also expose immutable binding-frame recipes with preparation-only parameter uploads and retained sampled resources.",
                 "This is an explicit resource API: Forge does not silently replace ndarray loads, and CUDA texture AOT manifests are not qualified by this contract.",
             ),
         ),

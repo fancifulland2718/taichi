@@ -299,7 +299,7 @@ def test_binding_frames_reject_snode_lifetimes_before_capture():
     builder = ti.graph.GraphBuilder()
     builder.dispatch(increment)
     graph = builder.compile()
-    with pytest.raises(RuntimeError, match="ordinary"):
+    with pytest.raises(RuntimeError, match="SNode dependencies"):
         _executor(graph)
 
 

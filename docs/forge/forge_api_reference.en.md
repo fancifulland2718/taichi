@@ -312,9 +312,14 @@ including cached Graph capture with generation-owned sampler lifetimes. Fixed
 `Graph.bind()` validates Texture type and dimensions before publication. In-place
 uploads preserve the capture; replacing the Texture selects or captures another
 bounded executable slot. Uploads retain their existing explicit synchronization
-behavior; this does not introduce a captured upload command. CUDA RW textures,
-texture AOT serialization, and the separate immutable-binding-frame recipe remain
-outside this support statement. No wheel variant is added.
+behavior; this does not introduce a captured upload command. On capable runtimes,
+the immutable-binding-frame complete recipe also accepts sampled textures and
+dispatch labels. Each published frame retains the sampled resource and uploads
+its argument image only during preparation; switching prepared frames reuses one
+Graph executable. In-place content updates remain visible. Published frames own
+their resource leases until frame/executor retirement, even if the source wrapper
+is retired; preparing a new frame still requires a live source. CUDA RW textures
+and texture AOT serialization remain unsupported. No wheel variant is added.
 
 ### `ti.hardware.graphics.VulkanGraphicsPipeline` (0.6.3 in development)
 

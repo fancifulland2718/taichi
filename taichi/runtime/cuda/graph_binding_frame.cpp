@@ -13,6 +13,7 @@
 #include "taichi/program/program.h"
 #include "taichi/program/runtime_completion.h"
 #include "taichi/program/storage_view.h"
+#include "taichi/program/texture.h"
 #include "taichi/rhi/cuda/cuda_context.h"
 #include "taichi/rhi/cuda/cuda_device.h"
 #include "taichi/runtime/cuda/kernel_launcher.h"
@@ -30,6 +31,9 @@ struct GraphBindingFrame::State {
   void *argument_image{nullptr};
   std::vector<std::uint8_t> host_argument_image;
   std::vector<std::unique_ptr<CudaDevice::AllocationLease>> allocations;
+  // Sampled CUDA objects are registry resources, not CudaDevice allocations.
+  // Published frames retain them just as they retain immutable buffer bindings.
+  std::vector<Program::TextureResourceLease> textures;
   std::vector<std::shared_ptr<aot::CudaGraphCaptureResources>>
       provider_capture_resources;
   std::size_t bytes{0};
@@ -61,6 +65,7 @@ struct GraphBindingFrame::State {
     host_argument_image.clear();
     contexts.clear();
     allocations.clear();
+    textures.clear();
     for (const auto &resource : provider_capture_resources) {
       resource->release(backend_safe);
     }
@@ -217,9 +222,8 @@ GraphBindingExecutor::GraphBindingExecutor(const aot::CompiledGraph &graph,
   TI_ERROR_IF(
       graph.dispatches.empty() || !graph.snode_tree_dependencies.empty() ||
           graph.has_indirect_dispatches() ||
-          graph.has_cuda_parallel_dispatch_groups() ||
-          graph.has_dispatch_labels(),
-      "CUDA binding frames require an ordinary unlabeled ndarray Graph");
+          graph.has_cuda_parallel_dispatch_groups(),
+      "CUDA binding frames require a flat CUDA Graph without SNode dependencies");
   auto state = std::make_shared<State>(graph, config);
   state->program = &program_owner;
   auto &driver = CUDADriver::get_instance();
@@ -310,6 +314,7 @@ std::shared_ptr<GraphBindingFrame> GraphBindingExecutor::prepare(
   data.valid = true;
   state.frames.push_back(frame);
   std::set<std::uint64_t> allocations;
+  std::set<const Texture *> textures;
   for (const auto &[name, value] : args) {
     if (value.tag == aot::ArgKind::kNdarray) {
       DeviceAllocation allocation;
@@ -348,6 +353,16 @@ std::shared_ptr<GraphBindingFrame> GraphBindingExecutor::prepare(
                     name);
         data.allocations.push_back(std::move(lease));
       }
+    } else if (value.tag == aot::ArgKind::kTexture) {
+      const auto *texture = reinterpret_cast<const Texture *>(value.val);
+      TI_ERROR_IF(!texture || texture->owning_program() != state.program ||
+                      !texture->is_cuda_texture(),
+                  "CUDA binding frames require a Program-owned CUDA Texture: {}",
+                  name);
+      if (textures.insert(texture).second) {
+        data.textures.push_back(
+            state.program->acquire_texture_external_lease(texture));
+      }
     } else {
       TI_ERROR_IF(value.tag != aot::ArgKind::kScalar &&
                       value.tag != aot::ArgKind::kMatrix,
@@ -379,6 +394,7 @@ std::shared_ptr<GraphBindingFrame> GraphBindingExecutor::prepare(
       state.graph.init_runtime_context(dispatch.symbolic_args, args, launch);
       state.program->resolve_ndarray_launch_context_under_guard(launch);
       state.program->resolve_runtime_storage_launch_context_under_guard(launch);
+      state.program->resolve_texture_launch_context_under_guard(launch);
       data.packets.emplace_back();
       auto &packet = data.packets.back();
       TI_ERROR_IF(!state.launcher->prepare_cuda_graph_launch_packet(
