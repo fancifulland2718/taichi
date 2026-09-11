@@ -1859,6 +1859,12 @@ ticket 可返回显式 `GraphBuilder.observe()` 终态；该次异步 submission
 `control_flow_stats()`。满足上述资格的 depth=2 `while` sequence 使用原生单-ticket
 路径；其它 depth=2 形态仍明确拒绝异步 submission。
 
+`GraphBuilder.observe()` 接收符号化标量 `NDARRAY` 参数（`ndim=0`），可绑定 ndarray、
+规范 dense scalar field 或其 program-owned view。固定绑定在 bind/update 时验证存储；
+动态 frame 在 payload 提交前验证。快照保持各标量原 dtype，每个 task 最多打包四个值，
+整数 ID 不经浮点转换。独立物化的 recipe 拥有独立的 packing execution cache。
+一般 affine、sparse 和高维存储不属于标量 observation。
+
 终态 observation 默认附着在 submission completion 上。CPU/Vulkan 使用 host-visible
 snapshot slot；CUDA 保持 snapshot 为 device-local，并在记录 ticket completion 前追加一次
 到持久 pinned host slot 的异步拷贝。因此 `ticket.observations()` 只需等待该 completion 后读取

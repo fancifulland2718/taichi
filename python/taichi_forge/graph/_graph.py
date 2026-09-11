@@ -5510,6 +5510,15 @@ class _FrozenNativeGraphNode(_CompiledNativeGraphNode):
 
 
 _OBSERVATION_PACK_KERNELS = {}
+_OBSERVATION_BATCH_KERNELS = {}
+
+
+class _GraphObservationBuffers(dict):
+    """A snapshot slot plus its cold-flattened private packing arguments."""
+
+    def __init__(self, buffers, arguments):
+        super().__init__(buffers)
+        self.arguments = arguments
 
 
 def _observation_pack_kernel(dtype):
@@ -5528,6 +5537,40 @@ def _observation_pack_kernel(dtype):
 
     _OBSERVATION_PACK_KERNELS[key] = pack_scalar_snapshot
     return pack_scalar_snapshot
+
+
+def _observation_pack_batch_kernel(dtypes, indices):
+    """Pack at most four typed scalars in one task without a pointer-table ABI."""
+    key = (tuple(str(dtype) for dtype in dtypes), tuple(indices))
+    cached = _OBSERVATION_BATCH_KERNELS.get(key)
+    if cached is not None:
+        return cached
+    count = len(dtypes)
+    d0, d1, d2, d3 = (*dtypes, *((dtypes[-1],) * (4 - count)))
+    i0, i1, i2, i3 = (*indices, *((indices[-1],) * (4 - count)))
+
+    @kernel_impl.kernel
+    def pack_snapshot_batch(
+        s0: ndarray_type.ndarray(dtype=d0, ndim=0),
+        s1: ndarray_type.ndarray(dtype=d1, ndim=0),
+        s2: ndarray_type.ndarray(dtype=d2, ndim=0),
+        s3: ndarray_type.ndarray(dtype=d3, ndim=0),
+        o0: ndarray_type.ndarray(dtype=d0, ndim=1),
+        o1: ndarray_type.ndarray(dtype=d1, ndim=1),
+        o2: ndarray_type.ndarray(dtype=d2, ndim=1),
+        o3: ndarray_type.ndarray(dtype=d3, ndim=1),
+    ):
+        for _ in range(1):
+            o0[i0] = s0[None]
+            if impl.static(count > 1):
+                o1[i1] = s1[None]
+            if impl.static(count > 2):
+                o2[i2] = s2[None]
+            if impl.static(count > 3):
+                o3[i3] = s3[None]
+
+    _OBSERVATION_BATCH_KERNELS[key] = pack_snapshot_batch
+    return pack_snapshot_batch
 
 
 class _CompiledObservationGraphNode:
@@ -5578,13 +5621,57 @@ class _CompiledObservationGraphNode:
             for key, group in groups.items()
         )
         self._entries = tuple(entries)
-        self._kernels = {
-            key: _observation_pack_kernel(dtype) for key, dtype, _ in self._groups
-        }
+        # Packing is an ordinary compiled Graph segment. It consumes the same
+        # generation-qualified storage frame as payload kernels, including dense
+        # fields, without falling back through Python kernel argument conversion.
+        builder = _new_runtime_graph_builder(())
+        self._pack_sources = []
+        self._pack_destinations = {}
+        self._pack_indices = {}
+        for start in range(0, len(entries), 4):
+            batch = entries[start : start + 4]
+            sources, destinations = [], []
+            for ordinal, (arg_name, key, index, dtype) in enumerate(batch, start):
+                source_name = f"source_{ordinal}"
+                destination_name = self._pack_destinations.setdefault(
+                    key, f"destination_{len(self._pack_destinations)}"
+                )
+                sources.append(Arg(ArgKind.NDARRAY, source_name, dtype, ndim=0))
+                destinations.append(
+                    Arg(ArgKind.NDARRAY, destination_name, dtype, ndim=1)
+                )
+                self._pack_sources.append((source_name, arg_name))
+            if len(batch) == 1:
+                index_name = f"index_{start}"
+                args = (
+                    sources[0],
+                    destinations[0],
+                    Arg(ArgKind.SCALAR, index_name, i32),
+                )
+                self._pack_indices[index_name] = batch[0][2]
+                kernel = gen_cpp_kernel(_observation_pack_kernel(batch[0][3]), args)
+            else:
+                args = tuple(
+                    sources
+                    + [sources[-1]] * (4 - len(batch))
+                    + destinations
+                    + [destinations[-1]] * (4 - len(batch))
+                )
+                kernel = gen_cpp_kernel(
+                    _observation_pack_batch_kernel(
+                        tuple(entry[3] for entry in batch),
+                        tuple(entry[2] for entry in batch),
+                    ),
+                    args,
+                )
+            builder.dispatch(kernel, args, f"{name}:snapshot:{start // 4}")
+        self._pack_sources = tuple(self._pack_sources)
+        self._pack_graph = builder.compile()
+        self._jit_cache = _ti_core.CompiledGraphJITCache()
         self._active_buffers = None
         self.runtime_arg_names = frozenset(names)
         self.dispatch_count = len(entries)
-        self.physical_dispatch_count = self.dispatch_count
+        self.physical_dispatch_count = (len(entries) + 3) // 4
         self.ir_node = ObservationNode(
             name=name,
             effects=tuple(
@@ -5607,7 +5694,17 @@ class _CompiledObservationGraphNode:
             else:
                 buffers[key] = ScalarNdarray(dtype, (len(names),))
             byte_count += np.dtype(to_numpy_type(dtype)).itemsize * len(names)
-        return buffers, byte_count
+        private_args = dict(self._pack_indices)
+        private_args.update(
+            (self._pack_destinations[key], storage) for key, storage in buffers.items()
+        )
+        context = _GraphRunContext()
+        context.begin(private_args)
+        try:
+            flattened = dict(context.flattened_args())
+        finally:
+            context.end()
+        return _GraphObservationBuffers(buffers, flattened), byte_count
 
     def bind_snapshot_buffers(self, buffers):
         self._active_buffers = buffers
@@ -5615,22 +5712,50 @@ class _CompiledObservationGraphNode:
     def clear_snapshot_buffers(self):
         self._active_buffers = None
 
+    def validate_bindings(self, runtime_args):
+        for arg_name, _, _, dtype in self._entries:
+            value = runtime_args[arg_name]
+            description = (
+                value.description
+                if isinstance(value, DenseNdarrayView)
+                else describe_storage(value)
+            )
+            descriptor = description.descriptor
+            if (
+                descriptor is None
+                or descriptor.index_shape
+                or descriptor.element_shape
+                or descriptor.scalar_type != dtype
+                or not description.properties["ndarray_abi_compatible"]
+            ):
+                raise TaichiRuntimeError(
+                    f"Graph observation {arg_name} requires a scalar ndarray, "
+                    f"canonical dense field or view with ndim=0 and dtype {dtype}"
+                )
+
     def run(self, context, temporaries=None):
         if self._active_buffers is None:
             raise TaichiRuntimeError("Graph observation snapshot slot was not bound")
-        runtime_args = context.runtime_args()
-        for arg_name, key, index, dtype in self._entries:
-            value = runtime_args[arg_name]
-            if (
-                not isinstance(value, Ndarray)
-                or value.shape != ()
-                or str(value.dtype) != str(dtype)
-            ):
-                raise TaichiRuntimeError(
-                    f"Graph observation {arg_name} requires a scalar ndarray "
-                    f"with dtype {dtype}"
-                )
-            self._kernels[key](value, self._active_buffers[key], index)
+        frame = context.flattened_args(self.runtime_arg_names)
+        arguments = {alias: frame[name] for alias, name in self._pack_sources}
+        arguments.update(self._active_buffers.arguments)
+        self._pack_graph.jit_run_cached(
+            context.compile_config(), arguments, self._jit_cache
+        )
+
+    def materialize(self):
+        from copy import copy
+
+        node = copy(self)
+        node._active_buffers = None
+        node._jit_cache = _ti_core.CompiledGraphJITCache()
+        return node
+
+    def invalidate_runtime(self, preserve_executables=False):
+        if preserve_executables:
+            self._jit_cache.retire_snode_tree_runtime_state()
+        else:
+            self._jit_cache.clear_runtime_state()
 
     def decode_snapshot(self, hosts):
         result = {}
@@ -10886,18 +11011,26 @@ class _GraphSpec:
 
     def materialize_baseline_sources(self, definition):
         """Instantiate detached segments and mutable control state at compile."""
-        if not self.structured_control_count and not any(
-            isinstance(node, _FrozenNativeGraphNode)
-            or getattr(node, "_requires_recipe_materialization", False)
-            for node in self.nodes
+        if (
+            not self.structured_control_count
+            and not self.observation_count
+            and not any(
+                isinstance(node, _FrozenNativeGraphNode)
+                or getattr(node, "_requires_recipe_materialization", False)
+                for node in self.nodes
+            )
         ):
             return self
-        from taichi_forge.graph._recipes.runtime_assembly import GraphRuntimeRecipeAssembly
+        from taichi_forge.graph._recipes.runtime_assembly import (
+            GraphRuntimeRecipeAssembly,
+        )
 
         assembly = GraphRuntimeRecipeAssembly(definition)
         nodes = []
         for node in self.nodes:
-            if isinstance(node, _FrozenNativeGraphNode):
+            if isinstance(
+                node, (_FrozenNativeGraphNode, _CompiledObservationGraphNode)
+            ):
                 node = node.materialize()
             elif getattr(node, "_requires_recipe_materialization", False):
                 groups = tuple(
@@ -11054,9 +11187,10 @@ class _GraphSpec:
             (node.control_depth for node in self.structured_control_nodes),
             default=0,
         )
-        self.observation_count = sum(
-            isinstance(n, _CompiledObservationGraphNode) for n in self.nodes
+        self.observation_nodes = tuple(
+            n for n in self.nodes if isinstance(n, _CompiledObservationGraphNode)
         )
+        self.observation_count = len(self.observation_nodes)
         self._native_preparers = tuple(
             (n, n.recordable_action.backend_command_recording)
             for n in self.nodes
@@ -11211,6 +11345,13 @@ class _GraphSpec:
             and all(
                 not dynamic_overlay_names.intersection(recording.binding_names)
                 for _, recording in self._native_preparers
+            )
+        )
+        self.observation_publish_frame_stable = (
+            not has_dynamic_argument_binding
+            and all(
+                not dynamic_overlay_names.intersection(node.runtime_arg_names)
+                for node in self.observation_nodes
             )
         )
         self.binding_plan = _GraphBindingPlan(
@@ -11417,6 +11558,8 @@ class _GraphSpec:
             if node_rewriter is not None:
                 node = node_rewriter(node)
             elif isinstance(node, _FrozenNativeGraphNode):
+                node = node.materialize()
+            elif isinstance(node, _CompiledObservationGraphNode):
                 node = node.materialize()
             nodes.append(node)
             node_source_regions.append(source_regions)
@@ -11692,6 +11835,7 @@ class _GraphSpec:
             validation_args,
             validate_memory_recipe=self.memory_recipe_publish_frame_stable,
             validate_control_bindings=False,
+            validate_observation_bindings=self.observation_publish_frame_stable,
         )
         if (
             not blockers
@@ -12026,7 +12170,11 @@ class _GraphSpec:
         *,
         validate_memory_recipe=True,
         validate_control_bindings=True,
+        validate_observation_bindings=True,
     ):
+        if validate_observation_bindings:
+            for node in self.observation_nodes:
+                node.validate_bindings(validation_args)
         if validate_control_bindings:
             self._validate_structured_control_bindings(validation_args)
         memory_recipe_certificate = (
@@ -17420,11 +17568,12 @@ class GraphBuilder:
         return self
 
     def observe(self, *values, name="observation"):
-        """Append a deferred packed snapshot of scalar ndarray arguments.
+        """Append a deferred snapshot of symbolic scalar storage arguments.
 
         ``Graph.submit()`` captures values on device and returns before host
         readback. Consume the immutable snapshot through
-        ``SubmissionTicket.observations()``.
+        ``SubmissionTicket.observations()``. Bind ndim=0 ndarrays, canonical dense
+        scalar fields, or their program-owned views.
         """
         if name in self._observation_names:
             raise TaichiRuntimeError(

@@ -2235,6 +2235,14 @@ asynchronous submission. Qualified depth-two `while` sequences use the native
 single-ticket path above; other depth-two shapes still reject asynchronous
 submission.
 
+`GraphBuilder.observe()` takes symbolic scalar `NDARRAY` arguments (`ndim=0`).
+Bind an ndarray, a canonical dense scalar field, or its program-owned view.
+Fixed bindings validate storage at bind/update; dynamic frames validate before
+payload submission. Snapshot packing preserves each scalar's dtype and batches
+up to four values per task; it does not convert integer IDs through floats.
+Independently materialized recipes own independent packing execution caches.
+General affine, sparse, and higher-rank storage are not scalar observations.
+
 Terminal observations are attached to the submission completion by default.
 CPU and Vulkan use host-visible snapshot slots; CUDA keeps snapshots in
 device-local memory and appends an asynchronous copy into a persistent pinned
