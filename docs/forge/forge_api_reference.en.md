@@ -235,8 +235,16 @@ These D0 APIs describe and submit one Vulkan RHI buffer-command sequence:
 manually with `recording.execute(bindings)`, or append it to a root Graph with
 `GraphBuilder.append_native(recording, admission="auto")`.
 
-The current contract is limited to runtime-owned Vulkan `ti.ndarray` values,
-four-byte-aligned ranges, explicit barriers, the runtime-ordered compute queue,
+The current contract accepts runtime-owned Vulkan `ti.ndarray`, canonical dense
+fields, and compact program-owned `ti.experimental.ndarray_view` ranges. Byte
+offsets are relative to the supplied view; disjoint ranges in one allocation
+are permitted, but overlapping copies and noncompact views are rejected. No
+implicit packing or field-to-ndarray copy is performed. `graph.bind()` prepares
+fixed command packets without executing them; layout/range checks occur there,
+not on each qualified replay. Tree destruction or runtime reset invalidates old
+bindings; content-only updates do not require rebinding.
+
+The contract requires four-byte-aligned ranges, explicit barriers, the runtime-ordered compute queue,
 and `rerecord` replay. It is not callable inside `@ti.kernel`, is not qualified
 inside a structured `Sequential` or for AOT serialization, and is not itself a
 RasterPass or AS provider. Bounds errors, overlapping copies, backend/device

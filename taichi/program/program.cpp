@@ -7412,6 +7412,103 @@ void Program::resolve_dense_storage_launch_context(
   }
 }
 
+std::shared_ptr<PreparedNativeStorage> Program::prepare_native_storage(
+    const std::vector<const storage::DenseStorageDescriptor *> &descriptors,
+    const std::vector<bool> &writable) {
+  TI_ERROR_IF(descriptors.size() != writable.size(),
+              "Native storage access coverage is inconsistent.");
+  std::optional<SNodeTreeLifecycleReadGuard> lifecycle_guard;
+  if (active_snode_tree_lifecycle_program != this) {
+    lifecycle_guard.emplace(acquire_snode_tree_lifecycle_read_guard());
+  }
+  auto submission_guard = acquire_runtime_resource_submission_guard();
+  auto plan = std::make_shared<PreparedNativeStorage>();
+  plan->owner_ = this;
+  plan->program_generation_ = runtime_program_generation();
+  plan->validated_tree_epoch_ = snode_tree_mutation_epoch();
+  NdarrayLaunchLeases ndarray_leases;
+  ExternalDenseStorageLaunchLeases external_leases;
+  for (std::size_t i = 0; i < descriptors.size(); ++i) {
+    TI_ERROR_IF(!descriptors[i], "Native storage descriptor is missing.");
+    const auto &descriptor = *descriptors[i];
+    storage::RuntimeStorageRequirement requirement;
+    requirement.backend = compile_config().arch;
+    requirement.consumer = storage::RuntimeStorageConsumer::kNativeConsumer;
+    requirement.mode = storage::RuntimeStorageMode::kReplay;
+    requirement.dense.require_unique_mapping = true;
+    requirement.dense.require_writable = writable[i];
+    storage::RuntimeStorageArgument argument(descriptor, requirement);
+    TI_ERROR_IF(
+        !argument.qualification().capabilities.replayable ||
+            !argument.qualification().capabilities.zero_copy_qualified ||
+            !descriptor.properties().compact_contiguous,
+        "Native storage requires a compact, unique, program-owned "
+        "dense range: {}.",
+        storage::to_string(argument.qualification().reason));
+    const auto binding = resolve_dense_storage_descriptor(
+        argument.descriptor(), ndarray_leases, external_leases, &argument);
+    plan->bindings_.push_back({binding.device_ptr(), binding.byte_size});
+    const auto &owner = descriptor.owner();
+    if (owner.kind == storage::StorageOwnerKind::kProgramNdarray) {
+      if (std::find(plan->ndarray_handles_.begin(),
+                    plan->ndarray_handles_.end(),
+                    owner.ndarray_handle) == plan->ndarray_handles_.end()) {
+        plan->ndarray_handles_.push_back(owner.ndarray_handle);
+      }
+    } else if (owner.kind == storage::StorageOwnerKind::kSNodePayload) {
+      const auto found = std::find_if(
+          plan->trees_.begin(), plan->trees_.end(),
+          [&](const auto &tree) { return tree.tree_id == owner.tree.tree_id; });
+      if (found == plan->trees_.end()) {
+        plan->trees_.push_back(owner.tree);
+      }
+    } else {
+      TI_ERROR("Native storage does not support external allocation owners.");
+    }
+  }
+  // The plan owns metadata only. There is no upload, submission, allocation,
+  // or in-flight lease pinning at this preparation boundary.
+  return plan;
+}
+
+void Program::with_prepared_native_storage(
+    const PreparedNativeStorage &plan,
+    const std::function<void()> &submit) {
+  std::optional<SNodeTreeLifecycleReadGuard> lifecycle_guard;
+  if (!plan.trees_.empty() && active_snode_tree_lifecycle_program != this) {
+    lifecycle_guard.emplace(acquire_snode_tree_lifecycle_read_guard());
+  }
+  auto submission_guard = acquire_runtime_resource_submission_guard();
+  TI_ERROR_IF(plan.owner_ != this ||
+                  plan.program_generation_ != runtime_program_generation(),
+              "Prepared native storage belongs to another runtime.");
+  if (!plan.trees_.empty() &&
+      plan.validated_tree_epoch_ != snode_tree_mutation_epoch()) {
+    validate_snode_tree_dependencies(plan.trees_, "prepared native storage");
+    plan.validated_tree_epoch_ = snode_tree_mutation_epoch();
+  }
+  NdarrayLaunchLeases leases;
+  for (const auto handle : plan.ndarray_handles_) {
+    TI_ERROR_IF(handle.index >= ndarray_view_slots_.size(),
+                "Prepared native storage references a retired ndarray.");
+    const auto &slot = ndarray_view_slots_[handle.index];
+    TI_ERROR_IF(slot.handle != handle || !slot.view || !slot.resource,
+                "Prepared native storage references a retired ndarray.");
+    if (ndarray_inflight_leases_.find(ndarray_lease_key(handle)) ==
+        ndarray_inflight_leases_.end()) {
+      auto lease = slot.resource->lease.clone();
+      TI_ERROR_IF(!lease, "Cannot retain prepared native storage.");
+      leases.add(std::move(lease));
+    }
+  }
+  // Pin before a callback that can partially submit and then throw. Existing
+  // completion/fault/reset paths own release; no success-path synchronization.
+  if (!leases.empty()) {
+    pin_ndarray_launch_leases(leases);
+  }
+  submit();
+}
+
 void Program::with_resolved_dense_storage_bindings(
     const std::vector<const storage::DenseStorageDescriptor *> &descriptors,
     const DenseStorageBindingCallback &callback) {
@@ -9700,143 +9797,144 @@ void Program::copy_ndarray_fast(Ndarray *dst, Ndarray *src) {
   stream->submit_synced(cmdlist.get());
 }
 
-void Program::record_vulkan_buffer_commands(
+PreparedVulkanBufferCommands Program::prepare_vulkan_buffer_commands(
     const std::vector<VulkanBufferCommand> &commands) {
   TI_ERROR_IF(compile_config().arch != Arch::vulkan,
               "Vulkan buffer command recording requires the Vulkan backend.");
-  TI_ERROR_IF(commands.empty(),
-              "Vulkan buffer command recording requires at least one command.");
-  TI_ERROR_IF(commands.size() > 4096,
-              "Vulkan buffer command recording exceeds the 4096-command "
-              "safety limit.");
-
-  auto resource_submission_guard = acquire_runtime_resource_submission_guard();
-  Device *device = program_impl_->get_compute_device();
-  TI_ERROR_IF(!device,
-              "Vulkan buffer command recording has no compute device.");
-
-  struct ResolvedCommand {
-    VulkanBufferCommandKind kind;
-    DeviceAllocation destination;
-    DeviceAllocation source;
-    std::size_t destination_offset;
-    std::size_t source_offset;
-    std::size_t bytes;
-    std::uint32_t value;
+  TI_ERROR_IF(commands.empty() || commands.size() > 4096,
+              "Vulkan buffer recording requires between 1 and 4096 commands.");
+  std::vector<storage::DenseStorageDescriptor> descriptors;
+  std::vector<bool> writable;
+  std::vector<std::pair<std::size_t, std::size_t>> indices;
+  descriptors.reserve(commands.size() * 2);
+  writable.reserve(commands.size() * 2);
+  const auto absent = (std::numeric_limits<std::size_t>::max)();
+  auto add_binding = [&](Ndarray *array,
+                         const storage::DenseStorageDescriptor *descriptor,
+                         bool write) {
+    if (descriptor) {
+      descriptors.push_back(*descriptor);
+    } else {
+      TI_ERROR_IF(!array, "Vulkan buffer command requires a storage binding.");
+      const auto described = storage::describe_ndarray_storage(*array);
+      TI_ERROR_IF(!described, "Vulkan buffer ndarray cannot be described.");
+      descriptors.push_back(*described.descriptor);
+    }
+    writable.push_back(write);
+    return descriptors.size() - 1;
   };
-  std::vector<ResolvedCommand> resolved;
-  std::vector<const Ndarray *> views;
-  resolved.reserve(commands.size());
-  views.reserve(commands.size() * 2);
-
-  auto storage_bytes = [](const Ndarray *array) {
-    TI_ERROR_IF(!array,
-                "Vulkan buffer command received a null ndarray binding.");
-    const std::size_t elements = array->get_nelement();
-    const std::size_t element_bytes = array->get_element_size();
-    TI_ERROR_IF(
-        element_bytes != 0 &&
-            elements > std::numeric_limits<std::size_t>::max() / element_bytes,
-        "Vulkan buffer command ndarray size overflows size_t.");
-    return elements * element_bytes;
-  };
-  auto validate_range = [&](const Ndarray *array, std::size_t offset,
-                            std::size_t bytes, const char *role) {
-    const std::size_t available = storage_bytes(array);
-    TI_ERROR_IF(offset > available || bytes > available - offset,
-                "Vulkan buffer command {} range offset {} plus {} bytes "
-                "exceeds {} bytes.",
-                role, offset, bytes, available);
-    TI_ERROR_IF((offset & 3u) != 0 || (bytes & 3u) != 0,
-                "Vulkan buffer command {} offset and size must be "
-                "four-byte aligned.",
-                role);
-    const DeviceAllocation allocation = array->get_device_allocation();
-    TI_ERROR_IF(array->owning_program() != this || allocation.device != device,
-                "Vulkan buffer command {} belongs to another runtime or "
-                "device.",
-                role);
-  };
-
   for (const auto &command : commands) {
-    ResolvedCommand item{command.kind,          kDeviceNullAllocation,
-                         kDeviceNullAllocation, command.destination_offset,
-                         command.source_offset, command.bytes,
-                         command.value};
+    std::size_t destination = absent, source = absent;
     switch (command.kind) {
       case VulkanBufferCommandKind::kFillU32:
-        TI_ERROR_IF(command.bytes == 0,
-                    "Vulkan buffer fill requires a nonzero byte count.");
-        validate_range(command.destination, command.destination_offset,
-                       command.bytes, "destination");
-        item.destination = command.destination->get_device_allocation();
-        views.push_back(command.destination);
+        destination =
+            add_binding(command.destination, command.destination_storage, true);
         break;
-      case VulkanBufferCommandKind::kCopy: {
-        TI_ERROR_IF(command.bytes == 0,
-                    "Vulkan buffer copy requires a nonzero byte count.");
-        validate_range(command.destination, command.destination_offset,
-                       command.bytes, "destination");
-        validate_range(command.source, command.source_offset, command.bytes,
-                       "source");
-        item.destination = command.destination->get_device_allocation();
-        item.source = command.source->get_device_allocation();
-        if (item.destination == item.source) {
-          const std::size_t destination_end =
-              command.destination_offset + command.bytes;
-          const std::size_t source_end = command.source_offset + command.bytes;
-          TI_ERROR_IF(command.destination_offset < source_end &&
-                          command.source_offset < destination_end,
-                      "Vulkan buffer copy regions overlap within one "
-                      "allocation.");
-        }
-        views.push_back(command.destination);
-        views.push_back(command.source);
+      case VulkanBufferCommandKind::kCopy:
+        destination =
+            add_binding(command.destination, command.destination_storage, true);
+        source = add_binding(command.source, command.source_storage, false);
         break;
-      }
       case VulkanBufferCommandKind::kBufferBarrier:
-        TI_ERROR_IF(!command.destination,
-                    "Vulkan buffer barrier requires a destination binding.");
-        validate_range(command.destination, 0, 0, "barrier");
-        item.destination = command.destination->get_device_allocation();
-        views.push_back(command.destination);
+        destination = add_binding(command.destination,
+                                  command.destination_storage, false);
         break;
       case VulkanBufferCommandKind::kMemoryBarrier:
         break;
       default:
         TI_ERROR("Vulkan buffer command kind is invalid.");
     }
-    resolved.push_back(item);
+    indices.emplace_back(destination, source);
   }
+  std::vector<const storage::DenseStorageDescriptor *> descriptor_ptrs;
+  descriptor_ptrs.reserve(descriptors.size());
+  for (const auto &descriptor : descriptors) {
+    descriptor_ptrs.push_back(&descriptor);
+  }
+  PreparedVulkanBufferCommands plan;
+  plan.storage = prepare_native_storage(descriptor_ptrs, writable);
+  auto resolved =
+      std::make_shared<std::vector<PreparedVulkanBufferCommands::Command>>();
+  resolved->reserve(commands.size());
+  auto range = [&](std::size_t binding_index, std::size_t offset,
+                   std::size_t bytes, const char *role) {
+    const auto &binding = plan.storage->binding(binding_index);
+    TI_ERROR_IF(offset > binding.bytes || bytes > binding.bytes - offset,
+                "Vulkan buffer command {} range offset {} plus {} bytes "
+                "exceeds {} bytes.",
+                role, offset, bytes, binding.bytes);
+    TI_ERROR_IF(
+        ((binding.pointer.offset + offset) & 3u) || (bytes & 3u),
+        "Vulkan buffer command {} offset and size must be four-byte aligned.",
+        role);
+    auto pointer = binding.pointer;
+    pointer.offset += offset;
+    return pointer;
+  };
+  for (std::size_t i = 0; i < commands.size(); ++i) {
+    const auto &command = commands[i];
+    PreparedVulkanBufferCommands::Command item{command.kind, kDeviceNullPtr,
+                                               kDeviceNullPtr, command.bytes,
+                                               command.value};
+    if (command.kind == VulkanBufferCommandKind::kFillU32 ||
+        command.kind == VulkanBufferCommandKind::kCopy) {
+      TI_ERROR_IF(!command.bytes,
+                  "Vulkan buffer fill/copy requires a nonzero byte count.");
+      item.destination = range(indices[i].first, command.destination_offset,
+                               command.bytes, "destination");
+      if (command.kind == VulkanBufferCommandKind::kCopy) {
+        item.source = range(indices[i].second, command.source_offset,
+                            command.bytes, "source");
+        const auto &dst =
+            static_cast<const DeviceAllocation &>(item.destination);
+        const auto &src = static_cast<const DeviceAllocation &>(item.source);
+        TI_ERROR_IF(
+            dst == src &&
+                item.destination.offset < item.source.offset + command.bytes &&
+                item.source.offset < item.destination.offset + command.bytes,
+            "Vulkan buffer copy regions overlap within one allocation.");
+      }
+    } else if (command.kind == VulkanBufferCommandKind::kBufferBarrier) {
+      item.destination = plan.storage->binding(indices[i].first).pointer;
+    }
+    resolved->push_back(item);
+  }
+  plan.commands = std::move(resolved);
+  return plan;
+}
 
-  auto leases = acquire_ndarray_leases(views);
-  enqueue_compute_op_lambda(
-      [resolved = std::move(resolved)](Device * /*device*/,
-                                       CommandList *cmdlist) {
-        for (const auto &command : resolved) {
-          switch (command.kind) {
-            case VulkanBufferCommandKind::kFillU32:
-              cmdlist->buffer_fill(
-                  command.destination.get_ptr(command.destination_offset),
-                  command.bytes, command.value);
-              break;
-            case VulkanBufferCommandKind::kCopy:
-              cmdlist->buffer_copy(
-                  command.destination.get_ptr(command.destination_offset),
-                  command.source.get_ptr(command.source_offset), command.bytes);
-              break;
-            case VulkanBufferCommandKind::kBufferBarrier:
-              cmdlist->buffer_barrier(command.destination);
-              break;
-            case VulkanBufferCommandKind::kMemoryBarrier:
-              cmdlist->memory_barrier();
-              break;
+void Program::execute_vulkan_buffer_commands(
+    const PreparedVulkanBufferCommands &plan) {
+  with_prepared_native_storage(*plan.storage, [&] {
+    enqueue_compute_op_lambda(
+        [commands = plan.commands](Device *, CommandList *cmdlist) {
+          for (const auto &command : *commands) {
+            switch (command.kind) {
+              case VulkanBufferCommandKind::kFillU32:
+                cmdlist->buffer_fill(command.destination, command.bytes,
+                                     command.value);
+                break;
+              case VulkanBufferCommandKind::kCopy:
+                cmdlist->buffer_copy(command.destination, command.source,
+                                     command.bytes);
+                break;
+              case VulkanBufferCommandKind::kBufferBarrier:
+                cmdlist->buffer_barrier(command.destination);
+                break;
+              case VulkanBufferCommandKind::kMemoryBarrier:
+                cmdlist->memory_barrier();
+                break;
+            }
           }
-        }
-      },
-      {});
-  mark_runtime_submission_pending();
-  pin_ndarray_launch_leases(leases);
+        },
+        {});
+    mark_runtime_submission_pending();
+  });
+}
+
+void Program::record_vulkan_buffer_commands(
+    const std::vector<VulkanBufferCommand> &commands) {
+  execute_vulkan_buffer_commands(prepare_vulkan_buffer_commands(commands));
 }
 
 void Program::copy_ndarray_from_host(Ndarray *dst,

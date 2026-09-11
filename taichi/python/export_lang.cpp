@@ -1297,6 +1297,7 @@ void export_lang(py::module &m) {
       .def_readwrite("custom_index", &VulkanRayInstanceInfo::custom_index);
 
   py::class_<VulkanRayQueryCommand>(m, "_VulkanRayQueryCommand");
+  py::class_<PreparedVulkanBufferCommands>(m, "_PreparedVulkanBufferCommands");
 
   py::class_<Program>(m, "Program")
       .def(py::init<>())
@@ -2705,7 +2706,7 @@ void export_lang(py::module &m) {
            py::arg("linear_filter"),
            py::call_guard<py::gil_scoped_release>())
       .def(
-          "_record_vulkan_buffer_commands",
+          "_prepare_vulkan_buffer_commands",
           [](Program *program, const py::sequence &raw_commands) {
             std::vector<VulkanBufferCommand> commands;
             commands.reserve(raw_commands.size());
@@ -2726,27 +2727,27 @@ void export_lang(py::module &m) {
               } else {
                 TI_ERROR("Unsupported Vulkan buffer command kind: {}", kind);
               }
-              command.destination =
-                  item[1].is_none() ? nullptr : py::cast<Ndarray *>(item[1]);
-              command.source =
-                  item[2].is_none() ? nullptr : py::cast<Ndarray *>(item[2]);
+              if (!item[1].is_none()) {
+                command.destination_storage =
+                    py::cast<const storage::DenseStorageDescriptor *>(item[1]);
+              }
+              if (!item[2].is_none()) {
+                command.source_storage =
+                    py::cast<const storage::DenseStorageDescriptor *>(item[2]);
+              }
               command.destination_offset = py::cast<std::size_t>(item[3]);
               command.source_offset = py::cast<std::size_t>(item[4]);
               command.bytes = py::cast<std::size_t>(item[5]);
               command.value = py::cast<std::uint32_t>(item[6]);
               commands.push_back(command);
             }
-            try {
-              py::gil_scoped_release release;
-              program->record_vulkan_buffer_commands(commands);
-              program->record_runtime_submission_stat(
-                  RuntimeSubmissionKind::kNative);
-            } catch (...) {
-              program->record_runtime_submission_failure();
-              throw;
-            }
+            py::gil_scoped_release release;
+            return program->prepare_vulkan_buffer_commands(commands);
           },
           py::arg("commands"))
+      .def("_execute_vulkan_buffer_commands",
+           tracked_native_program_method(&Program::execute_vulkan_buffer_commands),
+           py::call_guard<py::gil_scoped_release>())
       .def("vulkan_graphics_pipeline_available",
            &Program::vulkan_graphics_pipeline_available)
       .def("vulkan_graphics_indirect_capabilities",

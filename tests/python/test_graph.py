@@ -3737,18 +3737,25 @@ def test_cached_graph_runtime_field_keeps_snode_lifecycle_guard():
     assert value[None] == 14
 
 
+@pytest.mark.parametrize("fixed_binding", [False, True])
 @test_utils.test(arch=[ti.cpu, ti.cuda, ti.vulkan])
-def test_cached_graph_runtime_field_rejects_destroyed_generation():
+def test_cached_graph_runtime_field_rejects_destroyed_generation(fixed_binding):
     graph = _build_repeated_inc_graph()
     value = ti.field(ti.i32)
     fields = ti.FieldsBuilder()
     fields.place(value)
     tree = fields.finalize()
 
-    graph.run({"arr": value})
+    bindings = graph.bind({"arr": value}) if fixed_binding else {"arr": value}
+    if fixed_binding:
+        assert bindings.fast_path_qualified, bindings.statistics()
+    graph.run(bindings)
+    value[None] = 10
+    graph.run(bindings)
+    assert value[None] == 14
     tree.destroy()
     with pytest.raises(RuntimeError, match="stale|destroyed|retired"):
-        graph.run({"arr": value})
+        graph.run(bindings)
 
 
 @test_utils.test(arch=[ti.cpu, ti.cuda, ti.vulkan])

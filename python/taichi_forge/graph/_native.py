@@ -1,5 +1,6 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import partial
 from types import MappingProxyType
 
 from taichi_forge._lib import core as _ti_core
@@ -532,17 +533,34 @@ class VulkanBufferCommandRecording(BackendCommandRecording):
         object.__setattr__(self, "commands", commands)
 
     @staticmethod
-    def _native_array(value, name):
+    def _storage_description(value, name):
+        from taichi_forge.lang._storage_view import describe_storage
+
         if isinstance(value, GraphTemporaryBuffer):
             value = value.storage
-        native_array = getattr(value, "arr", None)
-        if native_array is None:
+        description = describe_storage(value)
+        if not description.supported:
             raise TaichiRuntimeError(
-                f"Vulkan buffer binding {name!r} must be a Taichi ndarray"
+                f"Vulkan buffer binding {name!r} cannot describe dense storage: "
+                f"{description.failure_reason}"
             )
-        return native_array
+        return description
 
     def execute(self, bindings):
+        from taichi_forge._hardware_telemetry import hardware_failure_phase
+
+        packet = (
+            bindings
+            if isinstance(bindings, _PreparedBufferCommands)
+            else self._prepare_packet(bindings)
+        )
+        with hardware_failure_phase("provider_execution_failure"):
+            packet.program._execute_vulkan_buffer_commands(packet.command)
+
+    def prepare_graph_execute(self, bindings):
+        return partial(self.execute, self._prepare_packet(bindings))
+
+    def _prepare_packet(self, bindings):
         required = frozenset(self.binding_names)
         provided = frozenset(bindings)
         if provided != required:
@@ -557,19 +575,19 @@ class VulkanBufferCommandRecording(BackendCommandRecording):
                 "Vulkan buffer bindings do not match the recording: "
                 + "; ".join(details)
             )
+        descriptions = {
+            name: self._storage_description(bindings[name], name)
+            for name in self.binding_names
+        }
         native_commands = []
         for command in self.commands:
             destination = (
                 None
                 if not command.destination
-                else self._native_array(
-                    bindings[command.destination], command.destination
-                )
+                else descriptions[command.destination].descriptor
             )
             source = (
-                None
-                if not command.source
-                else self._native_array(bindings[command.source], command.source)
+                None if not command.source else descriptions[command.source].descriptor
             )
             native_commands.append(
                 (
@@ -582,10 +600,12 @@ class VulkanBufferCommandRecording(BackendCommandRecording):
                     command.value,
                 )
             )
-        from taichi_forge._hardware_telemetry import hardware_failure_phase
-
-        with hardware_failure_phase("provider_execution_failure"):
-            impl.get_runtime().prog._record_vulkan_buffer_commands(native_commands)
+        program = impl.get_runtime().prog
+        command = program._prepare_vulkan_buffer_commands(native_commands)
+        owners = tuple(bindings[name] for name in self.binding_names)
+        return _PreparedBufferCommands(
+            program, command, owners, tuple(descriptions.values())
+        )
 
     @property
     def resource_effects(self):
@@ -616,6 +636,14 @@ class VulkanBufferCommandRecording(BackendCommandRecording):
 
     def _as_graph_native_node(self):
         return _VulkanBufferCommandNode(self)
+
+
+@dataclass(frozen=True)
+class _PreparedBufferCommands:
+    program: object
+    command: object
+    owners: tuple
+    descriptions: tuple
 
 
 @dataclass(frozen=True)

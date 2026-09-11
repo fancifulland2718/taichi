@@ -11204,6 +11204,15 @@ class _GraphSpec:
             not has_dynamic_argument_binding
             and not dynamic_overlay_names.intersection(self.memory_recipe_binding_names)
         )
+        self.native_publish_frame_stable = (
+            # A final native frame can be checked at bind/update even if an
+            # unrelated binding keeps the enclosing Graph on its slow path.
+            not has_dynamic_argument_binding
+            and all(
+                not dynamic_overlay_names.intersection(recording.binding_names)
+                for _, recording in self._native_preparers
+            )
+        )
         self.binding_plan = _GraphBindingPlan(
             public_names=public_names,
             public_name_set=self.runtime_arg_names,
@@ -11578,6 +11587,24 @@ class _GraphSpec:
             # reasons to reconstruct a descriptor during every replay.
             return None
         if isinstance(value, (DenseNdarrayView, ScalarField, MatrixField)):
+            # Compact program-owned storage has an immutable descriptor and
+            # native owner-generation checks, just like GraphMemory bindings.
+            # Freeze its flattened argument at publication instead of rebuilding
+            # Field layout metadata on every replay. Affine/external cases keep
+            # the existing conservative path.
+            description = (
+                value.description
+                if isinstance(value, DenseNdarrayView)
+                else describe_storage(value)
+            )
+            descriptor = description.descriptor
+            if (
+                descriptor is not None
+                and descriptor.owner_kind in ("kProgramNdarray", "kSNodePayload")
+                and description.properties["compact_contiguous"]
+                and description.properties["ndarray_abi_compatible"]
+            ):
+                return None
             return f"volatile_dense_storage:{name}"
         if isinstance(value, Matrix) and value.is_host_access:
             return f"volatile_host_matrix:{name}"
@@ -11711,7 +11738,9 @@ class _GraphSpec:
             fast_path_qualified=not blockers,
             volatile_reasons=tuple(blockers),
             native_actions=(
-                self._prepare_native_actions(validation_args) if not blockers else None
+                self._prepare_native_actions(validation_args)
+                if not blockers or self.native_publish_frame_stable
+                else None
             ),
         )
 

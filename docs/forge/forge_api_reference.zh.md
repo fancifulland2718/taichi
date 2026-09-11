@@ -188,7 +188,13 @@ vendor runtime 就自动成为默认 provider。
 `recording.execute(bindings)` 手动执行，也可通过
 `GraphBuilder.append_native(recording, admission="auto")` 加入 root Graph。
 
-当前只支持 runtime-owned Vulkan `ti.ndarray`、4-byte 对齐 range、显式 barrier、
+当前支持 runtime-owned Vulkan `ti.ndarray`、规范 dense field，以及 program-owned、
+紧凑连续的 `ti.experimental.ndarray_view`。byte offset 相对于传入 view；同一 allocation
+内不相交的区间可以复制，重叠复制与非连续 view 明确拒绝，不隐式 packing 或 field→ndarray
+复制。`graph.bind()` 只准备固定 command packet，不执行命令；布局和范围在这里验证，
+不进入已资格化的重复执行。Tree 销毁或 runtime reset 使旧绑定失效，原位更新内容不需要重新绑定。
+
+仍要求 4-byte 对齐 range、显式 barrier、
 runtime-ordered compute queue 和 `rerecord` replay。它不可从 `@ti.kernel` 内调用，
 不支持 structured `Sequential` 或 AOT serialization，也不等于 RasterPass/AS provider。
 越界、overlap copy、错误 backend/device、reset 后的旧 Graph 和超过 4096 条 command

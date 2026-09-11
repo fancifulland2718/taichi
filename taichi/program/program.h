@@ -97,6 +97,34 @@ struct SNodeMetadataStatistics {
 
 class Ndarray;
 class SparseMatrix;
+class Program;
+namespace storage {
+class DenseStorageDescriptor;
+}
+
+// A cold-qualified, program-owned byte-range plan. Device pointers are cached
+// only together with exact allocation handles and SNodeTree generations.
+// Consumers may use them only inside with_prepared_native_storage().
+class PreparedNativeStorage {
+ public:
+  struct Binding {
+    DevicePtr pointer;
+    std::size_t bytes;
+  };
+  const Binding &binding(std::size_t index) const {
+    return bindings_[index];
+  }
+
+ private:
+  friend class Program;
+  Program *owner_{nullptr};
+  std::uint64_t program_generation_{0};
+  std::vector<Binding> bindings_;
+  std::vector<RuntimeResourceHandle> ndarray_handles_;
+  std::vector<SNodeTreeDependency> trees_;
+  // Protected by Program's resource submission mutex, not a per-plan lock.
+  mutable std::uint64_t validated_tree_epoch_{0};
+};
 
 enum class VulkanBufferCommandKind : std::uint8_t {
   kFillU32,
@@ -109,13 +137,26 @@ struct VulkanBufferCommand {
   VulkanBufferCommandKind kind{VulkanBufferCommandKind::kMemoryBarrier};
   Ndarray *destination{nullptr};
   Ndarray *source{nullptr};
+  const storage::DenseStorageDescriptor *destination_storage{nullptr};
+  const storage::DenseStorageDescriptor *source_storage{nullptr};
   std::size_t destination_offset{0};
   std::size_t source_offset{0};
   std::size_t bytes{0};
   std::uint32_t value{0};
 };
 
-class Program;
+struct PreparedVulkanBufferCommands {
+  struct Command {
+    VulkanBufferCommandKind kind;
+    DevicePtr destination;
+    DevicePtr source;
+    std::size_t bytes;
+    std::uint32_t value;
+  };
+  std::shared_ptr<PreparedNativeStorage> storage;
+  std::shared_ptr<const std::vector<Command>> commands;
+};
+
 // Cold-qualified immutable ray bindings. Python/Graph owns the original array
 // wrappers; submission still acquires the existing generation-qualified leases.
 struct VulkanRayQueryCommand {
@@ -1076,6 +1117,11 @@ class TI_DLL_EXPORT Program {
   void with_resolved_runtime_storage_arguments(
       const std::vector<const storage::RuntimeStorageArgument *> &arguments,
       const DenseStorageBindingCallback &callback);
+  std::shared_ptr<PreparedNativeStorage> prepare_native_storage(
+      const std::vector<const storage::DenseStorageDescriptor *> &descriptors,
+      const std::vector<bool> &writable);
+  void with_prepared_native_storage(const PreparedNativeStorage &storage,
+                                   const std::function<void()> &submit);
   intptr_t get_dense_storage_data_ptr_as_int(
       const storage::ResolvedDenseBinding &binding);
 
@@ -1143,6 +1189,9 @@ class TI_DLL_EXPORT Program {
 
   void record_vulkan_buffer_commands(
       const std::vector<VulkanBufferCommand> &commands);
+  PreparedVulkanBufferCommands prepare_vulkan_buffer_commands(
+      const std::vector<VulkanBufferCommand> &commands);
+  void execute_vulkan_buffer_commands(const PreparedVulkanBufferCommands &plan);
 
   void copy_ndarray_from_host(Ndarray *dst,
                               const void *src,
