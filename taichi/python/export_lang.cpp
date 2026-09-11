@@ -5865,6 +5865,7 @@ void export_lang(py::module &m) {
       m, "_GfxExternalGraphCommand");
   py::class_<gfx::FixedGraphRecording, std::shared_ptr<gfx::FixedGraphRecording>>(
       m, "_VulkanFixedGraphRecording")
+      .def_static("supports_texture_bindings", [] { return true; })
       .def("run", &gfx::FixedGraphRecording::run, py::call_guard<py::gil_scoped_release>())
       .def("close", &gfx::FixedGraphRecording::close, py::call_guard<py::gil_scoped_release>())
       .def("argument_bytes", &gfx::FixedGraphRecording::argument_bytes,

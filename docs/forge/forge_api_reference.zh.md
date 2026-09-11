@@ -258,6 +258,16 @@ dispatch label。每个已发布 frame 保留 sampler 资源，只在准备时�
 退役，已发布 frame 仍持有其资源；准备新 frame 则要求源资源有效。CUDA RW texture 和
 texture AOT 序列化仍不支持，不新增 wheel 变体。
 
+支持此能力的 Vulkan runtime 中，默认完整 recipe provider 还提供 flat buffer/image Graph 的
+immutable secondary-command frame。sampled/storage image 复用 Program owner；`Graph.bind()`
+发布时准备参数、descriptor 和命令。录制包含闭合的 image layout 周期；上传、普通 kernel 或
+graphics 改变布局后，下次执行补必要入口转换，布局未变时不扫描 image binding 或重新上传参数。
+graphics 输出可直接进入已录制的 compute 消费者，无需 host readback；既有 graphics/compute
+queue bridge 保留，并不把 draw 合入同一 secondary command。当前覆盖单 mip 二维纹理组合，
+同一 task 内同一 image 的 sampled/storage 双重别名、AS 参数、SNode 和 texture AOT 不属于
+此路线。ordinary Vulkan Graph 行为不变；选择此完整 recipe 用 retained command/descriptor 和
+device barrier 换取较低 host 准备成本，不保证 device 加速。
+
 ### `ti.hardware.graphics.VulkanGraphicsPipeline`（0.6.3 开发中）
 
 这是 renderer-neutral 的底层 Vulkan 光栅接口。调用方提供 SPIR-V shader binary、精确

@@ -7,7 +7,6 @@ import weakref
 def eligible(spec, backend):
     from taichi_forge._lib import core
     from taichi_forge.graph._graph import _CompiledCGraphNode, _CompiledNativeGraphNode
-    from taichi_forge.hardware._vulkan_fft import _FrozenVulkanFftSource, _Recording
     from taichi_forge.lang import impl
 
     config = impl.current_cfg()
@@ -23,6 +22,11 @@ def eligible(spec, backend):
         return False
     if not spec.nodes:
         return False
+    if spec._texture_binding_requirements:
+        native = getattr(core, "_VulkanFixedGraphRecording", None)
+        supports_images = getattr(native, "supports_texture_bindings", None)
+        if supports_images is None or not supports_images():
+            return False
     for node in spec.nodes:
         if isinstance(node, _CompiledCGraphNode):
             if (
@@ -33,6 +37,8 @@ def eligible(spec, backend):
             ):
                 return False
         elif isinstance(node, _CompiledNativeGraphNode):
+            from taichi_forge.hardware._vulkan_fft import _FrozenVulkanFftSource, _Recording
+
             recording = getattr(node.executable, "_recording", None)
             if not isinstance(
                 recording, (_Recording, _FrozenVulkanFftSource)
@@ -55,7 +61,7 @@ class VulkanBindingFrameExecutor:
         spec = instance.spec
         if not eligible(spec, "vulkan"):
             raise ValueError(
-                "Vulkan binding frames require fixed buffer dispatches and inline-recordable FFT plans"
+                "Vulkan binding frames require fixed buffer/image dispatches and inline-recordable FFT plans"
             )
         self._program = impl.get_runtime().prog
         self._prepare = core._prepare_vulkan_graph_recording

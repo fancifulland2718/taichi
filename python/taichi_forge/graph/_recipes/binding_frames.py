@@ -185,15 +185,24 @@ class GraphBindingFrameRecipeProvider(GraphRuntimeFragmentProvider):
             "typed-runtime-fragment",
             "fixed-plan-provider-capture",
             "sampled-texture-resource-retention",
+            "vulkan-secondary-image-recording",
         ),
-        domain_version="immutable-binding-frame-domain-v5",
-        semantic_fingerprint="cuda-graph-composed-binding-retained-textures-v5",
+        domain_version="immutable-binding-frame-domain-v6",
+        semantic_fingerprint="cuda-vulkan-composed-binding-retained-images-v6",
     )
 
     def fragments(self, definition):
-        if not _eligible(definition._runtime_spec, definition.backend):
-            return ()
         spec = definition._runtime_spec
+        vulkan = definition.backend == "vulkan"
+        if vulkan:
+            from taichi_forge.graph._recipes.vulkan_binding_frames import eligible
+
+            # Mixed FFT/provider graphs retain their existing provider-owned
+            # submission fragment; do not generate a duplicate physical plan.
+            if spec.native_count or not eligible(spec, definition.backend):
+                return ()
+        elif not _eligible(spec, definition.backend):
+            return ()
         native = bool(spec.native_count)
         return (
             _fragment(
@@ -205,33 +214,65 @@ class GraphBindingFrameRecipeProvider(GraphRuntimeFragmentProvider):
                 tasks=(
                     GraphFragmentTask.create(
                         "whole-graph-bindings:execute",
-                        "cuda_complete_graph_binding_reuse",
+                        "vulkan_complete_graph_binding_reuse" if vulkan else "cuda_complete_graph_binding_reuse",
                         effects=spec.pre_optimization_ir_root.effects,
                         bindings=spec.pre_optimization_ir_root.bindings,
                         physical={
-                            "queue": "default",
                             "argument_images": "immutable_per_published_binding",
                             "argument_upload": "preparation_only",
-                            "executable_count": 1,
-                            "binding_transition": "whole_executable_update",
                             "argument_lifetime": "published_binding_and_inflight_work",
-                            "completion_events": "reuse_observed_peak_until_executor_close",
                             "workspace_lanes": 1,
+                            **(
+                                {
+                                    "submission": "embedded_secondary_commands",
+                                    "image_layouts": "closed_cycle_with_entry_repair_after_layout_change",
+                                    "binding_transition": "select_immutable_secondary",
+                                }
+                                if vulkan
+                                else {
+                                    "queue": "default",
+                                    "executable_count": 1,
+                                    "binding_transition": "whole_executable_update",
+                                    "completion_events": "reuse_observed_peak_until_executor_close",
+                                }
+                            ),
                             **({"provider_parameters": "captured_per_binding_fixed_plan"} if native else {}),
                         },
                     ),
                 ),
                 provider_descriptor=self.descriptor,
-                executor_kind="cuda_immutable_argument_frames",
+                executor_kind="vulkan_immutable_argument_frames" if vulkan else "cuda_immutable_argument_frames",
             ),
         )
 
     def contribute_runtime(self, assembly, selection):
         if selection.source_key != "whole-graph-bindings" or selection.choice_id != "immutable-argument-images":
             raise ValueError("unknown whole-Graph immutable binding selection")
-        assembly.select_binding_executor(_BindingFrameExecutor)
+        if assembly.definition.backend == "vulkan":
+            from taichi_forge.graph._recipes.vulkan_binding_frames import VulkanBindingFrameExecutor
+
+            assembly.select_binding_executor(VulkanBindingFrameExecutor)
+        else:
+            assembly.select_binding_executor(_BindingFrameExecutor)
 
     def describe(self, definition, fragment_key):
+        if definition.backend == "vulkan":
+            return {
+                **super().describe(definition, fragment_key),
+                "display_name": "Whole-Graph immutable Vulkan binding frames",
+                "changes": (
+                    "prepare arguments, descriptors and secondary commands at binding publication",
+                    "retain buffer/image resources until frame and parent command retirement",
+                    "record a closed image-layout cycle; repair entry layouts only after layout changes",
+                ),
+                "limitations": (
+                    "flat Vulkan kernel Graph, one workspace lane; no SNode, AS or external synchronization domains",
+                    "one-mip sampled/storage images; simultaneous sampled/storage alias in one task is unavailable",
+                    "raw mapping calls include argument preparation; use Graph.bind to amortize it",
+                    "uploads and intervening graphics operations retain their existing explicit boundaries",
+                    "driver-owned command/descriptor memory remains opaque; benefit requires workload measurements",
+                ),
+            }
         return {
             **super().describe(definition, fragment_key),
             "display_name": "Whole-Graph immutable argument frames",

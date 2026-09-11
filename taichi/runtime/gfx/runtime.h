@@ -820,6 +820,10 @@ class TI_DLL_EXPORT GfxRuntime {
 
   std::unordered_map<DeviceAllocation *, size_t> root_buffers_size_map_;
   std::unordered_map<DeviceAllocationId, ImageLayout> last_image_layouts_;
+  // Invalidate recorded entry-layout preparation only on a real layout change.
+  // Stable secondary replay never scans its image bindings.
+  std::uint64_t image_layout_epoch_{1};
+  void set_tracked_image_layout(DeviceAllocationId image, ImageLayout layout);
   std::unordered_map<DeviceAllocationId, ImageSamplerConfig>
       image_sampler_configs_;
   // [Note] Why do we need to track ndarrays that are in use?

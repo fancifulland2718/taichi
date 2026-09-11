@@ -321,6 +321,21 @@ their resource leases until frame/executor retirement, even if the source wrappe
 is retired; preparing a new frame still requires a live source. CUDA RW textures
 and texture AOT serialization remain unsupported. No wheel variant is added.
 
+On capable Vulkan runtimes, the default complete-recipe provider set also offers
+immutable secondary-command frames for flat buffer/image Graphs. Sampled and
+storage images retain their existing Program owners; arguments, descriptors and
+commands are prepared at `Graph.bind()` publication. The recording closes its
+image-layout cycle. Uploads, direct kernels or graphics use may require an entry
+transition on the next execution, but unchanged replay does not scan image
+bindings or reupload arguments. Graphics output can therefore feed the recorded
+compute consumer without a host readback; the existing graphics/compute queue
+bridge remains. This does not add graphics draws to the same secondary command.
+One-mip 2D texture composition is covered. Simultaneous sampled/storage aliasing
+of one image within one task, AS arguments, SNode bindings and texture AOT remain
+outside this route. Ordinary Vulkan Graph execution is unchanged; selecting this
+complete recipe trades retained commands/descriptors and device barriers for
+lower host preparation cost, not guaranteed device acceleration.
+
 ### `ti.hardware.graphics.VulkanGraphicsPipeline` (0.6.3 in development)
 
 This is the low-level, renderer-neutral Vulkan raster interface. The caller

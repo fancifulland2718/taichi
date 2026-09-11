@@ -1,5 +1,6 @@
 #include "taichi/program/program.h"
 #include "taichi/program/ndarray.h"
+#include "taichi/program/texture.h"
 #include "taichi/runtime/gfx/graph_recording.h"
 
 #ifdef TI_WITH_VULKAN
@@ -15,9 +16,7 @@ aot::CompiledGraph graph_recording_argument_schema(
     auto [entry, inserted] = result.args.emplace(arg.name, arg);
     const auto &prior = entry->second;
     TI_ERROR_IF(
-        !inserted && (arg.tag != prior.tag || arg.dtype_id != prior.dtype_id ||
-                      arg.field_dim != prior.field_dim ||
-                      arg.element_shape != prior.element_shape),
+        !inserted && arg != prior,
         "Prepared Vulkan Graph has conflicting argument declarations: {}",
         arg.name);
   };
@@ -80,6 +79,7 @@ Program::create_vulkan_graph_recording(
   auto *launcher = dynamic_cast<gfx::KernelLauncher *>(&get_kernel_launcher());
   TI_ERROR_IF(!launcher, "Prepared Vulkan Graph launcher is unavailable");
   std::vector<const Ndarray *> arrays;
+  auto textures = std::make_shared<std::vector<TextureResourceLease>>();
   for (const auto &[name, value] : args) {
     if (value.tag == aot::ArgKind::kNdarray) {
       TI_ERROR_IF(!value.val,
@@ -100,14 +100,22 @@ Program::create_vulkan_graph_recording(
         const auto *argument = value.runtime_storage;
         retain_runtime_storage_for_graph_submission(&argument, 1);
       }
+    } else if (value.tag == aot::ArgKind::kTexture) {
+      const auto *texture = reinterpret_cast<const Texture *>(value.val);
+      TI_ERROR_IF(!texture || texture->owning_program() != this ||
+                      texture->is_cuda_texture(),
+                  "Prepared Vulkan Graph requires a Program-owned image: {}",
+                  name);
+      textures->push_back(acquire_texture_external_lease(texture));
     } else {
       TI_ERROR_IF(
           value.tag != aot::ArgKind::kScalar &&
               value.tag != aot::ArgKind::kMatrix,
-          "Prepared Vulkan Graph supports buffer and value arguments only");
+          "Prepared Vulkan Graph argument kind is unsupported");
     }
   }
   std::vector<std::shared_ptr<void>> owners;
+  owners.push_back(std::move(textures));
   owners.push_back(
       std::make_shared<NdarrayLaunchLeases>(acquire_ndarray_leases(arrays)));
   std::vector<std::unique_ptr<LaunchContextBuilder>> contexts;
@@ -118,9 +126,8 @@ Program::create_vulkan_graph_recording(
       const auto &graph = **graph_pointer;
       TI_ERROR_IF(!graph.snode_tree_dependencies.empty() ||
                       graph.has_indirect_dispatches() ||
-                      graph.has_cuda_parallel_dispatch_groups() ||
-                      graph.has_dispatch_labels(),
-                  "Prepared Vulkan Graph requires ordinary ndarray segments");
+                      graph.has_cuda_parallel_dispatch_groups(),
+                  "Prepared Vulkan Graph requires flat segments without SNode dependencies");
       // Retain synthetic kernels and their compiled payloads independently of
       // Python builders and subsequent compilation-cache eviction.
       for (auto &kernel : graph.owned_jit_kernels) {
@@ -143,6 +150,7 @@ Program::create_vulkan_graph_recording(
         graph.init_runtime_context(dispatch.symbolic_args, args, *context);
         resolve_ndarray_launch_context_under_guard(*context);
         resolve_runtime_storage_launch_context_under_guard(*context);
+        resolve_texture_launch_context_under_guard(*context);
         operations.push_back({{handle, context.get()}, {}});
         contexts.push_back(std::move(context));
       }

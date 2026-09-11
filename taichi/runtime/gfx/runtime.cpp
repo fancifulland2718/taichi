@@ -2325,6 +2325,10 @@ bool GfxRuntime::GraphReplayExecutable::refresh_prepared_cache(
       for (const auto &array_arg : pd.kernel->runtime_array_args()) {
         const auto alloc_type =
             pd.host_ctx->device_allocation_type[array_arg.indices];
+        if (alloc_type == LaunchContextBuilder::DevAllocType::kTexture ||
+            alloc_type == LaunchContextBuilder::DevAllocType::kRWTexture) {
+          continue;
+        }
         DeviceAllocation devalloc = kDeviceNullAllocation;
         if (alloc_type == LaunchContextBuilder::DevAllocType::kDenseStorage) {
           devalloc =
@@ -2692,6 +2696,9 @@ std::unique_ptr<GraphReplayRegistration> GfxRuntime::prepare_fixed_graph(
   auto &slot = *payload;
   slot.retained_owners = std::move(owners);
   std::vector<GraphReplayExecutable::PreparedDispatch> prepared;
+  using ImageBinding = std::pair<DeviceAllocation, ImageLayout>;
+  std::vector<ImageBinding> entry_images;
+  std::unordered_map<DeviceAllocationId, ImageLayout> recorded_image_layouts;
   for (const auto &operation : operations) {
     if (operation.external) {
       continue;
@@ -2709,18 +2716,19 @@ std::unique_ptr<GraphReplayRegistration> GfxRuntime::prepare_fixed_graph(
       const auto kind =
           dispatch.host_ctx->device_allocation_type[array.indices];
       TI_ERROR_IF(kind != LaunchContextBuilder::DevAllocType::kNdarray &&
-                      kind != LaunchContextBuilder::DevAllocType::kDenseStorage,
-                  "Prepared Vulkan Graph requires owned device arrays");
+                      kind != LaunchContextBuilder::DevAllocType::kDenseStorage &&
+                      kind != LaunchContextBuilder::DevAllocType::kTexture &&
+                      kind != LaunchContextBuilder::DevAllocType::kRWTexture,
+                  "Prepared Vulkan Graph requires owned device arrays or images");
     }
     const auto &tasks = kernel->ti_kernel_attribs().tasks_attribs;
     for (std::size_t i = 0; i < tasks.size(); ++i) {
       TI_ERROR_IF(
-          !tasks[i].texture_binds.empty() ||
-              !tasks[i].acceleration_structure_binds.empty() ||
+          !tasks[i].acceleration_structure_binds.empty() ||
               tasks[i].task_type == OffloadedTaskType::listgen ||
               tasks[i].may_mutate_sparse_topology ||
               kernel->task_uses_listgen_buffer(i),
-          "Prepared Vulkan Graph requires topology-stable buffer tasks");
+          "Prepared Vulkan Graph requires topology-stable tasks without AS bindings");
       for (const auto &bind : kernel->buffer_binding_plan(i)) {
         TI_ERROR_IF(
             bind.kind == CompiledTaichiKernel::BufferBindingKind::ArgPack ||
@@ -2782,6 +2790,37 @@ std::unique_ptr<GraphReplayRegistration> GfxRuntime::prepare_fixed_graph(
     const auto &tasks = pd.kernel->ti_kernel_attribs().tasks_attribs;
     for (std::size_t i = 0; i < tasks.size(); ++i) {
       auto resources = device_->create_resource_set_unique();
+      std::unordered_map<DeviceAllocationId, ImageLayout> task_images;
+      for (const auto &bind : tasks[i].texture_binds) {
+        const auto found = pd.host_ctx->array_ptrs.find(bind.arg_id);
+        TI_ERROR_IF(found == pd.host_ctx->array_ptrs.end() || !found->second,
+                    "Prepared Vulkan Graph image is unbound");
+        const auto image = *static_cast<DeviceAllocation *>(found->second);
+        TI_ERROR_IF(image.device != device_ ||
+                        last_image_layouts_.find(image.alloc_id) ==
+                            last_image_layouts_.end(),
+                    "Prepared Vulkan Graph image is not owned by this device");
+        const auto layout = bind.is_storage ? ImageLayout::shader_read_write
+                                            : ImageLayout::shader_read;
+        const auto [usage, inserted] = task_images.emplace(image.alloc_id, layout);
+        TI_ERROR_IF(!inserted && usage->second != layout,
+                    "Prepared Vulkan Graph cannot bind one image as both sampled "
+                    "and storage in the same task");
+        const auto [previous, first_use] =
+            recorded_image_layouts.emplace(image.alloc_id, layout);
+        if (first_use) {
+          entry_images.emplace_back(image, layout);
+        } else if (previous->second != layout) {
+          commands->image_transition(image, previous->second, layout);
+          previous->second = layout;
+        }
+        if (bind.is_storage) {
+          resources->rw_image(bind.binding, image, 0);
+        } else {
+          resources->image(bind.binding, image,
+                            image_sampler_configs_.at(image.alloc_id));
+        }
+      }
       TI_ERROR_IF(!bind_graph_task(pd, i, resources.get(), false),
                   "Prepared Vulkan Graph descriptor preparation failed");
       commands->bind_pipeline(pd.kernel->get_pipeline(i));
@@ -2796,6 +2835,14 @@ std::unique_ptr<GraphReplayRegistration> GfxRuntime::prepare_fixed_graph(
                   "Prepared Vulkan Graph dispatch recording failed");
       commands->memory_barrier();
       slot.resource_sets.push_back(std::move(resources));
+    }
+  }
+  // Close the recorded layout cycle. The same immutable commands can then
+  // replay without inspecting or changing per-image tracking on each launch.
+  for (const auto &[image, layout] : entry_images) {
+    const auto final_layout = recorded_image_layouts.at(image.alloc_id);
+    if (final_layout != layout) {
+      commands->image_transition(image, final_layout, layout);
     }
   }
   for (auto bytes : slot.args_buffer_sizes) {
@@ -2828,6 +2875,24 @@ std::unique_ptr<GraphReplayRegistration> GfxRuntime::prepare_fixed_graph(
     };
   }
   state.last_path = GraphReplayLastPath::record;
+  if (!entry_images.empty()) {
+    state.fixed_submit =
+        [this, launch = std::move(state.fixed_submit),
+         images = std::move(entry_images), epoch = std::uint64_t{0}]() mutable {
+          if (epoch != image_layout_epoch_) {
+            // Only an intervening upload, graphics use or another image plan
+            // can require an entry-layout repair. No probe, owner validation,
+            // parameter upload or host synchronization is needed here.
+            for (const auto &[image, layout] : images) {
+              if (last_image_layouts_.at(image.alloc_id) != layout) {
+                transition_image(image, layout);
+              }
+            }
+            epoch = image_layout_epoch_;
+          }
+          launch();
+        };
+  }
   graph_replay_states_.emplace(registration->replay_key(), std::move(state));
   return registration;
 }
@@ -5304,21 +5369,21 @@ DeviceAllocation GfxRuntime::create_image(const ImageParams &params) {
   TI_ERROR_IF(gfx_device == nullptr,
               "Image can only be created on a graphics device");
   DeviceAllocation image = gfx_device->create_image(params);
-  track_image(image, ImageLayout::undefined);
-  last_image_layouts_.at(image.alloc_id) = params.initial_layout;
+  track_image(image, params.initial_layout);
   image_sampler_configs_.at(image.alloc_id) = params.sampler_config;
   return image;
 }
 
 void GfxRuntime::track_image(DeviceAllocation image, ImageLayout layout) {
   std::lock_guard<std::recursive_mutex> lock(host_api_mutex_);
-  last_image_layouts_[image.alloc_id] = layout;
+  set_tracked_image_layout(image.alloc_id, layout);
   image_sampler_configs_.try_emplace(image.alloc_id, ImageSamplerConfig{});
 }
 void GfxRuntime::untrack_image(DeviceAllocation image) {
   std::lock_guard<std::recursive_mutex> lock(host_api_mutex_);
   invalidate_graphics_command_replay_locked(image);
   last_image_layouts_.erase(image.alloc_id);
+  ++image_layout_epoch_;
   image_sampler_configs_.erase(image.alloc_id);
 }
 void GfxRuntime::transition_image(DeviceAllocation image, ImageLayout layout) {
@@ -5327,7 +5392,16 @@ void GfxRuntime::transition_image(DeviceAllocation image, ImageLayout layout) {
   ensure_current_cmdlist();
   insert_pending_dispatch_barriers();
   current_cmdlist_->image_transition(image, last_layout, layout);
-  last_layout = layout;
+  set_tracked_image_layout(image.alloc_id, layout);
+}
+
+void GfxRuntime::set_tracked_image_layout(DeviceAllocationId image,
+                                          ImageLayout layout) {
+  auto [entry, inserted] = last_image_layouts_.try_emplace(image, layout);
+  if (inserted || entry->second != layout) {
+    entry->second = layout;
+    ++image_layout_epoch_;
+  }
 }
 
 void GfxRuntime::synchronize() {
@@ -6028,7 +6102,7 @@ void GfxRuntime::enqueue_graphics_op_lambda(
                              .slots[retained_slot_index]
                              .command_list.get();
     for (const auto &ref : image_refs) {
-      last_image_layouts_[ref.image.alloc_id] = ref.final_layout;
+      set_tracked_image_layout(ref.image.alloc_id, ref.final_layout);
     }
   } else {
     auto [new_commands, graphics_result] =
@@ -6054,7 +6128,7 @@ void GfxRuntime::enqueue_graphics_op_lambda(
         graphics_commands->image_transition(ref.image, ref.initial_layout,
                                             ref.final_layout);
       }
-      last_image_layouts_[ref.image.alloc_id] = ref.final_layout;
+      set_tracked_image_layout(ref.image.alloc_id, ref.final_layout);
     }
 
     if (record_retained) {

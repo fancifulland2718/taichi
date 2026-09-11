@@ -311,6 +311,12 @@ grouped under the behavior they shipped.
   arguments only at binding publication; CUDA read/write textures and
   texture AOT manifests remain unsupported. Neither backend silently replaces
   field/ndarray access, and no official wheel variant is added.
+- Vulkan complete recipes can retain sampled/storage images in immutable
+  secondary-command frames, with preparation-only argument/descriptor work and
+  closed layout cycles. Uploads and graphics use preserve the existing ordering
+  boundaries; unchanged replay adds no per-image layout scan. Image transitions
+  now cover actual shader and early/late depth accesses instead of using
+  `TOP_OF_PIPE` for shader dependencies. Ordinary Graph behavior is unchanged.
 - Added D0 `ti.hardware.graphics.VulkanGraphicsPipeline`, a renderer-neutral
   interface over caller-provided SPIR-V, exact vertex/index layouts,
   runtime-owned color/depth textures, and direct or root-Graph draw recording.

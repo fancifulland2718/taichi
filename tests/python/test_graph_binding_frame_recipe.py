@@ -42,7 +42,7 @@ def _definition(size=131):
 
 
 def _catalog(definition):
-    if not core._CudaGraphBindingExecutor.available():
+    if definition.backend == "cuda" and not core._CudaGraphBindingExecutor.available():
         pytest.skip("CUDA binding-frame execution is unavailable")
     return definition.recipe_catalog(providers=(GraphRuntimeAssemblyProvider(), GraphBindingFrameRecipeProvider()))
 
@@ -220,7 +220,7 @@ def test_binding_recipe_raw_mapping_calls_prepare_without_silent_ordinary_fallba
 
 
 @pytest.mark.parametrize("sampled_texture", [False, True])
-@test_utils.test(arch=ti.cuda, offline_cache=False)
+@test_utils.test(arch=[ti.cuda, ti.vulkan], offline_cache=False)
 def test_binding_recipe_fork_search_report_and_fresh_definition_resolve(sampled_texture):
     factory = _texture_definition if sampled_texture else _definition
     definition = factory()
@@ -265,7 +265,156 @@ def test_binding_recipe_fork_search_report_and_fresh_definition_resolve(sampled_
     selection = fresh.resolve_recipe(decision.selection_artifact, providers=providers)
     with fresh.materialize(selection) as materialized:
         evaluate(materialized.executor, selection)
-        assert materialized.executor._instance.physical_submission_mode == "cuda_immutable_argument_frames_exec_reuse"
+        expected_mode = (
+            "vulkan_secondary_immutable_argument_frames"
+            if definition.backend == "vulkan"
+            else "cuda_immutable_argument_frames_exec_reuse"
+        )
+        assert materialized.executor._instance.physical_submission_mode == expected_mode
+
+
+@test_utils.test(arch=ti.vulkan, offline_cache=False)
+def test_vulkan_image_frames_close_layout_cycles_across_upload_and_kernel_use(monkeypatch):
+    from taichi_forge.lang import impl
+
+    @ti.kernel
+    def write(
+        image: ti.types.rw_texture(num_dimensions=2, fmt=ti.Format.r32f, lod=0),
+        source: ti.types.ndarray(dtype=ti.f32, ndim=2),
+    ):
+        for i, j in source:
+            image.store(ti.Vector([i, j]), ti.Vector([source[i, j], 0.0, 0.0, 1.0]))
+
+    @ti.kernel
+    def read(image: ti.types.texture(num_dimensions=2), output: ti.types.ndarray(dtype=ti.f32, ndim=2)):
+        for i, j in output:
+            output[i, j] = image.fetch(ti.Vector([i, j]), 0).x
+
+    image = ti.Texture(ti.Format.r32f, (17, 23))
+    source = ti.ndarray(ti.f32, (17, 23))
+    output = ti.ndarray(ti.f32, (17, 23))
+    host = np.arange(17 * 23, dtype=np.float32).reshape(17, 23) / 16
+    source.from_numpy(host)
+    output.fill(-53)
+    reader = _texture_definition()
+    with monkeypatch.context() as patch:
+        patch.setattr(core, "_VulkanFixedGraphRecording", object)
+        assert GraphBindingFrameRecipeProvider().fragments(reader) == ()
+        assert GraphBindingFrameRecipeProvider().fragments(_definition())
+    builder = ti.graph.GraphBuilder()
+    builder.dispatch(
+        write,
+        ti.graph.Arg(ti.graph.ArgKind.RWTEXTURE, "write_image", fmt=ti.Format.r32f, ndim=2),
+        ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "source", ti.f32, ndim=2),
+        label="write",
+    )
+    builder.dispatch(
+        read,
+        ti.graph.Arg(ti.graph.ArgKind.TEXTURE, "read_image", ndim=2),
+        ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "output", ti.f32, ndim=2),
+        label="read-after-write",
+    )
+    cycle = builder.freeze()
+    plans = []
+    for definition in (reader, cycle):
+        catalog = _catalog(definition)
+        recipe = next(entry.recipe for entry in catalog.entries() if entry.recipe.fragments)
+        context = definition.materialization_context(provider_set=catalog.provider_set)
+        plans.append((context, context.materialize(recipe)))
+    read_graph, cycle_graph = [plan.executor for _, plan in plans]
+    read_binding = read_graph.bind(dict(image=image, output=output))
+    cycle_binding = cycle_graph.bind(dict(write_image=image, read_image=image, source=source, output=output))
+    np.testing.assert_array_equal(output.to_numpy(), np.full((17, 23), -53, np.float32))
+    frames = (read_binding._version.execution_frame, cycle_binding._version.execution_frame)
+    assert all(frame.uses_secondary_commands() for frame in frames)
+    argument_bytes = [frame.argument_bytes() for frame in frames]
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("Immutable replay must not prepare again")
+
+    monkeypatch.setattr(core, "_prepare_vulkan_graph_recording", unexpected)
+    for _ in range(3):
+        cycle_graph.run(cycle_binding)
+        np.testing.assert_array_equal(output.to_numpy(), host)
+        read_graph.run(read_binding)
+        np.testing.assert_array_equal(output.to_numpy(), host * 2 + 1)
+        source.fill(9)
+        image.from_ndarray(source)
+        read_graph.run(read_binding)
+        np.testing.assert_array_equal(output.to_numpy(), np.full((17, 23), 19, np.float32))
+        source.from_numpy(host)
+        write(image, source)
+        read_graph.run(read_binding)
+        np.testing.assert_array_equal(output.to_numpy(), host * 2 + 1)
+    assert [frame.argument_bytes() for frame in frames] == argument_bytes
+    version = cycle_binding._version
+    wrong_format = ti.Texture(ti.Format.rgba32f, (17, 23))
+    with pytest.raises((ValueError, RuntimeError, ti.TaichiRuntimeError)):
+        cycle_binding.update(write_image=wrong_format)
+    assert cycle_binding._version is version
+    wrong_format._delete_runtime_texture()
+    program = impl.get_runtime().prog
+    before = dict(program._debug_texture_resource_stats())
+    native_image = image.tex
+    image._delete_runtime_texture()
+    cycle_graph.run(cycle_binding)
+    # Closing before submission must retain images until the parent commands
+    # finish, not merely until the Python recording wrapper is closed.
+    for context, plan in plans:
+        plan.close()
+        context.close()
+    np.testing.assert_array_equal(output.to_numpy(), host)
+    ti.sync()
+    after = dict(program._debug_texture_resource_stats())
+    assert after["released_total"] >= before["released_total"] + 1
+    assert after["retiring"] == after["inflight"] == after["release_errors"] == 0
+    assert all(frame.argument_bytes() == 0 for frame in frames)
+    assert native_image
+
+
+@test_utils.test(arch=ti.vulkan, offline_cache=False)
+def test_vulkan_sampled_frame_consumes_graphics_output_and_retires_on_reset():
+    from tests.python.test_hardware_graphics import _triangle_pipeline, _triangle_vertices
+
+    @ti.kernel
+    def read(image: ti.types.texture(num_dimensions=2), output: ti.types.ndarray(dtype=ti.f32, ndim=3)):
+        for i, j in ti.ndrange(64, 64):
+            value = image.fetch(ti.Vector([i, j]), 0)
+            for c in ti.static(range(4)):
+                output[i, j, c] = value[c]
+
+    image = ti.Texture(ti.Format.rgba8, (64, 64))
+    output = ti.ndarray(ti.f32, (64, 64, 4))
+    reference = ti.ndarray(ti.f32, (64, 64, 4))
+    vertices = _triangle_vertices()
+    builder = ti.graph.GraphBuilder()
+    builder.dispatch(
+        read,
+        ti.graph.Arg(ti.graph.ArgKind.TEXTURE, "image", ndim=2),
+        ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "output", ti.f32, ndim=3),
+        label="postprocess",
+    )
+    definition = builder.freeze()
+    catalog = _catalog(definition)
+    recipe = next(entry.recipe for entry in catalog.entries() if entry.recipe.fragments)
+    with definition.materialization_context(provider_set=catalog.provider_set) as context:
+        with context.materialize(recipe) as materialized, _triangle_pipeline() as pipeline:
+            graph = materialized.executor
+            binding = graph.bind(dict(image=image, output=output))
+            frame = binding._version.execution_frame
+            for color in ((0.1, 0.2, 0.3, 1.0), (0.6, 0.4, 0.2, 1.0)):
+                pipeline.draw(image, {0: vertices}, draw=ti.hardware.graphics.Draw(3), clear_color=color)
+                graph.run(binding)
+                # The direct consumer is an oracle, not a second recording.
+                read(image, reference)
+                np.testing.assert_array_equal(output.to_numpy(), reference.to_numpy())
+                np.testing.assert_allclose(output.to_numpy()[0, 0], color, atol=1 / 255)
+            pipeline.close()
+            ti.reset()
+            with pytest.raises(RuntimeError, match="closed|finaliz|runtime"):
+                frame.run()
+            frame.close()
+            assert frame.argument_bytes() == 0
 
 
 @test_utils.test(arch=ti.cuda, offline_cache=False)

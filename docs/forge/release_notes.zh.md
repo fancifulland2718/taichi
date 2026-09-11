@@ -233,6 +233,10 @@ runtime build identity `c268ca5671e8`；`0.4.25` 仍是最后一个公开的 `0.
   binding 发布时上传参数；CUDA
   read/write texture 与 texture AOT manifest 仍不支持。两个 backend 都不会
   静默替换 field/ndarray 访问，也不增加官方 wheel 变体。
+- Vulkan 完整 recipe 可在 immutable secondary-command frame 中保留 sampled/storage image；
+  参数和 descriptor 仅在准备时建立，录制使用闭合 layout 周期。上传和 graphics 操作保留既有
+  排序边界，布局不变的 replay 不逐 image 扫描。image transition 修正为覆盖真实 shader 与
+  early/late depth 访问，不再用 TOP_OF_PIPE 表达 shader 数据依赖。ordinary Graph 行为不变。
 - 新增 D0 `ti.hardware.graphics.VulkanGraphicsPipeline`，在调用方提供的 SPIR-V、精确
   vertex/index layout、runtime-owned color/depth texture 上提供 renderer-neutral 的 direct
   或 root-Graph draw recording。compute/graphics 排序使用 device-side semaphore bridge，
