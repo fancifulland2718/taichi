@@ -3609,6 +3609,41 @@ def test_dispatch_labels_preserve_production_backend_replay():
     assert not segment.replay_attribution.enabled
 
 
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_cuda_replay_preserves_order_across_zero_task_dispatches():
+    @ti.kernel
+    def empty():
+        pass
+
+    @ti.kernel
+    def advance(value: ti.types.ndarray(dtype=ti.i32, ndim=0)):
+        value[None] = value[None] * 2 + 1
+
+    symbol = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "value", ti.i32, ndim=0)
+    builder = ti.graph.GraphBuilder()
+    builder.dispatch(empty)
+    builder.dispatch(advance, symbol)
+    builder.dispatch(empty)
+    builder.dispatch(advance, symbol)
+    builder.dispatch(empty)
+    graph = builder.compile()
+    value = ti.ndarray(ti.i32, ())
+    value.fill(0)
+    bindings = graph.bind({"value": value})
+    for _ in range(3):
+        graph.run(bindings)
+    assert value.to_numpy()[()] == 63
+    assert graph.execution_stats().segments[0].last_path == "cuda_exact_replay"
+
+    empty_builder = ti.graph.GraphBuilder()
+    empty_builder.dispatch(empty)
+    empty_graph = empty_builder.compile()
+    for _ in range(3):
+        empty_graph.run({})
+    ti.sync()
+    assert empty_graph.execution_stats().segments[0].last_path == "cuda_exact_replay"
+
+
 @test_utils.test(arch=[ti.cpu, ti.cuda, ti.vulkan])
 def test_cached_graph_stats_are_side_effect_free_and_binding_is_generation_safe():
     graph = _build_repeated_inc_graph()

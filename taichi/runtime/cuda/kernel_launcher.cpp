@@ -1126,7 +1126,11 @@ void KernelLauncher::capture_cuda_graph_launch(
   auto *cuda_jit_module = dynamic_cast<JITModuleCUDA *>(cuda_module);
   TI_ASSERT(cuda_jit_module != nullptr);
   const auto &offloaded_tasks = packet.offloaded_tasks;
-  TI_ASSERT(!offloaded_tasks.empty());
+  // A valid compiled kernel can contain no offloaded work (for example an
+  // empty kernel or a statically eliminated body). It contributes no CUDA
+  // commands; the surrounding stream operations already preserve ordering.
+  // Keep the logical dispatch in the Graph, without fabricating a device task
+  // or forcing the complete Graph to fall back to ordinary execution.
   for (const auto &task : offloaded_tasks) {
     std::string trace_name;
     std::unique_ptr<ScopedExternalProfilerAnnotation> annotation;
