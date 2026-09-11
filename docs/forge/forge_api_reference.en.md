@@ -306,9 +306,15 @@ mip level and normalized coordinates; anisotropy and comparison sampling are
 not exposed. `sample_lod()` uses the sampler while exact integer-coordinate
 `fetch()` ignores it. Floating filtering does not promise cross-device
 bitwise determinism.
-Ordinary field or ndarray access is never converted to texture sampling, and
-the CUDA backend has no texture lowering yet. This D0 route adds no wheel
-variant.
+Ordinary field or ndarray access is never converted to texture sampling. CUDA
+also supports explicit sampled textures over Driver-API arrays/texture objects,
+including cached Graph capture with generation-owned sampler lifetimes. Fixed
+`Graph.bind()` validates Texture type and dimensions before publication. In-place
+uploads preserve the capture; replacing the Texture selects or captures another
+bounded executable slot. Uploads retain their existing explicit synchronization
+behavior; this does not introduce a captured upload command. CUDA RW textures,
+texture AOT serialization, and the separate immutable-binding-frame recipe remain
+outside this support statement. No wheel variant is added.
 
 ### `ti.hardware.graphics.VulkanGraphicsPipeline` (0.6.3 in development)
 

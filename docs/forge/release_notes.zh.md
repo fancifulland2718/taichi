@@ -228,7 +228,8 @@ runtime build identity `c268ca5671e8`；`0.4.25` 仍是最后一个公开的 `0.
   repeat/mirrored-repeat/clamp-to-edge address，由 device sampler cache 复用；精确
   `fetch()` 继续与 sampler 无关，边界仍是单 mip normalized sampling。另新增匹配的显式
   CUDA JIT-kernel 路线，通过 Driver API array/texture object 支持合格的一、二、四通道格式；
-  CUDA read/write texture、AOT manifest 与 Graph capture 仍不支持。两个 backend 都不会
+  cached CUDA Graph capture 保留 sampled texture generation 并支持 replay/换绑；CUDA
+  read/write texture 与 texture AOT manifest 仍不支持。两个 backend 都不会
   静默替换 field/ndarray 访问，也不增加官方 wheel 变体。
 - 新增 D0 `ti.hardware.graphics.VulkanGraphicsPipeline`，在调用方提供的 SPIR-V、精确
   vertex/index layout、runtime-owned color/depth texture 上提供 renderer-neutral 的 direct

@@ -762,6 +762,7 @@ struct CudaGraphArgSignatureEntry {
   uint64_t byte_offset{0};
   uint64_t byte_size{0};
   uint64_t runtime_signature{0};
+  RuntimeResourceHandle texture_handle;
   PrimitiveTypeID dtype_id{PrimitiveTypeID::unknown};
   ExternalArrayLayout layout{ExternalArrayLayout::kNull};
   std::vector<int> shape;
@@ -780,13 +781,15 @@ struct CudaGraphArgSignatureEntry {
     return name == other.name && tag == other.tag && device == other.device &&
            byte_size == other.byte_size && dtype_id == other.dtype_id &&
            layout == other.layout && shape == other.shape &&
-           element_shape == other.element_shape;
+           element_shape == other.element_shape &&
+           (tag != ArgKind::kTexture || texture_handle == other.texture_handle);
   }
 };
 
 struct CudaGraphSignatureCandidate {
   std::vector<CudaGraphArgSignatureEntry> entries;
   std::vector<DeviceAllocation> allocations;
+  std::vector<Program::TextureResourceLease> texture_leases;
 };
 
 bool cuda_graph_signatures_are_structurally_compatible(
@@ -1131,6 +1134,7 @@ struct CompiledGraphCudaState {
   std::vector<DeviceAllocation> allocations;
   std::vector<std::unique_ptr<cuda::CudaDevice::AllocationLease>>
       allocation_leases;
+  std::vector<Program::TextureResourceLease> texture_leases;
   std::unique_ptr<CudaGraphCaptureStream> capture_stream;
   std::vector<std::unique_ptr<CudaGraphCaptureStream>>
       parallel_capture_streams;
@@ -1354,6 +1358,7 @@ struct CompiledGraphCudaState {
     // by Python GC from being released. Drop it only after all replay and
     // capture-owned argument buffers that contain the address are retired.
     allocation_leases.clear();
+    texture_leases.clear();
   }
 
   uint64_t known_bounded_control_bytes() const {
@@ -1528,6 +1533,18 @@ make_cuda_graph_signature(const CompiledGraph &graph,
       if (!already_listed) {
         signature.allocations.push_back(allocation);
       }
+    } else if (kv.second.tag == ArgKind::kTexture) {
+      auto *texture = reinterpret_cast<Texture *>(kv.second.val);
+      if (texture == nullptr || texture->owning_program() != &program ||
+          !texture->is_cuda_texture()) {
+        return std::nullopt;
+      }
+      // CUDA arrays and sampled objects are not CudaDevice allocations. Retain
+      // their existing registry owner for the complete capture lifetime.
+      auto lease = program.acquire_texture_external_lease(texture);
+      entry.texture_handle = lease.handle();
+      entry.value = kv.second.val;
+      signature.texture_leases.push_back(std::move(lease));
     } else if (kv.second.tag == ArgKind::kScalar) {
       entry.byte_size = data_type_size(declared_it->second.dtype());
       entry.value = kv.second.val;
@@ -1542,8 +1559,6 @@ make_cuda_graph_signature(const CompiledGraph &graph,
                   reinterpret_cast<const void *>(matrix->data()),
                   entry.byte_size);
     } else {
-      // Texture handles require a backend-specific lifetime owner and are not
-      // eligible for CUDA argument-buffer patching yet.
       return std::nullopt;
     }
     signature.entries.push_back(std::move(entry));
@@ -1632,6 +1647,12 @@ bool cuda_graph_arguments_match_cached_signature(
           byte_offset != entry.byte_offset || byte_size != entry.byte_size ||
           runtime_signature != entry.runtime_signature ||
           dtype_id != entry.dtype_id || layout != entry.layout) {
+        return false;
+      }
+    } else if (entry.tag == ArgKind::kTexture) {
+      auto *texture = reinterpret_cast<Texture *>(value.val);
+      if (texture == nullptr || value.val != entry.value ||
+          texture->runtime_resource_handle() != entry.texture_handle) {
         return false;
       }
     } else if (entry.tag == ArgKind::kScalar) {
@@ -2577,6 +2598,7 @@ bool try_run_cuda_graph(const CompiledGraph &graph,
   state->signature = std::move(signature->entries);
   state->allocations = signature->allocations;
   state->allocation_leases = std::move(*allocation_leases);
+  state->texture_leases = std::move(signature->texture_leases);
   if (state->diagnostics_enabled) {
     ++state->stats.capture_attempts;
     if (state->has_captured_once) {
@@ -2963,6 +2985,7 @@ bool try_run_cuda_masked_control_graph(
   state->signature = std::move(signature->entries);
   state->allocations = signature->allocations;
   state->allocation_leases = std::move(*allocation_leases);
+  state->texture_leases = std::move(signature->texture_leases);
   state->masked_mode = true;
   state->masked_control_type = control_type;
   state->masked_max_iterations = is_while ? max_iterations : 0;
@@ -3401,6 +3424,7 @@ bool try_run_cuda_device_update_nested_control_graph(
   state->signature = std::move(signature->entries);
   state->allocations = signature->allocations;
   state->allocation_leases = std::move(*allocation_leases);
+  state->texture_leases = std::move(signature->texture_leases);
   state->device_update_nested_mode = true;
   state->masked_control_type = 3;
   state->masked_selector_allocation = outer_allocation;
@@ -3931,6 +3955,7 @@ bool try_run_cuda_masked_nested_control_graph(
   state->signature = std::move(signature->entries);
   state->allocations = signature->allocations;
   state->allocation_leases = std::move(*allocation_leases);
+  state->texture_leases = std::move(signature->texture_leases);
   state->masked_mode = true;
   state->masked_nested_mode = true;
   state->masked_control_type = 3;
@@ -4275,6 +4300,7 @@ bool try_run_cuda_bounded_graph(
   state->signature = std::move(signature->entries);
   state->allocations = signature->allocations;
   state->allocation_leases = std::move(*allocation_leases);
+  state->texture_leases = std::move(signature->texture_leases);
   if (state->diagnostics_enabled) {
     ++state->stats.capture_attempts;
     if (is_recapture) {
@@ -4691,6 +4717,7 @@ bool try_run_cuda_conditional_graph(
   state->signature = std::move(signature->entries);
   state->allocations = signature->allocations;
   state->allocation_leases = std::move(*allocation_leases);
+  state->texture_leases = std::move(signature->texture_leases);
   if (state->diagnostics_enabled) {
     ++state->stats.capture_attempts;
     if (is_recapture) {

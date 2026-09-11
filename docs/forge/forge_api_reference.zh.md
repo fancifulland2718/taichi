@@ -247,8 +247,13 @@ filter 可选 `nearest`/`linear`，各轴 address 可选 `repeat`、`mirrored_re
 `clamp_to_edge`；Vulkan sampler object 按 immutable 配置在 device 内缓存。当前 texture
 只有一个 mip 且使用 normalized coordinate，暂不公开 anisotropy 与 comparison sampling。
 `sample_lod()` 使用 sampler，精确整数 coordinate 的 `fetch()` 忽略它；浮点 filtering 不
-承诺跨设备 bitwise deterministic。普通 field/ndarray 访问不会自动转换为
-texture，CUDA backend 也尚未实现 texture lowering。该 D0 路线不新增 wheel 变体。
+承诺跨设备 bitwise deterministic。普通 field/ndarray 访问不会自动转换为 texture。
+CUDA 也支持基于 Driver API array/texture object 的显式 sampled texture，并支持保留确切
+sampler generation 生命周期的 cached Graph capture。固定 `Graph.bind()` 在发布前验证
+Texture 类型和维度；原位上传保持 capture，替换 Texture 使用另一有界 executable slot 或
+重新 capture。上传仍保留既有显式同步行为，本次没有添加 captured upload command。
+CUDA RW texture、texture AOT 序列化及独立 immutable-binding-frame recipe 不属于此支持声明。
+不新增 wheel 变体。
 
 ### `ti.hardware.graphics.VulkanGraphicsPipeline`（0.6.3 开发中）
 

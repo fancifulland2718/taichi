@@ -305,8 +305,9 @@ grouped under the behavior they shipped.
   by a device sampler cache. Exact `fetch()` remains sampler-independent;
   one-mip normalized sampling remains the boundary. Added the matching explicit
   CUDA JIT-kernel route over Driver-API arrays and texture objects for supported
-  one-, two-, and four-channel formats. CUDA read/write textures, AOT manifests,
-  and Graph capture remain unsupported. Neither backend silently replaces
+  one-, two-, and four-channel formats. Cached CUDA Graph capture retains sampled
+  texture generations across replay and rebinding; CUDA read/write textures and
+  texture AOT manifests remain unsupported. Neither backend silently replaces
   field/ndarray access, and no official wheel variant is added.
 - Added D0 `ti.hardware.graphics.VulkanGraphicsPipeline`, a renderer-neutral
   interface over caller-provided SPIR-V, exact vertex/index layouts,

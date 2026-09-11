@@ -820,9 +820,21 @@ bool KernelLauncher::prepare_cuda_graph_context(Handle handle,
     if (parameter.is_array) {
       if (ctx.device_allocation_type[key] ==
           LaunchContextBuilder::DevAllocType::kTexture) {
-        // Texture objects are generation-qualified host resources. CUDA Graph
-        // capture does not yet retain or rebind that resource identity.
-        return false;
+        // Program resolved the generation-qualified texture before capture;
+        // the owning Graph retains its registry lease, not a buffer lease.
+        const auto found = ctx.array_ptrs.find(key);
+        if (found == ctx.array_ptrs.end() || found->second == nullptr) {
+          return false;
+        }
+        const auto object =
+            *static_cast<const std::uint64_t *>(found->second);
+        if (object == 0) {
+          return false;
+        }
+        auto object_key = key;
+        object_key.push_back(TypeFactory::DATA_PTR_POS_IN_NDARRAY);
+        ctx.set_struct_arg<std::uint64_t>(object_key, object);
+        continue;
       }
       const auto arr_sz = ctx.array_runtime_sizes[key];
       if (arr_sz == 0) {

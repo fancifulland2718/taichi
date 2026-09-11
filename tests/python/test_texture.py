@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import requests
 from PIL import Image
+from taichi_forge._lib import core as ti_core
 from taichi_forge.lang import impl
 
 import taichi_forge as ti
@@ -208,13 +209,17 @@ def test_cuda_texture_uploads_tightly_packed_dense_field():
     )
 
 
+@pytest.mark.parametrize("fixed", [False, True])
 @test_utils.test(arch=ti.cuda, offline_cache=False)
-def test_cuda_texture_graph_capture_fails_closed_to_ordinary_dispatch():
+def test_cuda_texture_graph_replay_retains_resources_and_rebinds(fixed):
     source = ti.ndarray(dtype=ti.f32, shape=(2, 2))
     source.from_numpy(np.asarray([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32))
-    texture = ti.Texture(ti.Format.r32f, (2, 2))
-    texture.from_ndarray(source)
-    output = ti.ndarray(dtype=ti.f32, shape=1)
+    textures = [ti.Texture(ti.Format.r32f, (2, 2)) for _ in range(3)]
+    for index, texture in enumerate(textures):
+        source.fill(index + 1)
+        texture.from_ndarray(source)
+    output = ti.ndarray(dtype=ti.f32, shape=2)
+    output.fill(0)
 
     @ti.kernel
     def fetch(
@@ -223,22 +228,139 @@ def test_cuda_texture_graph_capture_fails_closed_to_ordinary_dispatch():
     ):
         result[0] = image.fetch(ti.Vector([1, 1]), 0).x
 
+    @ti.kernel
+    def consume(result: ti.types.ndarray(dtype=ti.f32, ndim=1)):
+        result[1] += result[0]
+
     image_arg = ti.graph.Arg(ti.graph.ArgKind.TEXTURE, "image", ndim=2)
-    output_arg = ti.graph.Arg(
-        ti.graph.ArgKind.NDARRAY, "output", ti.f32, ndim=1
-    )
+    output_arg = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "output", ti.f32, ndim=1)
     builder = ti.graph.GraphBuilder()
     builder.dispatch(fetch, image_arg, output_arg)
+    builder.dispatch(consume, output_arg)
     graph = builder.compile()
-    assert graph._graph_stats[0]["backend"] == "none"
-    graph.run({"image": texture, "output": output})
-    ti.sync()
+    # Graph compilation owns a dummy texture for kernel specialization.
+    cold_stats = dict(impl.get_runtime().prog._debug_texture_resource_stats())
+    bindings = graph.bind({"image": textures[0], "output": output}) if fixed else None
+    np.testing.assert_array_equal(output.to_numpy(), [0, 0])
 
-    assert output.to_numpy()[0] == pytest.approx(4.0)
-    stats = graph._graph_stats[0]
-    assert stats["last_path"] == "ordinary_fallback"
-    assert stats["ordinary_fallbacks"] >= 1
-    assert stats["structural_fallbacks"] >= 1
+    total = 0
+    # Exercise exact replay, both bounded cache slots, and eviction. Resource
+    # identity changes must not patch a sampled object behind an old lease.
+    for index in (0, 1, 0, 1, 2, 0):
+        if fixed:
+            bindings.update(image=textures[index])
+        for _ in range(2):
+            graph.run(
+                bindings if fixed else {"image": textures[index], "output": output}
+            )
+            total += index + 1
+        np.testing.assert_array_equal(output.to_numpy(), [index + 1, total])
+        assert graph.execution_stats().segments[0].last_path == "cuda_exact_replay"
+
+    # Content upload preserves the sampled object; the captured query sees it.
+    source.fill(9)
+    textures[0].from_ndarray(source)
+    graph.run(bindings if fixed else {"image": textures[0], "output": output})
+    total += 9
+    np.testing.assert_array_equal(output.to_numpy(), [9, total])
+    assert graph.execution_stats().segments[0].last_path == "cuda_exact_replay"
+
+    if fixed:
+        revision = bindings.revision
+        with pytest.raises((ValueError, RuntimeError, ti.TaichiRuntimeError)):
+            bindings.update(image=output)
+        wrong_dimension = ti.Texture(ti.Format.r32f, (2,))
+        with pytest.raises(ti.TaichiRuntimeError, match="dimensionality"):
+            bindings.update(image=wrong_dimension)
+        wrong_dimension._delete_runtime_texture()
+        assert bindings.revision == revision
+        graph.run(bindings)
+        total += 9
+        np.testing.assert_array_equal(output.to_numpy(), [9, total])
+
+    # Keep native wrappers alive to distinguish registry retirement from Python
+    # garbage collection. Closing a capture must drop its persistent leases.
+    native_textures = [texture.tex for texture in textures]
+    for texture in textures:
+        texture._delete_runtime_texture()
+    if fixed:
+        with pytest.raises(
+            (RuntimeError, ti.TaichiRuntimeError), match="Texture|texture|retired|stale"
+        ):
+            graph.run(bindings)
+    graph.close()
+    ti.sync()
+    stats = dict(impl.get_runtime().prog._debug_texture_resource_stats())
+    assert stats["live"] <= cold_stats["live"] - len(textures)
+    assert stats["released_total"] >= cold_stats["released_total"] + len(textures)
+    assert stats["retiring"] == stats["inflight"] == stats["release_errors"] == 0
+    assert native_textures
+
+
+@pytest.mark.parametrize("force_masked", [False, True])
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_cuda_texture_control_capture_keeps_sampler_lifetime(monkeypatch, force_masked):
+    capabilities = dict(ti_core.cuda_conditional_graph_capabilities())
+    required = (
+        "internal_masked_graph_available"
+        if force_masked
+        else "general_graph_exact_control_available"
+    )
+    if not capabilities.get(required, False):
+        pytest.skip(f"CUDA control capture unavailable: {required}")
+    if force_masked:
+        monkeypatch.setenv("TI_GRAPH_CUDA_FORCE_MASKED_CONTROL", "1")
+
+    @ti.kernel
+    def condition(value: ti.i32, predicate: ti.types.ndarray(dtype=ti.i32, ndim=0)):
+        predicate[None] = value
+
+    @ti.kernel
+    def body(
+        image: ti.types.texture(num_dimensions=2),
+        result: ti.types.ndarray(dtype=ti.f32, ndim=0),
+    ):
+        result[None] += image.sample_lod(ti.Vector([0.5, 0.5]), 0.0).x
+
+    builder = ti.graph.GraphBuilder()
+    value = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "value", ti.i32)
+    predicate = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "predicate", ti.i32, ndim=0)
+    image = ti.graph.Arg(ti.graph.ArgKind.TEXTURE, "image", ndim=2)
+    result = ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "result", ti.f32, ndim=0)
+    condition_region = builder.create_sequential().dispatch(condition, value, predicate)
+    body_region = builder.create_sequential().dispatch(body, image, result)
+    builder.if_then_else(
+        condition_region,
+        body_region,
+        predicate=predicate,
+        control_inputs=(value,),
+        lowering_mode="native_required",
+    )
+    graph = builder.compile()
+    source = ti.ndarray(ti.f32, shape=(2, 2))
+    source.fill(2)
+    texture = ti.Texture(ti.Format.r32f, (2, 2))
+    texture.from_ndarray(source)
+    output = ti.ndarray(ti.f32, shape=())
+    output.fill(0)
+    control = ti.ndarray(ti.i32, shape=())
+    bindings = graph.bind(
+        {"value": 1, "predicate": control, "image": texture, "result": output}
+    )
+    for enabled in (1, 0, 1):
+        bindings.update(value=enabled)
+        graph.run(bindings)
+    assert output.to_numpy()[()] == 4
+    expected = "cuda_masked_bounded_graph" if force_masked else "cuda_conditional_graph"
+    assert graph.control_flow_stats()[0].lowering == expected
+    revision = bindings.revision
+    with pytest.raises(ti.TaichiRuntimeError, match="Texture"):
+        bindings.update(image=source)
+    assert bindings.revision == revision
+    # Reset retires captured samplers before the CUDA context, even with live
+    # Python Graph/binding wrappers retained here.
+    ti.reset()
+    assert graph.execution_stats().lifecycle_state == "runtime_invalid"
 
 
 @test_utils.test(arch=ti.vulkan, offline_cache=False)
@@ -248,9 +370,7 @@ def test_vulkan_texture_hardware_sampling_qualification():
 
     @ti.kernel
     def write(
-        texture: ti.types.rw_texture(
-            num_dimensions=2, fmt=ti.Format.r32f, lod=0
-        ),
+        texture: ti.types.rw_texture(num_dimensions=2, fmt=ti.Format.r32f, lod=0),
     ):
         texture.store(ti.Vector([0, 0]), ti.Vector([0.0, 0.0, 0.0, 0.0]))
         texture.store(ti.Vector([1, 0]), ti.Vector([1.0, 0.0, 0.0, 0.0]))

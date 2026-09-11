@@ -9891,6 +9891,35 @@ def _discover_cuda_recording_partition_sources(source_nodes, backend):
     return tuple(result)
 
 
+def _graph_texture_binding_requirements(nodes):
+    """Collect frozen symbolic image contracts, never inspect replay values."""
+    requirements = {}
+
+    def add(args):
+        for arg in args:
+            if arg.tag in (ArgKind.TEXTURE, ArgKind.RWTEXTURE):
+                key = (arg.name, int(arg.tag), len(arg.texture_shape))
+                if arg.tag == ArgKind.RWTEXTURE:
+                    key += (str(arg.channel_format()), arg.num_channels)
+                requirements[key] = arg
+
+    def visit(node):
+        for dispatch in getattr(node, "recording_dispatches", ()):
+            add(dispatch.args)
+        for child in getattr(node, "nodes", ()):
+            visit(child)
+        for _, sequence in getattr(node, "_definition_regions", ()):
+            for _, args in sequence._dispatches:
+                add(args)
+        for _, children in getattr(node, "_definition_children", ()):
+            for child in children:
+                visit(child)
+
+    for node in nodes:
+        visit(node)
+    return tuple(requirements.values())
+
+
 def _graph_memory_disjoint_pairs(root):
     pairs = set()
 
@@ -11058,6 +11087,9 @@ class _GraphSpec:
     ):
         source_nodes = tuple(nodes)
         structured_control_nodes = _prepare_structured_definition_tree(source_nodes)
+        self._texture_binding_requirements = _graph_texture_binding_requirements(
+            source_nodes
+        )
         structured_owner_token = object()
         self.pre_optimization_ir_root = SequentialRegion(
             tuple(node.ir_node for node in source_nodes), name="graph"
@@ -11800,6 +11832,28 @@ class _GraphSpec:
         snapshot = MappingProxyType(
             dict(zip(self.binding_plan.public_names, slot_values))
         )
+        # Publish immutable image bindings only after their symbolic contracts
+        # match. Native replay retains and validates the existing resource
+        # generation; it does not repeat these Python shape/format checks.
+        for arg in self._texture_binding_requirements:
+            if arg.name not in snapshot:
+                continue  # Provider-owned overlays are resolved by their owner.
+            value = snapshot[arg.name]
+            if not isinstance(value, Texture) or value.tex is None:
+                raise TaichiRuntimeError(
+                    f"Graph argument {arg.name!r} requires a live Texture"
+                )
+            if value.num_dims != len(arg.texture_shape):
+                raise TaichiRuntimeError(
+                    f"Graph Texture {arg.name!r} has the wrong dimensionality"
+                )
+            if arg.tag == ArgKind.RWTEXTURE and FORMAT2TY_CH[value.fmt] != (
+                arg.channel_format(),
+                arg.num_channels,
+            ):
+                raise TaichiRuntimeError(
+                    f"Graph RWTexture {arg.name!r} has the wrong format"
+                )
         blockers = list(self.binding_plan.static_fast_path_blockers)
         if not allow_fast_path:
             blockers.append("qualified_fusion_selector")
