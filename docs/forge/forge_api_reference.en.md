@@ -435,7 +435,7 @@ does not read them back to validate mesh topology.
 
 For integer IDs and triangle barycentrics, both `TriangleScene` and `InstanceTLAS`
 provide `trace_typed(rays, hits, hit_indices)` and `record_typed(ray_count)`.
-The caller supplies distinct device arrays: f32 `hits` `(N, 4)` contains
+The caller supplies non-overlapping device ranges: f32 `hits` `(N, 4)` contains
 `[t, u, v, 0]`, and i32/u32 `hit_indices` `(N, 4)` contains
 `[primitive_index, instance_index, instance_custom_index, hit_flag]`.
 AOS vector-4 arrays are also accepted. `instance_index` is the zero-based TLAS
@@ -451,6 +451,14 @@ Append `scene.record_typed(count)` as a root native Graph node and bind
 `rays`, `hits`, and `hit_indices`; subsequent kernels can consume both outputs.
 This remains runtime-ordered native rerecording, not Vulkan command-buffer
 replay. Legacy `trace` / `record` retain their float4 output contract.
+Query inputs and outputs also accept canonical dense fields and compact
+program-owned `ndarray_view` subranges, including disjoint regions of one
+SNodeTree. Shape/dtype contracts are unchanged; there is no implicit packing.
+Only 4-byte data alignment is required: descriptor offsets are aligned during
+preparation and a subrange shader addresses the remaining offset. Unaligned
+output uses 2 KiB (4 KiB typed) of workgroup memory to coalesce writes, not an extra
+global conversion buffer. Tree destruction invalidates prepared query bindings.
+Geometry construction/refit still requires ndarray inputs at this stage.
 `graph.bind(...)` prepares immutable native packets without tracing rays.
 Reusing that binding does not revalidate shapes, dtypes, or non-aliasing;
 `binding.update(...)` prepares a replacement. Provider close/reset and in-flight

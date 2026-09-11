@@ -365,7 +365,7 @@ ray 为 f32 `(N, 8)`：`[ox, oy, oz, tmin, dx, dy, dz, tmax]`；hit 为 f32
 topology 而把 index 回读到 host。
 
 `TriangleScene` 和 `InstanceTLAS` 另提供 `trace_typed(rays, hits, hit_indices)`
-与 `record_typed(ray_count)`。调用者提供互不重叠的 device 数组：f32 `hits`
+与 `record_typed(ray_count)`。调用者提供互不重叠的 device 区间：f32 `hits`
 `(N, 4)` 写入 `[t, u, v, 0]`，i32/u32 `hit_indices` `(N, 4)` 写入
 `[primitive_index, instance_index, instance_custom_index, hit_flag]`；也接受
 AOS vector-4 数组。`instance_index` 是从零开始的 TLAS 实例序号，不是调用者的
@@ -377,6 +377,11 @@ custom index；单实例 wrapper 的两者均为零。三角形顶点权重为 `
 Graph 节点，绑定 `rays`、`hits`、`hit_indices` 后由后续 kernel 直接消费。
 这仍是 runtime-ordered native rerecording，不是 Vulkan command-buffer replay。
 原有 `trace` / `record` 的 float4 合同不变。
+查询输入、输出还接受规范 dense field 与 program-owned compact `ndarray_view` 子区间，
+包括同一 SNodeTree 内不相交的区间。shape/dtype 合同不变，不隐式 packing。数据只需
+4-byte 对齐；准备时按设备要求对齐 descriptor，子区间 shader 处理剩余偏移。未对齐输出使用
+2 KiB（typed 为 4 KiB）workgroup memory 合并写出，不增加全局转换缓冲。Tree 销毁使旧查询绑定失效。
+本阶段 geometry construction/refit 仍要求 ndarray 输入。
 `graph.bind(...)` 准备不可变 native packet，不执行射线查询；复用该绑定不重复验证
 shape、dtype 或 non-aliasing，`binding.update(...)` 则准备替代 packet。
 provider 的 close/reset 和在途资源保留仍由 native owner 管理。

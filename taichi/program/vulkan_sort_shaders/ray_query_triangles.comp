@@ -11,30 +11,81 @@ struct RayRecord {
 };
 
 layout(std430, set = 0, binding = 1) readonly buffer RayBuffer {
+#ifdef SUBRANGE
+  float ray_values[];
+#else
   RayRecord rays[];
+#endif
 };
 
 layout(std430, set = 0, binding = 2) writeonly buffer HitBuffer {
+#ifdef SUBRANGE
+  float hit_values[];
+#else
   vec4 hits[];
+#endif
 };
 
 #ifdef TYPED_HITS
 layout(std430, set = 0, binding = 3) writeonly buffer HitIndexBuffer {
+#ifdef SUBRANGE
+  int index_values[];
+#else
   ivec4 hit_indices[];
+#endif
 };
 #endif
 
 layout(push_constant) uniform Parameters {
   uint ray_count;
+#ifdef SUBRANGE
+  uint ray_offset;
+  uint hit_offset;
+  uint index_offset;
+#endif
 } parameters;
 
-void main() {
-  uint ray_index = gl_GlobalInvocationID.x;
+#ifdef SUBRANGE
+// Transpose AoS outputs within a workgroup. Consecutive lanes then
+// write consecutive words even when the caller's range is only 4-byte aligned.
+// This uses 2 KiB (4 KiB typed) of workgroup memory, not a global allocation.
+shared vec4 hit_tile[gl_WorkGroupSize.x];
+#ifdef TYPED_HITS
+shared ivec4 index_tile[gl_WorkGroupSize.x];
+#endif
+#endif
+
+void store_hit(uint index, vec4 value) {
+#ifdef SUBRANGE
+  hit_tile[gl_LocalInvocationID.x] = value;
+#else
+  hits[index] = value;
+#endif
+}
+
+#ifdef TYPED_HITS
+void store_indices(uint index, ivec4 value) {
+#ifdef SUBRANGE
+  index_tile[gl_LocalInvocationID.x] = value;
+#else
+  hit_indices[index] = value;
+#endif
+}
+#endif
+
+void trace_one(uint ray_index) {
   if (ray_index >= parameters.ray_count) {
     return;
   }
 
+#ifdef SUBRANGE
+  uint offset = parameters.ray_offset + 8 * ray_index;
+  RayRecord ray = RayRecord(
+      vec4(ray_values[offset], ray_values[offset + 1], ray_values[offset + 2], ray_values[offset + 3]),
+      vec4(ray_values[offset + 4], ray_values[offset + 5], ray_values[offset + 6], ray_values[offset + 7]));
+#else
   RayRecord ray = rays[ray_index];
+#endif
   rayQueryEXT query;
   rayQueryInitializeEXT(query, scene, gl_RayFlagsOpaqueEXT, 0xff,
                         ray.origin_tmin.xyz, ray.origin_tmin.w,
@@ -46,23 +97,41 @@ void main() {
       gl_RayQueryCommittedIntersectionTriangleEXT) {
 #ifdef TYPED_HITS
     vec2 uv = rayQueryGetIntersectionBarycentricsEXT(query, true);
-    hits[ray_index] = vec4(rayQueryGetIntersectionTEXT(query, true), uv, 0.0);
-    hit_indices[ray_index] = ivec4(
+    store_hit(ray_index, vec4(rayQueryGetIntersectionTEXT(query, true), uv, 0.0));
+    store_indices(ray_index, ivec4(
         rayQueryGetIntersectionPrimitiveIndexEXT(query, true),
         rayQueryGetIntersectionInstanceIdEXT(query, true),
-        rayQueryGetIntersectionInstanceCustomIndexEXT(query, true), 1);
+        rayQueryGetIntersectionInstanceCustomIndexEXT(query, true), 1));
 #else
-    hits[ray_index] = vec4(
+    store_hit(ray_index, vec4(
         rayQueryGetIntersectionTEXT(query, true),
         float(rayQueryGetIntersectionPrimitiveIndexEXT(query, true)),
-        float(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)), 1.0);
+        float(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)), 1.0));
 #endif
   } else {
 #ifdef TYPED_HITS
-    hits[ray_index] = vec4(-1.0, 0.0, 0.0, 0.0);
-    hit_indices[ray_index] = ivec4(-1, -1, -1, 0);
+    store_hit(ray_index, vec4(-1.0, 0.0, 0.0, 0.0));
+    store_indices(ray_index, ivec4(-1, -1, -1, 0));
 #else
-    hits[ray_index] = vec4(-1.0, -1.0, -1.0, 0.0);
+    store_hit(ray_index, vec4(-1.0, -1.0, -1.0, 0.0));
 #endif
   }
+}
+
+void main() {
+  trace_one(gl_GlobalInvocationID.x);
+#ifdef SUBRANGE
+  // Every invocation participates, including inactive lanes in the last group.
+  barrier();
+  for (uint part = 0; part < 4; ++part) {
+    uint word = gl_LocalInvocationID.x + gl_WorkGroupSize.x * part;
+    uint global_word = gl_WorkGroupID.x * (gl_WorkGroupSize.x * 4) + word;
+    if (global_word < parameters.ray_count * 4) {
+      hit_values[parameters.hit_offset + global_word] = hit_tile[word / 4][word % 4];
+#ifdef TYPED_HITS
+      index_values[parameters.index_offset + global_word] = index_tile[word / 4][word % 4];
+#endif
+    }
+  }
+#endif
 }

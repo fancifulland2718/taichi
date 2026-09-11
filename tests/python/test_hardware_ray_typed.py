@@ -165,3 +165,134 @@ def test_typed_ray_hits_preserve_indices_barycentrics_and_graph_consumption(
     graph.close()
     if instanced:
         blas.close()
+
+
+@test_utils.test(arch=ti.vulkan, offline_cache=False)
+@pytest.mark.parametrize("instanced", [False, True])
+def test_ray_dense_field_subranges_preserve_neighbors_and_lifetime(
+    instanced, monkeypatch
+):
+    if not ti.hardware.ray.is_available():
+        pytest.skip("Vulkan ray query is unavailable")
+    vertices = ti.ndarray(ti.f32, shape=(3, 3))
+    triangles = ti.ndarray(ti.i32, shape=(1, 3))
+    vertices.from_numpy(np.array([[0, 0, 0], [2, 0, 0], [0, 2, 0]], np.float32))
+    triangles.from_numpy(np.array([[0, 1, 2]], np.int32))
+    if instanced:
+        blas = ti.hardware.ray.TriangleBLAS(vertices, triangles)
+        scene = ti.hardware.ray.InstanceTLAS(
+            [ti.hardware.ray.RayInstance(blas, custom_index=71)]
+        )
+    else:
+        scene = ti.hardware.ray.TriangleScene(vertices, triangles)
+
+    count = 131 if instanced else 3  # Multiple workgroups plus a partial tail.
+    size = 2 * count + 1
+    padding = ti.field(ti.i32)
+    rays = ti.field(ti.f32)
+    hits = ti.field(ti.f32)
+    indices = ti.field(ti.i32)
+    fields = ti.FieldsBuilder()
+    fields.dense(ti.i, 7).place(padding)
+    fields.dense(ti.ij, (size, 8)).place(rays)
+    fields.dense(ti.ij, (size, 4)).place(hits)
+    fields.dense(ti.ij, (size, 4)).place(indices)
+    tree = fields.finalize()
+    padding.fill(911)
+    ray_values = np.tile(
+        np.array([0.5, 0.5, 2, 0.001, 0, 0, -2, 100], np.float32), (size, 1)
+    )
+    ray_values[2, 0] = 20
+    rays.from_numpy(ray_values)
+    hits.fill(123)
+    indices.fill(456)
+    ray_view = ti.experimental.ndarray_view(
+        rays, slices=(slice(1, count + 1), slice(None))
+    )
+    hit_view = ti.experimental.ndarray_view(
+        hits, slices=(slice(1, count + 1), slice(None))
+    )
+    index_view = ti.experimental.ndarray_view(
+        indices, slices=(slice(1, count + 1), slice(None))
+    )
+    # A legal compact field range need not have vec4/storage-descriptor alignment.
+    assert ray_view.descriptor.byte_offset % 16 != 0
+    assert hit_view.descriptor.byte_offset % 16 != 0
+    result = ti.ndarray(ti.i32, shape=count)
+
+    @ti.kernel
+    def consume(
+        ids: ti.types.ndarray(ti.i32, ndim=2), output: ti.types.ndarray(ti.i32, ndim=1)
+    ):
+        for i in output:
+            output[i] = ids[i, 3]
+
+    builder = ti.graph.GraphBuilder()
+    builder.append_native(scene.record_typed(count), admission="auto")
+    builder.dispatch(
+        consume,
+        ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "hit_indices", ti.i32, ndim=2),
+        ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "result", ti.i32, ndim=1),
+    )
+    graph = builder.compile()
+    binding = graph.bind(
+        {
+            "rays": ray_view,
+            "hits": hit_view,
+            "hit_indices": index_view,
+            "result": result,
+        }
+    )
+    assert binding.fast_path_qualified, binding.statistics()
+    np.testing.assert_array_equal(hits.to_numpy(), np.full((size, 4), 123, np.float32))
+
+    def unexpected_prepare(*args, **kwargs):
+        raise AssertionError("Ray storage preparation entered fixed replay")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(
+            ti.hardware.ray.VulkanRayQueryRecording,
+            "_prepare_packet",
+            unexpected_prepare,
+        )
+        for _ in range(3):
+            graph.run(binding)
+    expected_hit = np.tile(np.array([1, 0.25, 0.25, 0], np.float32), (count, 1))
+    expected_hit[1] = [-1, 0, 0, 0]
+    expected_ids = np.tile(
+        np.array([0, 0, 71 if instanced else 0, 1], np.int32), (count, 1)
+    )
+    expected_ids[1] = [-1, -1, -1, 0]
+    np.testing.assert_allclose(hits.to_numpy()[1 : count + 1], expected_hit, atol=1e-6)
+    np.testing.assert_array_equal(indices.to_numpy()[1 : count + 1], expected_ids)
+    for field, sentinel in ((hits, 123), (indices, 456)):
+        np.testing.assert_array_equal(
+            field.to_numpy()[[0, *range(count + 1, size)]],
+            np.full((size - count, 4), sentinel),
+        )
+    np.testing.assert_array_equal(padding.to_numpy(), np.full(7, 911))
+    np.testing.assert_array_equal(rays.to_numpy(), ray_values)
+    np.testing.assert_array_equal(result.to_numpy(), expected_ids[:, 3])
+
+    revision = binding.revision
+    with pytest.raises(RuntimeError, match="compact"):
+        binding.update(
+            rays=ti.experimental.ndarray_view(
+                rays, slices=(slice(0, 2 * count, 2), slice(None))
+            )
+        )
+    assert binding.revision == revision
+    # Direct full-field input and legacy subrange output use the same owner path.
+    scene.trace_typed(rays, hits, indices)
+    all_hit = np.ones(size, np.int32)
+    all_hit[2] = 0
+    np.testing.assert_array_equal(indices.to_numpy()[:, 3], all_hit)
+    scene.trace(ray_view, hit_view)
+    np.testing.assert_array_equal(hits.to_numpy()[1 : count + 1, 3], expected_ids[:, 3])
+    tree.destroy()
+    with pytest.raises(RuntimeError, match="retired|destroyed|generation"):
+        graph.run(binding)
+    graph.close()
+    scene.close()
+    if instanced:
+        blas.close()

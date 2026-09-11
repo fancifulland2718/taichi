@@ -3140,11 +3140,7 @@ void export_lang(py::module &m) {
            py::arg("handle"), py::arg("rays"), py::arg("hits"),
            py::arg("ray_count"), py::arg("hit_indices") = nullptr,
            py::call_guard<py::gil_scoped_release>())
-      .def("_prepare_vulkan_typed_ray_query",
-           &Program::prepare_vulkan_typed_ray_query,
-           py::arg("handle"), py::arg("instance_tlas"),
-           py::call_guard<py::gil_scoped_release>())
-      .def("_prepare_vulkan_ray_query", &Program::prepare_vulkan_ray_query,
+      .def("_prepare_vulkan_ray_query", &Program::prepare_vulkan_ray_query_storage,
            py::arg("handle"), py::arg("instance_tlas"), py::arg("rays"),
            py::arg("hits"), py::arg("ray_count"), py::arg("hit_indices") = nullptr,
            py::call_guard<py::gil_scoped_release>())

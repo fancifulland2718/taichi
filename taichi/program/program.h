@@ -157,17 +157,16 @@ struct PreparedVulkanBufferCommands {
   std::shared_ptr<const std::vector<Command>> commands;
 };
 
-// Cold-qualified immutable ray bindings. Python/Graph owns the original array
-// wrappers; submission still acquires the existing generation-qualified leases.
+// Cold-qualified ray bindings. Aligned descriptor ranges and shader offsets
+// are derived from PreparedNativeStorage; no per-query layout reconstruction.
 struct VulkanRayQueryCommand {
-  Program *owner{nullptr};
+  std::shared_ptr<PreparedNativeStorage> storage;
   std::uint64_t scene_handle{0};
   bool instance_tlas{false};
   std::size_t ray_count{0};
-  std::vector<const Ndarray *> arrays;
-  DeviceAllocation rays{kDeviceNullAllocation};
-  DeviceAllocation hits{kDeviceNullAllocation};
-  DeviceAllocation hit_indices{kDeviceNullAllocation};
+  unsigned variant{0};  // bit 0: typed hits, bit 1: scalar subrange addressing
+  std::array<PreparedNativeStorage::Binding, 3> shader_bindings{};
+  std::array<std::uint32_t, 4> parameters{};  // count, ray/hit/index scalar offset
 };
 class CudaFftPlan;
 class VulkanFftPlan;
@@ -1324,14 +1323,17 @@ class TI_DLL_EXPORT Program {
                                         std::size_t ray_count,
                                         Ndarray *hit_indices = nullptr);
 
-  void prepare_vulkan_typed_ray_query(std::uint64_t handle, bool instance_tlas);
-
   VulkanRayQueryCommand prepare_vulkan_ray_query(std::uint64_t handle,
                                                  bool instance_tlas,
                                                  Ndarray *rays,
                                                  Ndarray *hits,
                                                  std::size_t ray_count,
                                                  Ndarray *hit_indices);
+  VulkanRayQueryCommand prepare_vulkan_ray_query_storage(
+      std::uint64_t handle, bool instance_tlas,
+      const storage::DenseStorageDescriptor &rays,
+      const storage::DenseStorageDescriptor &hits, std::size_t ray_count,
+      const storage::DenseStorageDescriptor *hit_indices);
   std::size_t execute_vulkan_ray_query(const VulkanRayQueryCommand &command);
 
   std::size_t vulkan_triangle_ray_refit(std::uint64_t handle,
