@@ -264,8 +264,9 @@ runtime build identity `c268ca5671e8`；`0.4.25` 仍是最后一个公开的 `0.
   BLAS topology 和 TLAS 的 BLAS 数量/顺序。`TriangleScene` 保留为单 identity-instance
   兼容 wrapper。procedural geometry 与改变 topology 的 update 仍不支持。另新增显式 JIT
   Vulkan kernel-inline closest-hit 路线，作用于 opaque triangle acceleration structure；
-  acceleration-structure Graph argument 与 AOT 仍不支持。不增加 SDK runtime 依赖或官方
-  wheel 变体。
+  JIT Graph 支持类型化 `ACCELERATION_STRUCTURE` 参数，显式 Vulkan immutable-frame recipe
+  保留真实 TLAS/BLAS 资源。build/refit 保持既有有序命令边界，AOT 仍不支持。不增加 SDK runtime
+  依赖或官方 wheel 变体。
 - 新增可选 D1 `ti.hardware.fft.CufftPlan1D`/`CufftPlanND`，通过 direct Python 与 root
   Graph 执行 fixed-size、batched、single-precision C2C/R2C/C2R transform，并支持带显式
   embed/stride/distance 的 rank-2/rank-3 layout。显式 probe 仍为无副作用的

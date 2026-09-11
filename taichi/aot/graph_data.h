@@ -40,14 +40,16 @@ class RuntimeStorageArgument;
 
 namespace aot {
 
-// Currently only scalar, matrix and ndarray are supported.
+// Preserve serialized values. Acceleration structures are JIT-only bindings;
+// AOT export rejects them rather than serializing a process-local resource.
 enum class ArgKind {
   kScalar,
   kMatrix,
   kNdarray,
   kTexture,
   kRWTexture,
-  kUnknown
+  kUnknown,
+  kAccelerationStructure
 };
 
 /**
@@ -166,6 +168,13 @@ struct TI_DLL_EXPORT IValue {
   uint64 val;
   ArgKind tag;
   const storage::RuntimeStorageArgument *runtime_storage{nullptr};
+  Program *resource_owner{nullptr};
+
+  static IValue acceleration_structure(Program &owner, std::uint64_t handle) {
+    IValue value(handle, ArgKind::kAccelerationStructure);
+    value.resource_owner = &owner;
+    return value;
+  }
 
   static IValue create(const Ndarray &ndarray) {
     return IValue(reinterpret_cast<intptr_t>(&ndarray), ArgKind::kNdarray);
@@ -519,6 +528,7 @@ struct CompiledGraphRuntimeResourceIdentity {
   std::string name;
   RuntimeResourceHandle handle;
   const void *object{nullptr};
+  std::uint64_t opaque_handle{0};
 };
 
 // Reusable, generation-qualified resource binding for stable Graph replay.

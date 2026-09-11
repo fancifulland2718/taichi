@@ -25,6 +25,7 @@ from taichi_forge.lang._ndarray import Ndarray
 from taichi_forge.lang._storage_view import describe_storage
 from taichi_forge.lang.exception import TaichiRuntimeError
 from taichi_forge.types.primitive_types import f32, i32, u32
+from taichi_forge.types.ray_type import _AccelerationStructureResource
 
 
 @dataclass(frozen=True)
@@ -891,7 +892,7 @@ class _KernelAccelerationStructureDescriptor:
             )
 
 
-class InstanceTLAS(_TypedRayScene):
+class InstanceTLAS(_TypedRayScene, _AccelerationStructureResource):
     """Independent Vulkan TLAS with fixed BLAS topology and mutable metadata."""
 
     def __init__(self, instances):

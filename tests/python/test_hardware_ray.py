@@ -68,7 +68,7 @@ def test_vulkan_inline_ray_query_fails_closed_outside_jit_vulkan():
     builder = ti.graph.GraphBuilder()
     with pytest.raises(
         ti.TaichiCompilationError,
-        match="acceleration-structure kernel arguments are JIT-only",
+        match="requires ArgKind.ACCELERATION_STRUCTURE",
     ):
         builder.dispatch(trace, None)
 

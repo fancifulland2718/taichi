@@ -2326,7 +2326,9 @@ bool GfxRuntime::GraphReplayExecutable::refresh_prepared_cache(
         const auto alloc_type =
             pd.host_ctx->device_allocation_type[array_arg.indices];
         if (alloc_type == LaunchContextBuilder::DevAllocType::kTexture ||
-            alloc_type == LaunchContextBuilder::DevAllocType::kRWTexture) {
+            alloc_type == LaunchContextBuilder::DevAllocType::kRWTexture ||
+            alloc_type ==
+                LaunchContextBuilder::DevAllocType::kAccelerationStructure) {
           continue;
         }
         DeviceAllocation devalloc = kDeviceNullAllocation;
@@ -2718,17 +2720,18 @@ std::unique_ptr<GraphReplayRegistration> GfxRuntime::prepare_fixed_graph(
       TI_ERROR_IF(kind != LaunchContextBuilder::DevAllocType::kNdarray &&
                       kind != LaunchContextBuilder::DevAllocType::kDenseStorage &&
                       kind != LaunchContextBuilder::DevAllocType::kTexture &&
-                      kind != LaunchContextBuilder::DevAllocType::kRWTexture,
-                  "Prepared Vulkan Graph requires owned device arrays or images");
+                      kind != LaunchContextBuilder::DevAllocType::kRWTexture &&
+                      kind !=
+                          LaunchContextBuilder::DevAllocType::kAccelerationStructure,
+                  "Prepared Vulkan Graph requires owned device resources");
     }
     const auto &tasks = kernel->ti_kernel_attribs().tasks_attribs;
     for (std::size_t i = 0; i < tasks.size(); ++i) {
       TI_ERROR_IF(
-          !tasks[i].acceleration_structure_binds.empty() ||
-              tasks[i].task_type == OffloadedTaskType::listgen ||
+          tasks[i].task_type == OffloadedTaskType::listgen ||
               tasks[i].may_mutate_sparse_topology ||
               kernel->task_uses_listgen_buffer(i),
-          "Prepared Vulkan Graph requires topology-stable tasks without AS bindings");
+          "Prepared Vulkan Graph requires topology-stable tasks");
       for (const auto &bind : kernel->buffer_binding_plan(i)) {
         TI_ERROR_IF(
             bind.kind == CompiledTaichiKernel::BufferBindingKind::ArgPack ||
@@ -2790,6 +2793,18 @@ std::unique_ptr<GraphReplayRegistration> GfxRuntime::prepare_fixed_graph(
     const auto &tasks = pd.kernel->ti_kernel_attribs().tasks_attribs;
     for (std::size_t i = 0; i < tasks.size(); ++i) {
       auto resources = device_->create_resource_set_unique();
+      for (const auto &bind : tasks[i].acceleration_structure_binds) {
+        const int offset = pd.host_ctx->args_type->get_element_offset(bind.arg_id);
+        const auto found = std::find_if(
+            pd.host_ctx->acceleration_structure_ptrs.begin(),
+            pd.host_ctx->acceleration_structure_ptrs.end(),
+            [offset](const auto &ref) { return ref.arg_offset == offset; });
+        TI_ERROR_IF(found == pd.host_ctx->acceleration_structure_ptrs.end() ||
+                        !found->owner || !found->handle,
+                    "Prepared Vulkan Graph acceleration structure is unbound");
+        found->owner->vulkan_bind_ray_kernel_resource(
+            found->handle, resources.get(), bind.binding, commands.get());
+      }
       std::unordered_map<DeviceAllocationId, ImageLayout> task_images;
       for (const auto &bind : tasks[i].texture_binds) {
         const auto found = pd.host_ctx->array_ptrs.find(bind.arg_id);

@@ -353,9 +353,11 @@ grouped under the behavior they shipped.
   `TriangleScene` remains the single identity-instance wrapper. Procedural
   geometry and topology-changing updates remain unsupported. Added the separate
   explicit JIT Vulkan kernel-inline closest-hit route over opaque triangle
-  acceleration structures; acceleration-structure Graph arguments and AOT
-  remain unsupported. No SDK runtime dependency or official wheel variant is
-  added.
+  acceleration structures. JIT Graphs accept typed `ACCELERATION_STRUCTURE`
+  arguments, including retained TLAS/BLAS bindings in explicit Vulkan immutable
+  frame recipes. Builds/refits keep their existing ordered command boundary;
+  AOT remains unsupported. No SDK runtime dependency or official wheel variant
+  is added.
 - Added optional D1 `ti.hardware.fft.CufftPlan1D`/`CufftPlanND` for fixed-size,
   batched single-precision C2C/R2C/C2R transforms, including rank-2/rank-3
   layouts with explicit embed/stride/distance, through direct Python and root

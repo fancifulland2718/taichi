@@ -152,7 +152,8 @@ def ray_command_operations(_operation):
             notes=(
                 "Explicit non-escaping kernel intrinsic backed by Vulkan Ray Query hardware.",
                 "Current scope is opaque triangle BLAS/TLAS and committed closest-hit data.",
-                "JIT Vulkan kernels only; AOT and Graph acceleration-structure arguments fail closed.",
+                "JIT Vulkan kernels and typed Graph AS bindings; AOT export fails closed.",
+                "Prepared Vulkan binding frames retain read-only TLAS/BLAS resources; builds/refits remain ordered external commands.",
                 "The batch Python/Graph native command remains a separate explicit route.",
                 "Qualified physics scope: dense-field particle contact where "
                 "inline traversal eliminates ray staging, hit storage, and two "

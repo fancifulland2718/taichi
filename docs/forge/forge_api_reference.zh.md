@@ -416,6 +416,25 @@ provider 的 close/reset 和在途资源保留仍由 native owner 管理。
 两条路径均不会自动替换普通 kernel 或 collision detection。改变 topology 的更新与
 procedural geometry 不属于此合同。
 
+inline query kernel 可声明 `scene: ti.types.acceleration_structure()`，并通过 JIT Graph
+参数接收 `InstanceTLAS`：
+
+```python
+scene_arg = ti.graph.Arg(ti.graph.ArgKind.ACCELERATION_STRUCTURE, "scene")
+# dispatch() 中与 kernel 的 acceleration-structure 参数对应。
+# 运行时在 "scene" 下绑定实际 InstanceTLAS，同时提供其他参数。
+```
+
+已有 `GraphBindingFrameRecipeProvider` 可为包含这种绑定的平坦 kernel Graph 生成 Vulkan
+immutable secondary-command recipe。`Graph.bind()` 一次准备 descriptor，并保留实际 TLAS、
+引用的 BLAS 及 backing resource，直到 frame/command retirement。源句柄关闭后已发布 frame
+仍可执行，新准备则拒绝关闭的句柄；runtime reset 退役所有 frame。同一资源的 refit/build
+通过既有有序 AS command 与 device barrier 对后续执行可见，无需重新绑定。AS build 不嵌入
+只读 frame；改变 topology 时应创建新资源及 binding。immutable replay 不增加 Python AS
+descriptor 检查或 host readback。ordinary Graph 仍可用，不隐式切换到此 recipe。AOT 明确
+拒绝 AS 参数，不序列化进程内句柄；typed hit 保持整数 index 与 f32 距离/重心坐标，不把 ID
+打包为浮点数。
+
 ### `ti.hardware.fft.CufftPlan1D` / `CufftPlanND`（0.6.3 开发中）
 
 面向 C2C、R2C 与 C2R transform 的显式 D1 single-GPU cuFFT provider：

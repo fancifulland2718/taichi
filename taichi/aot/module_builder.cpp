@@ -52,6 +52,11 @@ void AotModuleBuilder::dump_graph(std::string output_dir) const {
 
 void AotModuleBuilder::add_graph(const std::string &name,
                                  const aot::CompiledGraph &graph) {
+  for (const auto &[arg_name, arg] : graph.args) {
+    TI_ERROR_IF(arg.tag == aot::ArgKind::kAccelerationStructure,
+                "AOT Graph {} contains JIT-only acceleration-structure argument {}",
+                name, arg_name);
+  }
   TI_ERROR_IF(graph.has_indirect_dispatches(),
               "AOT Graph {} contains JIT-only indirect dispatches", name);
   TI_ERROR_IF(graph.has_dispatch_labels(),

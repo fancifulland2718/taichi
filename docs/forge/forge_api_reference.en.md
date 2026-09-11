@@ -507,6 +507,29 @@ official wheel variant. These batch methods are not callable inside
 Neither route replaces ordinary kernels or collision detection automatically.
 Topology-changing updates and procedural geometry remain outside this contract.
 
+Inline query kernels may declare `scene: ti.types.acceleration_structure()` and
+receive `InstanceTLAS` through a JIT Graph slot:
+
+```python
+scene_arg = ti.graph.Arg(ti.graph.ArgKind.ACCELERATION_STRUCTURE, "scene")
+# Match scene_arg to the kernel's acceleration-structure argument in dispatch().
+# Bind the actual InstanceTLAS under "scene", alongside the other runtime slots.
+```
+
+The existing `GraphBindingFrameRecipeProvider` can produce an immutable Vulkan
+secondary-command recipe for flat kernel Graphs containing these bindings.
+`Graph.bind()` prepares descriptors once and retains the actual TLAS, referenced
+BLAS, and backing resources until frame/command retirement. Published frames
+remain executable after the source handles close; new preparation from a closed
+handle fails. Runtime reset retires all frames. Refit/build changes to the same
+resource are visible without rebinding, through the existing ordered AS command
+and device barriers. AS builds are not embedded in the read-only frame; topology
+changes require a new resource and binding. No Python AS descriptor checks or
+host readback are added to immutable replay. Ordinary Graph execution is still
+available and does not implicitly switch to the recipe. AOT export rejects AS
+arguments instead of serializing process-local handles. The typed hit fields
+remain integer indices and f32 distances/barycentrics, not float-packed IDs.
+
 ### `ti.hardware.fft.CufftPlan1D` / `CufftPlanND` (0.6.3 in development)
 
 An explicit D1 single-GPU cuFFT provider for C2C, R2C, and C2R transforms:

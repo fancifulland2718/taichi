@@ -20,6 +20,7 @@ from taichi_forge.types._argument_descriptor import (
     python_compound_type,
 )
 from taichi_forge.types.texture_type import RWTextureType, TextureType
+from taichi_forge.types.ray_type import AccelerationStructureType
 
 template_types = (NdarrayType, TextureType, template)
 
@@ -68,6 +69,17 @@ def produce_injected_args_from_template(kernel, template_args):
 
 def _produce_injected_arg(arg, symbolic_arg=None, has_symbolic_arg=False):
     anno = arg.annotation
+    if isinstance(anno, AccelerationStructureType):
+        if has_symbolic_arg and (
+            symbolic_arg is None
+            or describe_symbolic_arg(symbolic_arg).kind != "acceleration_structure"
+        ):
+            raise TaichiCompilationError(
+                f"Graph argument {arg.name} requires ArgKind.ACCELERATION_STRUCTURE"
+            )
+        # AS descriptors do not specialize codegen. Never allocate a dummy
+        # BLAS/TLAS to compile a symbolic Graph dispatch.
+        return None
     if isinstance(anno, NdarrayType):
         if has_symbolic_arg:
             symbolic_descriptor = describe_symbolic_arg(symbolic_arg)
@@ -179,8 +191,6 @@ def _validate_graph_template_exemplar(arg, symbolic_arg, exemplar):
 
 def produce_injected_args_for_graph(kernel, symbolic_args, template_args=None):
     """Inject compile-time values while preserving Graph runtime arguments."""
-
-    reject_acceleration_structure_arguments(kernel, "Graph dispatch")
 
     if template_args is None:
         has_required_template = any(isinstance(arg.annotation, template) for arg in kernel.arguments)

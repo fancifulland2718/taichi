@@ -179,6 +179,8 @@ def describe_symbolic_arg(symbolic_arg):
         return ArgumentTypeDescriptor(
             "matrix", describe_element_type(symbolic_arg.element_dtype())
         )
+    if tag == getattr(_ti_core.ArgKind, "ACCELERATION_STRUCTURE", None):
+        return ArgumentTypeDescriptor("acceleration_structure")
     if tag == _ti_core.ArgKind.TEXTURE:
         return ArgumentTypeDescriptor(
             "texture", ndim=len(symbolic_arg.texture_shape)

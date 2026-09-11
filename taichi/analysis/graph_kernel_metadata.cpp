@@ -308,6 +308,18 @@ class MetadataVisitor final : public BasicStmtVisitor {
     record(stmt->src, "read");
   }
 
+  void visit(AccelerationStructurePtrStmt *stmt) override {
+    auto *argument = stmt->arg_load_stmt->cast<ArgLoadStmt>();
+    if (argument == nullptr) {
+      block("unknown_acceleration_structure", "opaque_access");
+      return;
+    }
+    // Traversal reads the whole AS, not an affine element of an array. Keep
+    // this resource effect without inventing a synchronization operation or
+    // allowing pointwise fusion to erase the AS dependency.
+    acceleration_structure_reads_.insert(argument->arg_id);
+  }
+
   void visit(GlobalStoreStmt *stmt) override {
     record(stmt->dest, "write");
   }
@@ -394,7 +406,7 @@ class MetadataVisitor final : public BasicStmtVisitor {
 
   std::vector<GraphKernelResourceEffect> effects() const {
     std::vector<GraphKernelResourceEffect> result;
-    result.reserve(effects_.size());
+    result.reserve(effects_.size() + acceleration_structure_reads_.size());
     for (const auto &[key, summary] : effects_) {
       GraphKernelResourceEffect effect;
       effect.resource_kind = std::get<0>(key);
@@ -452,10 +464,20 @@ class MetadataVisitor final : public BasicStmtVisitor {
       }
       result.push_back(std::move(effect));
     }
+    for (const auto &arg_id : acceleration_structure_reads_) {
+      GraphKernelResourceEffect effect;
+      effect.resource_kind = "argument";
+      effect.arg_id = arg_id;
+      effect.access = "read";
+      result.push_back(std::move(effect));
+    }
     return result;
   }
 
   bool elementwise() const {
+    if (!acceleration_structure_reads_.empty()) {
+      return false;
+    }
     return std::all_of(
         effects_.begin(), effects_.end(), [&](const auto &item) {
           const auto &summary = item.second;
@@ -607,6 +629,7 @@ class MetadataVisitor final : public BasicStmtVisitor {
   RangeForStmt *loop_{nullptr};
   const GraphKernelIterationDomain &domain_;
   std::map<ResourceKey, EffectSummary> effects_;
+  std::set<std::vector<int>> acceleration_structure_reads_;
   std::vector<std::int64_t> logical_origin_;
   std::vector<std::string> side_effects_;
   std::string blocker_;

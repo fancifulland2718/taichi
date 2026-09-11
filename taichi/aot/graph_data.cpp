@@ -128,9 +128,11 @@ struct GraphRuntimeResourceViews {
   InlineUniqueViewList<Ndarray> ndarrays;
   InlineUniqueViewList<storage::RuntimeStorageArgument> runtime_storage;
   InlineUniqueViewList<Texture> textures;
+  bool has_acceleration_structures{false};
 
   bool empty() const noexcept {
-    return ndarrays.empty() && runtime_storage.empty() && textures.empty();
+    return ndarrays.empty() && runtime_storage.empty() && textures.empty() &&
+           !has_acceleration_structures;
   }
 };
 
@@ -140,6 +142,14 @@ GraphRuntimeResourceViews graph_runtime_resource_views(
   GraphRuntimeResourceViews views;
   for (const auto &[name, value] : args) {
     (void)name;
+    if (value.tag == ArgKind::kAccelerationStructure) {
+      TI_ERROR_IF(
+          value.resource_owner == nullptr || value.val == 0 ||
+              value.resource_owner != expected_program,
+          "Graph acceleration structures must belong to the Graph's Program");
+      views.has_acceleration_structures = true;
+      continue;
+    }
     if (value.tag == ArgKind::kNdarray) {
       if (value.runtime_storage != nullptr) {
         views.runtime_storage.add(value.runtime_storage);
@@ -189,7 +199,8 @@ bool graph_has_runtime_resource_declarations(
     const std::unordered_map<std::string, IValue> &args) {
   return std::any_of(args.begin(), args.end(), [](const auto &entry) {
     return entry.second.tag == ArgKind::kNdarray ||
-           entry.second.tag == ArgKind::kTexture;
+           entry.second.tag == ArgKind::kTexture ||
+           entry.second.tag == ArgKind::kAccelerationStructure;
   });
 }
 
@@ -221,7 +232,10 @@ CompiledGraphRuntimeResourceIdentity runtime_resource_identity(
     const IValue &value) {
   CompiledGraphRuntimeResourceIdentity identity;
   identity.name = name;
-  if (value.tag == ArgKind::kNdarray && value.runtime_storage != nullptr) {
+  if (value.tag == ArgKind::kAccelerationStructure) {
+    identity.object = value.resource_owner;
+    identity.opaque_handle = value.val;
+  } else if (value.tag == ArgKind::kNdarray && value.runtime_storage != nullptr) {
     identity.object = value.runtime_storage;
     const auto &owner = value.runtime_storage->descriptor().owner();
     if (owner.kind == storage::StorageOwnerKind::kProgramNdarray) {
@@ -252,7 +266,8 @@ bool runtime_binding_plan_matches(
   }
   std::size_t resource_count = 0;
   for (const auto &[name, value] : args) {
-    if (value.tag != ArgKind::kNdarray && value.tag != ArgKind::kTexture) {
+    if (value.tag != ArgKind::kNdarray && value.tag != ArgKind::kTexture &&
+        value.tag != ArgKind::kAccelerationStructure) {
       continue;
     }
     ++resource_count;
@@ -266,7 +281,8 @@ bool runtime_binding_plan_matches(
     }
     const auto current = runtime_resource_identity({}, value);
     if (current.object != expected->object ||
-        current.handle != expected->handle) {
+        current.handle != expected->handle ||
+        current.opaque_handle != expected->opaque_handle) {
       return false;
     }
   }
@@ -283,7 +299,8 @@ void rebuild_runtime_binding_plan(
   plan.initialized = true;
   plan.revision = revision;
   for (const auto &[name, value] : args) {
-    if (value.tag != ArgKind::kNdarray && value.tag != ArgKind::kTexture) {
+    if (value.tag != ArgKind::kNdarray && value.tag != ArgKind::kTexture &&
+        value.tag != ArgKind::kAccelerationStructure) {
       continue;
     }
     plan.identities.push_back(runtime_resource_identity(name, value));
@@ -294,11 +311,15 @@ void rebuild_runtime_binding_plan(
       if (array != nullptr && array->owning_program() != nullptr) {
         append_unique_resource(plan.ndarrays, array);
       }
-    } else {
+    } else if (value.tag == ArgKind::kTexture) {
       auto *texture = reinterpret_cast<Texture *>(value.val);
       if (texture != nullptr && texture->owning_program() != nullptr) {
         append_unique_resource(plan.textures, texture);
       }
+    } else {
+      TI_ERROR_IF(
+          value.resource_owner != program || value.val == 0,
+          "Graph acceleration structures must belong to the Graph's Program");
     }
   }
   std::sort(plan.identities.begin(), plan.identities.end(),
@@ -5055,7 +5076,8 @@ make_vulkan_graph_argument_signature(
     const std::unordered_map<std::string, IValue> &args) {
   std::vector<VulkanGraphArgumentSignatureEntry> signature;
   for (const auto &[name, value] : args) {
-    if (value.tag == ArgKind::kNdarray || value.tag == ArgKind::kTexture) {
+    if (value.tag == ArgKind::kNdarray || value.tag == ArgKind::kTexture ||
+        value.tag == ArgKind::kAccelerationStructure) {
       continue;
     }
     const auto declared = graph.args.find(name);
@@ -5767,6 +5789,10 @@ CompiledGraphJITCache::~CompiledGraphJITCache() {
 
 void CompiledGraph::run(
     const std::unordered_map<std::string, IValue> &args) const {
+  for (const auto &entry : args) {
+    TI_ERROR_IF(entry.second.tag == ArgKind::kAccelerationStructure,
+                "AOT Graph does not support JIT-only acceleration structures");
+  }
   for (const auto &dispatch : dispatches) {
     TI_ASSERT(dispatch.compiled_kernel);
     LaunchContextBuilder launch_ctx(dispatch.compiled_kernel);
@@ -7382,6 +7408,9 @@ void CompiledGraph::init_runtime_context(
         default:
           TI_ERROR("Unsupported type size {}", type_size);
       }
+    } else if (symbolic_arg.tag == aot::ArgKind::kAccelerationStructure) {
+      TI_ASSERT(ival.tag == aot::ArgKind::kAccelerationStructure);
+      ctx.set_arg_acceleration_structure(arg_id, ival.resource_owner, ival.val);
     } else if (symbolic_arg.tag == aot::ArgKind::kTexture) {
       TI_ASSERT(ival.tag == aot::ArgKind::kTexture);
       Texture *tex = reinterpret_cast<Texture *>(ival.val);

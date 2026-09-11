@@ -135,7 +135,10 @@ class Kernel;
 //  30 - Forge CUDA artifact controls (2026-08). LLVM compiled-kernel payloads
 //       now retain the exact per-kernel register cap and NVVM entry metadata
 //       can carry min-CTA and max-register tuning directives.
-constexpr std::uint32_t kOfflineCacheSchemaVersion = 30;
+//  31 - JIT Graph acceleration-structure resources (2026-09). Retain AS reads
+//       in kernel Graph metadata; old payloads lack this explicit dependency.
+//       Existing opaque intrinsic blockers are preserved.
+constexpr std::uint32_t kOfflineCacheSchemaVersion = 31;
 
 std::string get_hashed_offline_cache_key_of_snode(const SNode *snode);
 std::string get_hashed_offline_cache_key_context(

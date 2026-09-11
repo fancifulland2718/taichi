@@ -5358,6 +5358,7 @@ void export_lang(py::module &m) {
       .value("MATRIX", aot::ArgKind::kMatrix)
       .value("TEXTURE", aot::ArgKind::kTexture)
       .value("RWTEXTURE", aot::ArgKind::kRWTexture)
+      .value("ACCELERATION_STRUCTURE", aot::ArgKind::kAccelerationStructure)
       .export_values();
 
   py::class_<aot::Arg>(m, "Arg")
@@ -5674,6 +5675,15 @@ void export_lang(py::module &m) {
               auto &val = pyarg.template cast<Ndarray &>();
               args.insert({arg_name, aot::IValue::create(val)});
             }
+          } else if (tag == aot::ArgKind::kAccelerationStructure) {
+            auto binding = pyarg.template cast<py::tuple>();
+            TI_ERROR_IF(
+                binding.size() != 2,
+                "Graph acceleration structure requires its Program and handle");
+            auto &owner = binding[0].template cast<Program &>();
+            auto handle = binding[1].template cast<std::uint64_t>();
+            args.insert(
+                {arg_name, aot::IValue::acceleration_structure(owner, handle)});
           } else if (tag == aot::ArgKind::kTexture ||
                      tag == aot::ArgKind::kRWTexture) {
             auto &val = pyarg.template cast<Texture &>();
@@ -5866,6 +5876,8 @@ void export_lang(py::module &m) {
   py::class_<gfx::FixedGraphRecording, std::shared_ptr<gfx::FixedGraphRecording>>(
       m, "_VulkanFixedGraphRecording")
       .def_static("supports_texture_bindings", [] { return true; })
+      .def_static("supports_acceleration_structure_bindings",
+                  [] { return true; })
       .def("run", &gfx::FixedGraphRecording::run, py::call_guard<py::gil_scoped_release>())
       .def("close", &gfx::FixedGraphRecording::close, py::call_guard<py::gil_scoped_release>())
       .def("argument_bytes", &gfx::FixedGraphRecording::argument_bytes,

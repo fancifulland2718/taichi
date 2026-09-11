@@ -17,6 +17,8 @@ def _eligible(spec, backend):
 
     if backend != "cuda" or impl.current_cfg().arch != core.Arch.cuda:
         return False
+    if spec._acceleration_structure_binding_requirements:
+        return False
     native = getattr(core, "_CudaGraphBindingExecutor", None)
     if native is None or not native.available():
         return False
@@ -186,9 +188,10 @@ class GraphBindingFrameRecipeProvider(GraphRuntimeFragmentProvider):
             "fixed-plan-provider-capture",
             "sampled-texture-resource-retention",
             "vulkan-secondary-image-recording",
+            "vulkan-readonly-tlas-recording",
         ),
-        domain_version="immutable-binding-frame-domain-v6",
-        semantic_fingerprint="cuda-vulkan-composed-binding-retained-images-v6",
+        domain_version="immutable-binding-frame-domain-v7",
+        semantic_fingerprint="cuda-vulkan-composed-binding-retained-resources-v7",
     )
 
     def fragments(self, definition):
@@ -262,11 +265,12 @@ class GraphBindingFrameRecipeProvider(GraphRuntimeFragmentProvider):
                 "display_name": "Whole-Graph immutable Vulkan binding frames",
                 "changes": (
                     "prepare arguments, descriptors and secondary commands at binding publication",
-                    "retain buffer/image resources until frame and parent command retirement",
+                    "retain buffer/image/TLAS and BLAS resources until frame and parent command retirement",
                     "record a closed image-layout cycle; repair entry layouts only after layout changes",
                 ),
                 "limitations": (
-                    "flat Vulkan kernel Graph, one workspace lane; no SNode, AS or external synchronization domains",
+                    "flat Vulkan kernel Graph, one workspace lane; no SNode or external synchronization domains",
+                    "TLAS bindings are read-only; AS builds/refits use their existing ordered commands outside the frame",
                     "one-mip sampled/storage images; simultaneous sampled/storage alias in one task is unavailable",
                     "raw mapping calls include argument preparation; use Graph.bind to amortize it",
                     "uploads and intervening graphics operations retain their existing explicit boundaries",

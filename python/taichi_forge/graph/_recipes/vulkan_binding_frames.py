@@ -27,6 +27,15 @@ def eligible(spec, backend):
         supports_images = getattr(native, "supports_texture_bindings", None)
         if supports_images is None or not supports_images():
             return False
+    if spec._acceleration_structure_binding_requirements:
+        native = getattr(core, "_VulkanFixedGraphRecording", None)
+        supports_as = getattr(native, "supports_acceleration_structure_bindings", None)
+        if (
+            supports_as is None
+            or not supports_as()
+            or not impl.get_runtime().prog.vulkan_ray_query_available()
+        ):
+            return False
     for node in spec.nodes:
         if isinstance(node, _CompiledCGraphNode):
             if (
@@ -61,7 +70,7 @@ class VulkanBindingFrameExecutor:
         spec = instance.spec
         if not eligible(spec, "vulkan"):
             raise ValueError(
-                "Vulkan binding frames require fixed buffer/image dispatches and inline-recordable FFT plans"
+                "Vulkan binding frames require fixed resource dispatches and inline-recordable FFT plans"
             )
         self._program = impl.get_runtime().prog
         self._prepare = core._prepare_vulkan_graph_recording

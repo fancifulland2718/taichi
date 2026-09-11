@@ -39,7 +39,8 @@ from taichi_forge.types._argument_descriptor import (
 )
 from taichi_forge.types import ndarray_type
 from taichi_forge.types.annotations import template
-from taichi_forge.types.primitive_types import f32, i32, u32
+from taichi_forge.types.primitive_types import f32, i32, u32, u64
+from taichi_forge.types.ray_type import _AccelerationStructureResource
 from taichi_forge.types.texture_type import FORMAT2TY_CH, TY_CH2FORMAT
 from taichi_forge.graph._native import (
     BackendCommandGraphAction,
@@ -5093,6 +5094,15 @@ class _GraphRunContext:
                         "Cannot submit a Texture to Graph.run() after its Taichi runtime has been reset"
                     )
                 signature.append((k, "texture", id(v), id(v.tex)))
+            elif isinstance(v, _AccelerationStructureResource):
+                v._validate_lifetime()
+                if v._runtime_prog is not impl.get_runtime().prog:
+                    raise TaichiRuntimeError(
+                        "Graph acceleration structure belongs to another runtime"
+                    )
+                signature.append(
+                    (k, "acceleration_structure", v._runtime_generation, v._handle)
+                )
             elif isinstance(v, Matrix):
                 signature.append((k, "matrix"))
                 dynamic_items.append((k, v.entries))
@@ -5102,7 +5112,8 @@ class _GraphRunContext:
             else:
                 raise TaichiRuntimeError(
                     "Only Python scalars, ti.Matrix, ti.Ndarray, DeviceExtent, "
-                    "canonical dense Field, and DenseNdarrayView are supported "
+                    "canonical dense Field, DenseNdarrayView, Texture, "
+                    "and InstanceTLAS are supported "
                     "as "
                     f"runtime arguments but got {type(v)}"
                 )
@@ -5152,6 +5163,10 @@ class _GraphRunContext:
                     flattened[k] = (view, runtime_argument)
                 elif isinstance(v, Texture):
                     flattened[k] = v.tex
+                elif isinstance(v, _AccelerationStructureResource):
+                    flattened[k] = (
+                        v._runtime_prog, v._kernel_resource_descriptor().handle
+                    )
             self._last_arg_signature = signature
             self._last_flattened = flattened
         for k, v in dynamic_items:
@@ -9891,13 +9906,17 @@ def _discover_cuda_recording_partition_sources(source_nodes, backend):
     return tuple(result)
 
 
-def _graph_texture_binding_requirements(nodes):
-    """Collect frozen symbolic image contracts, never inspect replay values."""
+def _graph_resource_binding_requirements(nodes):
+    """Collect frozen symbolic resource contracts, never inspect replay values."""
     requirements = {}
 
     def add(args):
         for arg in args:
-            if arg.tag in (ArgKind.TEXTURE, ArgKind.RWTEXTURE):
+            if arg.tag in (
+                ArgKind.TEXTURE,
+                ArgKind.RWTEXTURE,
+                getattr(ArgKind, "ACCELERATION_STRUCTURE", None),
+            ):
                 key = (arg.name, int(arg.tag), len(arg.texture_shape))
                 if arg.tag == ArgKind.RWTEXTURE:
                     key += (str(arg.channel_format()), arg.num_channels)
@@ -11087,8 +11106,16 @@ class _GraphSpec:
     ):
         source_nodes = tuple(nodes)
         structured_control_nodes = _prepare_structured_definition_tree(source_nodes)
-        self._texture_binding_requirements = _graph_texture_binding_requirements(
-            source_nodes
+        resource_requirements = _graph_resource_binding_requirements(source_nodes)
+        self._texture_binding_requirements = tuple(
+            arg
+            for arg in resource_requirements
+            if arg.tag in (ArgKind.TEXTURE, ArgKind.RWTEXTURE)
+        )
+        self._acceleration_structure_binding_requirements = tuple(
+            arg
+            for arg in resource_requirements
+            if arg.tag == getattr(ArgKind, "ACCELERATION_STRUCTURE", None)
         )
         structured_owner_token = object()
         self.pre_optimization_ir_root = SequentialRegion(
@@ -11783,11 +11810,14 @@ class _GraphSpec:
             return f"volatile_dense_storage:{name}"
         if isinstance(value, Matrix) and value.is_host_access:
             return f"volatile_host_matrix:{name}"
-        if isinstance(value, (int, float, Matrix, Ndarray, Texture)):
+        if isinstance(
+            value, (int, float, Matrix, Ndarray, Texture, _AccelerationStructureResource)
+        ):
             return None
         raise TaichiRuntimeError(
             "Only Python scalars, ti.Matrix, ti.Ndarray, DeviceExtent, "
-            "canonical dense Field, DenseNdarrayView, and Texture are supported "
+            "canonical dense Field, DenseNdarrayView, Texture, "
+            "and InstanceTLAS are supported "
             "as Graph runtime arguments but got "
             f"{type(value)} for {name!r}"
         )
@@ -11853,6 +11883,19 @@ class _GraphSpec:
             ):
                 raise TaichiRuntimeError(
                     f"Graph RWTexture {arg.name!r} has the wrong format"
+                )
+        for arg in self._acceleration_structure_binding_requirements:
+            if arg.name not in snapshot:
+                continue
+            value = snapshot[arg.name]
+            if not isinstance(value, _AccelerationStructureResource):
+                raise TaichiRuntimeError(
+                    f"Graph argument {arg.name!r} requires an InstanceTLAS"
+                )
+            value._validate_lifetime()
+            if value._runtime_prog is not impl.get_runtime().prog:
+                raise TaichiRuntimeError(
+                    "Graph acceleration structure belongs to another runtime"
                 )
         blockers = list(self.binding_plan.static_fast_path_blockers)
         if not allow_fast_path:
@@ -15447,7 +15490,12 @@ def _dispatch_ir_node(
         kind = str(tag)
         access = (
             GraphAccess.READ
-            if tag in (ArgKind.SCALAR, ArgKind.MATRIX, ArgKind.TEXTURE)
+            if tag in (
+                ArgKind.SCALAR,
+                ArgKind.MATRIX,
+                ArgKind.TEXTURE,
+                getattr(ArgKind, "ACCELERATION_STRUCTURE", None),
+            )
             else GraphAccess.READ_WRITE
         )
         effects.append(ResourceEffect(arg.name, access))
@@ -19807,6 +19855,11 @@ def _make_arg_rwtexture(kwargs: Dict[str, Any]):
     )
 
 
+def _make_arg_acceleration_structure(kwargs: Dict[str, Any]):
+    _check_args(kwargs, ["tag", "name"])
+    return _ti_core.Arg(ArgKind.ACCELERATION_STRUCTURE, kwargs["name"], u64, 0, [])
+
+
 def _make_arg(kwargs: Dict[str, Any]):
     assert "tag" in kwargs
     _deprecate_arg_args(kwargs)
@@ -19818,6 +19871,8 @@ def _make_arg(kwargs: Dict[str, Any]):
         ArgKind.RWTEXTURE: _make_arg_rwtexture,
     }
     tag = kwargs["tag"]
+    if tag == getattr(ArgKind, "ACCELERATION_STRUCTURE", None):
+        return _make_arg_acceleration_structure(kwargs)
     return proc[tag](kwargs)
 
 

@@ -100,6 +100,11 @@ Program::create_vulkan_graph_recording(
         const auto *argument = value.runtime_storage;
         retain_runtime_storage_for_graph_submission(&argument, 1);
       }
+    } else if (value.tag == aot::ArgKind::kAccelerationStructure) {
+      TI_ERROR_IF(value.resource_owner != this || value.val == 0,
+                  "Prepared Vulkan Graph AS belongs to another Program: {}", name);
+      // The existing kernel binding retains TLAS, BLAS and all backing Vulkan
+      // objects in the recorded command, independently of the open handle table.
     } else if (value.tag == aot::ArgKind::kTexture) {
       const auto *texture = reinterpret_cast<const Texture *>(value.val);
       TI_ERROR_IF(!texture || texture->owning_program() != this ||
