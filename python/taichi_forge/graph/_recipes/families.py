@@ -549,9 +549,8 @@ def materialize_runtime_graph_baseline(scope, definition, recipe):
             workspace_saturation=scope._context.workspace_saturation,
         )
     else:
-        # No map-fusion axis exists, so the frozen executor already is the
-        # exact all-baseline recipe.  Reuse it to preserve structured-control
-        # ownership and provider baselines that require no reconstruction.
+        # Without a map axis, compile preserves the exact baseline partition
+        # while instantiating independent mutable control/provider state.
         graph = definition.compile(
             workspace_lanes=scope._context.workspace_lanes,
             workspace_saturation=scope._context.workspace_saturation,

@@ -10703,6 +10703,15 @@ def _clone_control_recipe_runtime_node(node, control_recipe):
 
 
 def _clone_structured_recipe_node(node, control_recipe):
+    # No override means preserve this node's frozen route, not choose again
+    # from process-wide environment. Children keep their own frozen choices.
+    selected_recipe = control_recipe
+    if selected_recipe is None:
+        nested_route = getattr(node, "_cuda_nested_control_lowering", None)
+        selected_recipe = {
+            _CUDA_NESTED_DEVICE_UPDATE_ROUTE: "cuda_nested_device_update",
+            _CUDA_NESTED_MASKED_ROUTE: "cuda_nested_masked_bounded",
+        }.get(nested_route, getattr(node, "_cuda_control_lowering", None))
     regions = {
         role: _clone_recipe_sequential(region, control_recipe)
         for role, region in node._definition_regions
@@ -10722,7 +10731,7 @@ def _clone_structured_recipe_node(node, control_recipe):
             masked_execution=node.masked_execution,
             lowering_mode=node.lowering_mode,
             name=node.name,
-            _control_recipe=control_recipe,
+            _control_recipe=selected_recipe,
         )
     if isinstance(node, _CompiledIfGraphNode):
         return _CompiledIfGraphNode(
@@ -10733,7 +10742,7 @@ def _clone_structured_recipe_node(node, control_recipe):
             control_inputs=node.control_inputs,
             lowering_mode=node.lowering_mode,
             name=node.name,
-            _control_recipe=control_recipe,
+            _control_recipe=selected_recipe,
         )
     if isinstance(node, _CompiledSwitchGraphNode):
         branches = tuple(
@@ -10747,7 +10756,7 @@ def _clone_structured_recipe_node(node, control_recipe):
             control_inputs=node.control_inputs,
             lowering_mode=node.lowering_mode,
             name=node.name,
-            _control_recipe=control_recipe,
+            _control_recipe=selected_recipe,
         )
     raise TaichiRuntimeError("unknown structured-control recipe source")
 
@@ -10777,6 +10786,18 @@ _CONTROL_RECIPE_ROUTES = {
 
 class _GraphSpec:
     def _with_recipe_nodes(self, nodes):
+        # Frozen specs own control-node paths, reports and native caches. A
+        # rebuilt recipe must not acquire those mutable instances, even when
+        # its selection only replaces an unrelated map/native region.
+        nodes = tuple(
+            _clone_control_recipe_runtime_node(node, None)
+            if any(
+                getattr(root, "_graph_owner_token", None) is not None
+                for root in _structured_root_call_sites(node)
+            )
+            else node
+            for node in nodes
+        )
         return _GraphSpec(
             nodes,
             graph_memory_sources=self._graph_memory_sources,
@@ -10855,8 +10876,8 @@ class _GraphSpec:
         return self._with_recipe_nodes(nodes) if changed else self
 
     def materialize_baseline_sources(self, definition):
-        """Reconstruct detached segments only at the explicit compile boundary."""
-        if not any(
+        """Instantiate detached segments and mutable control state at compile."""
+        if not self.structured_control_count and not any(
             isinstance(node, _FrozenNativeGraphNode)
             or getattr(node, "_requires_recipe_materialization", False)
             for node in self.nodes
@@ -11373,15 +11394,7 @@ class _GraphSpec:
             raise TaichiRuntimeError(
                 "map-fusion fragment is outside the frozen Graph source topology"
             )
-        variant = _GraphSpec(
-            nodes,
-            graph_memory_sources=self._graph_memory_sources,
-            graph_offload_fusion_sources=self._graph_offload_fusion_sources,
-            graph_sparse_traversal_sources=(self._graph_sparse_traversal_sources),
-            graph_bounded_sources=self._graph_bounded_sources,
-            graph_reduction_sources=self._graph_reduction_sources,
-            graph_native_algorithm_sources=self._graph_native_algorithm_sources,
-        )
+        variant = self._with_recipe_nodes(nodes)
         variant._definition_source_spec = self
         variant._recipe_node_source_regions = tuple(node_source_regions)
         variant._complete_recipe_id = recipe.recipe_id

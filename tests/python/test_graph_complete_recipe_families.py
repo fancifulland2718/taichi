@@ -1218,6 +1218,118 @@ def test_complete_bounded_recipe_composes_independent_publication_groups(monkeyp
 
 
 @test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_mixed_map_control_recipes_own_independent_control_state(monkeypatch):
+    capabilities = dict(ti_core.cuda_conditional_graph_capabilities())
+    if not capabilities.get("general_graph_exact_control_available", False):
+        pytest.skip("general CUDA conditional Graph is unavailable")
+
+    @ti.kernel
+    def advance(
+        source: ti.types.ndarray(dtype=ti.i32, ndim=1),
+        output: ti.types.ndarray(dtype=ti.i32, ndim=1),
+    ):
+        for i in range(33):
+            output[i] = source[i] + 1
+
+    @ti.kernel
+    def condition(
+        state: ti.types.ndarray(dtype=ti.i32, ndim=0),
+        predicate: ti.types.ndarray(dtype=ti.i32, ndim=0),
+        target: ti.i32,
+    ):
+        predicate[None] = int(state[None] < target)
+
+    @ti.kernel
+    def step(
+        state: ti.types.ndarray(dtype=ti.i32, ndim=0),
+        predicate: ti.types.ndarray(dtype=ti.i32, ndim=0),
+        counter: ti.types.ndarray(dtype=ti.i32, ndim=0),
+    ):
+        if predicate[None] != 0:
+            state[None] += 1
+            counter[None] += 1
+
+    arrays = {
+        name: ti.graph.Arg(ti.graph.ArgKind.NDARRAY, name, ti.i32, ndim=1)
+        for name in ("source", "temporary", "output")
+    }
+    scalars = {
+        name: ti.graph.Arg(ti.graph.ArgKind.NDARRAY, name, ti.i32, ndim=0)
+        for name in ("state", "predicate", "counter")
+    }
+    target = ti.graph.Arg(ti.graph.ArgKind.SCALAR, "target", ti.i32)
+    monkeypatch.delenv("TI_GRAPH_CUDA_FORCE_MASKED_CONTROL", raising=False)
+    builder = ti.graph.GraphBuilder()
+    builder.dispatch(advance, arrays["source"], arrays["temporary"])
+    builder.dispatch(advance, arrays["temporary"], arrays["output"])
+    condition_region = builder.create_sequential()
+    condition_region.dispatch(condition, scalars["state"], scalars["predicate"], target)
+    body = builder.create_sequential()
+    body.dispatch(step, scalars["state"], scalars["predicate"], scalars["counter"])
+    builder.while_loop(
+        condition_region,
+        body,
+        predicate=scalars["predicate"],
+        control_inputs=(scalars["state"], target),
+        carried_state=(scalars["state"],),
+        counter=scalars["counter"],
+        max_iterations=8,
+        name="mixed_control",
+    )
+    definition = builder.freeze()
+    catalog = definition.recipe_catalog()
+    maps = _family_fragments(catalog, "map_fusion")
+    assert maps, "the regression requires a real map-fusion axis"
+    fused = catalog.compose(
+        (maps[0].fragment_id,),
+        stage="single-region",
+        parent_recipe_ids=(catalog.baseline.recipe.recipe_id,),
+    ).recipe
+    recipes = [
+        (catalog.baseline.recipe, "cuda_conditional_graph"),
+        (fused, "cuda_conditional_graph"),
+    ]
+    controls = _family_fragments(catalog, "structured_control")
+    if controls:
+        combined = catalog.compose(
+            (maps[0].fragment_id, controls[0].fragment_id),
+            stage="compatible-composition",
+            parent_recipe_ids=(fused.recipe_id,),
+        ).recipe
+        recipes.append((combined, "cuda_masked_bounded_graph"))
+    # A recipe's frozen control route must not inherit later process overrides.
+    monkeypatch.setenv("TI_GRAPH_CUDA_FORCE_MASKED_CONTROL", "1")
+    owners = []
+    with definition.materialization_context() as left, definition.materialization_context() as right:
+        materializations = [
+            (context.materialize(recipe), route)
+            for context in (left, right)
+            for recipe, route in recipes
+        ]
+        for index, (handle, expected_route) in enumerate(materializations):
+            arguments = {name: ti.ndarray(ti.i32, shape=33) for name in arrays}
+            arguments.update({name: ti.ndarray(ti.i32, shape=()) for name in scalars})
+            arguments["source"].from_numpy(np.arange(33, dtype=np.int32) + index)
+            for name in scalars:
+                arguments[name].fill(0)
+            arguments["target"] = index + 2
+            handle.executor.run(arguments)
+            report = handle.executor.control_flow_stats()[0]
+            assert report.logical_iterations == index + 2
+            assert report.lowering == expected_route
+            np.testing.assert_array_equal(
+                arguments["output"].to_numpy(),
+                np.arange(33, dtype=np.int32) + index + 2,
+            )
+            assert arguments["state"].to_numpy()[()] == index + 2
+            owners.append(handle.executor._spec.structured_control_nodes[0])
+        assert len({id(owner) for owner in owners}) == len(materializations)
+        assert [owner._last_report.logical_iterations for owner in owners] == list(
+            range(2, len(materializations) + 2)
+        )
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
 def test_complete_structured_control_recipe_rebuilds_both_routes_without_environment(
     monkeypatch,
 ):
