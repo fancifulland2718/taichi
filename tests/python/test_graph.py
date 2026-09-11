@@ -3206,14 +3206,16 @@ def test_fixed_binding_frame_publication_and_execution(fixed_kind, monkeypatch):
     values = ti.ndarray(ti.i32, shape=8)
     values.fill(0)
     bindings = graph.bind({"values": values})
-    assert bindings.fast_path_qualified == (fixed_kind == "ndarray")
+    # A provider binding is itself an immutable allocation + owner pair.
+    # Dynamic rebind hooks, not the value type, keep mutable providers slow.
+    assert bindings.fast_path_qualified == (fixed_kind != "multi_lane")
     assert tuple(bindings.snapshot()) == ("values",)
     if bindings.fast_path_qualified:
         version = bindings._version
         prepared = graph._spec.prepare_invocation(
             version.arguments, entrypoint="test", binding_version=version
         )
-        assert prepared.arguments["fixed_offset"] is offset
+        assert prepared.arguments["fixed_offset"] is fixed
         assert prepared.arguments["values"] is values
         with pytest.raises(TypeError):
             prepared.arguments["fixed_offset"] = values

@@ -11286,7 +11286,11 @@ class _GraphSpec:
         # with a published BindingVersion. Provider-controlled or otherwise
         # replaceable fixed values remain on the validated replay path.
         self._stable_fixed_binding_frame = bool(self.fixed_runtime_args) and all(
-            isinstance(value, (InternalNdarrayRequirement, Ndarray, int, float))
+            isinstance(
+                value,
+                (InternalNdarrayRequirement, Ndarray, ProviderOwnedNdarrayBinding,
+                 DenseNdarrayView, ScalarField, MatrixField, int, float),
+            )
             for value in self.fixed_runtime_args.values()
         )
         self.internal_storage_bytes = _graph_internal_storage_bytes(
@@ -11782,7 +11786,10 @@ class _GraphSpec:
                 return None
             return f"volatile_device_extent:{name}"
         if isinstance(value, ProviderOwnedNdarrayBinding):
-            return f"volatile_provider_binding:{name}"
+            # This object pins one immutable native allocation and its exact
+            # owner. Providers that publish replacements remain blocked by
+            # their bind_graph_arguments/lifetime hooks, not by this value.
+            return None
         if isinstance(value, DenseNdarrayView) and (
             name in self.binding_plan.memory_recipe_names
             and self.binding_plan.memory_recipe_publish_frame_stable
@@ -11912,6 +11919,10 @@ class _GraphSpec:
         )
         if fixed_binding_fast_path:
             blockers.remove("lane_fixed_bindings")
+            for name, value in fixed_runtime_args.items():
+                reason = self._binding_value_volatile_reason(name, value)
+                if reason is not None:
+                    blockers.append(reason)
         for name, value in zip(self.binding_plan.public_names, slot_values):
             reason = self._binding_value_volatile_reason(name, value)
             if reason is not None:

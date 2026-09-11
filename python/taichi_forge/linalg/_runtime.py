@@ -1903,6 +1903,18 @@ class LinearOperator:
             "numeric update is not defined for composed operators"
         )
 
+    def prepare_apply(self, input, out, *, adjoint=False):
+        """Pin a recordable action generation and fixed dense operands.
+
+        Contents/live field state may change in place. Published numeric or
+        coefficient generations are not followed: prepare again to adopt them.
+        Unlike apply(), preparation performs no mathematics or host staging.
+        See PreparedOperatorPlan for recording, ownership and scope.
+        """
+        from taichi_forge.linalg._prepared_operator import PreparedOperatorPlan
+
+        return PreparedOperatorPlan(self, input, out, adjoint=adjoint)
+
     def graph_action(self, input, output, *, adjoint=False):
         """Return a recordable f32 Graph action for this operator apply.
 

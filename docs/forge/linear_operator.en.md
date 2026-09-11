@@ -52,6 +52,45 @@ Unsupported dtype/provider/backend combinations fail explicitly. Stored
 operators and dense fields may still use `ti.f64` where the corresponding
 provider, solver, and backend rows in the support tables below allow it.
 
+## Prepared apply (0.6.3)
+
+For repeated application with fixed storage, use:
+
+```python
+prepared = operator.prepare_apply(input_array, output_array, adjoint=False)
+prepared.run()
+builder.append_native(prepared.record())
+graph = builder.compile()
+prepared.close()
+graph.run({})  # The recorded snapshot has its own retained reference.
+graph.close()
+```
+
+`ti.linalg.PreparedOperatorPlan` pins one provider topology/numeric/coefficient
+generation and validates dense input/output extent, layout and disjointness when
+preparing. It performs no mathematical application or field staging. Input
+contents and explicitly declared live field state remain live. In contrast,
+`update_numeric()` or parameter publication **does not update an existing prepared
+plan**: prepare again to adopt that generation. The existing `graph_action()`
+continues to rebind compatible generations dynamically.
+
+This path reuses qualified f32 compiled-kernel/compiled-Graph actions and their
+supported compositions; it does not add a stored/vendor sparse route, f64 ABI,
+generalized alpha/beta apply, or indexed-view packing. Derived subviews of
+unresolved composition workspace are rejected. `record()` expands only at Graph
+root, with an opaque semantic boundary; it is not a new fusion claim. Provider
+snapshots are retained without copies, while each compiled Graph owns its own
+composition workspace. Preparation may compile helper kernels and allocate that
+workspace; warm the Graph before timing. No provider/schema rediscovery is added
+to prepared replay, and normal Graph capture/replay eligibility still applies.
+
+`run()`, `report()`, `close()` and context management are available. Reports give
+pinned generation revisions, dispatch/workspace facts and binding status, not a
+performance guarantee or a complete driver VRAM measurement. Closing a prepared
+plan retires its own Graph; separately compiled recordings retain their snapshot
+and workspace until they close. Runtime reset or live source-tree retirement
+invalidates execution. Plans are not executable cross-process serialization.
+
 ## Dense fields and VectorView
 
 A supported dense field may be passed directly as `input`, `out`, or `addend`

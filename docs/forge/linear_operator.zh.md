@@ -43,6 +43,36 @@ matrix-free provider，也不会替换为其它 provider 或 backend。不受支
 dtype/provider/backend 组合会明确失败。stored operator 与 dense field 仍可在下文
 支持表所列的 provider、solver 和 backend 组合中使用 `ti.f64`。
 
+## Prepared apply（0.6.3）
+
+固定存储上的重复 apply 可使用：
+
+```python
+prepared = operator.prepare_apply(input_array, output_array, adjoint=False)
+prepared.run()
+builder.append_native(prepared.record())
+graph = builder.compile()
+prepared.close()
+graph.run({})  # 独立编译的 recording 持有自己的快照引用。
+graph.close()
+```
+
+`ti.linalg.PreparedOperatorPlan` 在准备时固定一次 provider topology/numeric/coefficient generation，并检查
+dense 输入输出的范围、布局、不重叠；不执行数学、不做 field staging。输入内容和显式声明的 live field state
+可原位更新。相反，后续 `update_numeric()` 或参数发布**不会改变已有 prepared plan**，需重新 prepare 才采用
+新 generation。原 `graph_action()` 的兼容 generation 动态 rebind 行为不变。
+
+支持已有资格的 f32 compiled-kernel/compiled-Graph action 及其可记录组合，不新增 stored/vendor sparse 路由、
+f64 ABI、广义 alpha/beta apply 或 indexed view packing。依赖尚未解析 composition workspace 的派生子视图
+明确拒绝。`record()` 仅在 Graph root 展开，语义保持 opaque，不因 prepare 宣称可融合。
+provider 快照仅保留引用、不复制；每个编译 Graph 自己持有 composition workspace。准备可能编译 helper kernel
+并分配 workspace，性能计时需预热。prepared replay 不重新发现 provider/schema，仍遵循既有 capture/replay 能力。
+
+提供 `run()`、`report()`、`close()` 与上下文管理。报告给出固定 generation 版本、dispatch/workspace 事实和
+绑定状态，不保证性能收益，也不是完整 driver 显存测量。关闭 plan 只退休自己的 Graph；独立编译的 recording
+保留其快照与 workspace 直到自己关闭。runtime reset 或 live source tree 退休使执行失效。plan 不是跨进程可执行
+对象的序列化格式。
+
 ## Dense field 与 VectorView
 
 受支持的 dense field 可以直接作为 `LinearOperator.apply()` 的 `input`、`out` 或
