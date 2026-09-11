@@ -1,6 +1,7 @@
 import ctypes
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 import taichi_forge as ti
@@ -435,3 +436,59 @@ def test_fake_optix_provider_scene_graph_lifetime_and_memory(monkeypatch):
     provider.close()
     assert fake.calls["destroy_scene"] == 1
     assert fake.calls["destroy_context"] == 1
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_optix_refit_refreshes_instance_bounds_in_graph():
+    status = _optix.probe_provider()
+    if status["discovery"] != "present":
+        pytest.skip(f"OptiX runtime unavailable: {status['unavailable_reason']}")
+    vertices = ti.ndarray(ti.f32, (3, 3))
+    vertices.from_numpy(np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32))
+    indices = ti.ndarray(ti.i32, (1, 3))
+    indices.from_numpy(np.array([[0, 1, 2]], np.int32))
+    rays = ti.ndarray(ti.f32, (2, 8))
+    rays.from_numpy(
+        np.array(
+            [[0.2, 0.3, 1, 0, 0, 0, -1, 10], [8.2, 0.3, 1, 0, 0, 0, -1, 10]], np.float32
+        )
+    )
+    hits = ti.ndarray(ti.f32, (2, 4))
+
+    @ti.kernel
+    def relocate(v: ti.types.ndarray(ti.f32, ndim=2), offset: ti.f32):
+        for i in range(3):
+            v[i, 0] = offset + ti.cast(i == 1, ti.f32)
+
+    with ti.hardware.ray.load_optix_provider() as provider:
+        with provider.triangle_scene(vertices, indices) as scene:
+            builder = ti.graph.GraphBuilder()
+            builder.dispatch(
+                relocate,
+                ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "vertices", ti.f32, ndim=2),
+                ti.graph.Arg(ti.graph.ArgKind.SCALAR, "offset", ti.f32),
+            )
+            builder.append_native(scene.record_refit(), admission="explicit")
+            builder.append_native(scene.record(2), admission="explicit")
+            graph = builder.compile()
+            before_bytes = scene.memory_report().known_resident_requested_bytes
+            try:
+                for offset in (8.0, 0.0, 8.0):
+                    ticket = graph.submit(
+                        {
+                            "vertices": vertices,
+                            "offset": offset,
+                            "rays": rays,
+                            "hits": hits,
+                        }
+                    )
+                    ticket.wait()
+                    actual = hits.to_numpy()
+                    selected = int(offset != 0)
+                    assert actual[selected].tolist() == [1.0, 0.0, 0.0, 1.0]
+                    assert actual[1 - selected].tolist() == [-1.0, -1.0, -1.0, 0.0]
+                assert (
+                    scene.memory_report().known_resident_requested_bytes == before_bytes
+                )
+            finally:
+                graph.close()

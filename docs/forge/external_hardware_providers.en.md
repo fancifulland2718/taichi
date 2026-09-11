@@ -791,6 +791,13 @@ Graph work retains both. Close scenes before the provider and do not reuse any
 object after `ti.reset()`. `validation=True` is recommended for development,
 not as a default performance setting.
 
+For an updatable triangle scene, `refit()` / `record_refit()` updates both its
+GAS and its identity IAS, including bounds that move outside the original scene.
+Updates and subsequent queries are ordered on the runtime stream without a
+per-refit host wait. Scene construction and explicit close remain cold lifecycle
+boundaries that may synchronize. Update-enabled scenes retain IAS scratch;
+`memory_report()` includes it in build/update scratch, with no per-refit allocation.
+
 ## Explicit optional runtime execution providers
 
 The standard runtime wheel contains Forge-owned thin adapters for the following

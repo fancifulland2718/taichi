@@ -626,6 +626,11 @@ provider 持有 OptiX context，scene 持有 provider，已提交 Graph work 同
 关闭 scene，再关闭 provider；`ti.reset()` 后不得复用任何旧对象。`validation=True` 推荐用于
 开发阶段，而不是默认性能配置。
 
+可更新 triangle scene 的 `refit()` / `record_refit()` 同时更新 GAS 和其 identity IAS，
+覆盖移出原始 scene 范围的包围盒。更新与后续查询在 runtime stream 上有序执行，不逐次等待
+host；scene 构建与显式 close 仍是可能同步的冷生命周期边界。可更新 scene 保留 IAS scratch，
+`memory_report()` 将其计入 build/update scratch，不在每次 refit 时分配。
+
 ## 显式 optional runtime 执行 provider
 
 标准 runtime wheel 随附以下三个 Forge 自有薄 adapter。adapter 不包含也不链接 vendor

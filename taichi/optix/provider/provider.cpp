@@ -38,14 +38,13 @@ std::string active_optix_runtime_library_path;
 constexpr char kProviderName[] = "taichi-forge-optix";
 constexpr char kBuildIdentity[] =
     "forge-optix-provider-abi1-optix-abi" TI_FORGE_STRINGIFY(
-        OPTIX_ABI_VERSION);
-constexpr uint64_t kFeatures =
-    TI_FORGE_OPTIX_FEATURE_TRIANGLE_GAS |
-    TI_FORGE_OPTIX_FEATURE_SINGLE_INSTANCE_IAS |
-    TI_FORGE_OPTIX_FEATURE_GAS_UPDATE |
-    TI_FORGE_OPTIX_FEATURE_BATCH_CLOSEST_HIT |
-    TI_FORGE_OPTIX_FEATURE_RUNTIME_ORDERED_STREAM |
-    TI_FORGE_OPTIX_FEATURE_EXACT_DEVICE_MEMORY;
+        OPTIX_ABI_VERSION) "-scene-refit2";
+constexpr uint64_t kFeatures = TI_FORGE_OPTIX_FEATURE_TRIANGLE_GAS |
+                               TI_FORGE_OPTIX_FEATURE_SINGLE_INSTANCE_IAS |
+                               TI_FORGE_OPTIX_FEATURE_GAS_UPDATE |
+                               TI_FORGE_OPTIX_FEATURE_BATCH_CLOSEST_HIT |
+                               TI_FORGE_OPTIX_FEATURE_RUNTIME_ORDERED_STREAM |
+                               TI_FORGE_OPTIX_FEATURE_EXACT_DEVICE_MEMORY;
 
 void clear_error_state() {
   last_error.clear();
@@ -163,6 +162,7 @@ struct Scene {
   DeviceBuffer gas;
   DeviceBuffer ias;
   DeviceBuffer scratch;
+  DeviceBuffer ias_scratch;
   DeviceBuffer instance;
   DeviceBuffer launch_params;
   OptixTraversableHandle gas_handle{0};
@@ -528,17 +528,18 @@ TiForgeOptixResult create_ias(Scene *scene, CUstream stream) {
   input.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
   input.instanceArray.instances = scene->instance.pointer;
   input.instanceArray.numInstances = 1;
-  const auto options = build_options(false, OPTIX_BUILD_OPERATION_BUILD);
+  const auto options =
+      build_options(scene->allow_update, OPTIX_BUILD_OPERATION_BUILD);
   OptixAccelBufferSizes sizes{};
-  result = optix_check(
-      optixAccelComputeMemoryUsage(scene->context->optix_context, &options,
-                                   &input, 1, &sizes),
-      "optixAccelComputeMemoryUsage(IAS)");
+  result =
+      optix_check(optixAccelComputeMemoryUsage(scene->context->optix_context,
+                                               &options, &input, 1, &sizes),
+                  "optixAccelComputeMemoryUsage(IAS)");
   if (result != TI_FORGE_OPTIX_SUCCESS) {
     return result;
   }
-  DeviceBuffer ias_scratch;
-  result = ias_scratch.allocate(sizes.tempSizeInBytes);
+  result = scene->ias_scratch.allocate(
+      std::max(sizes.tempSizeInBytes, sizes.tempUpdateSizeInBytes));
   if (result != TI_FORGE_OPTIX_SUCCESS) {
     return result;
   }
@@ -547,16 +548,20 @@ TiForgeOptixResult create_ias(Scene *scene, CUstream stream) {
     return result;
   }
   result = optix_check(
-      optixAccelBuild(scene->context->optix_context, stream, &options, &input, 1,
-                      ias_scratch.pointer, ias_scratch.bytes,
+      optixAccelBuild(scene->context->optix_context, stream, &options, &input,
+                      1, scene->ias_scratch.pointer, scene->ias_scratch.bytes,
                       scene->ias.pointer, scene->ias.bytes, &scene->ias_handle,
                       nullptr, 0),
       "optixAccelBuild(IAS)");
   if (result != TI_FORGE_OPTIX_SUCCESS) {
     return result;
   }
-  return cuda_check(cuStreamSynchronize(stream),
-                    "cuStreamSynchronize(scene build)");
+  result = cuda_check(cuStreamSynchronize(stream),
+                      "cuStreamSynchronize(scene build)");
+  if (result == TI_FORGE_OPTIX_SUCCESS && !scene->allow_update) {
+    scene->ias_scratch.reset();
+  }
+  return result;
 }
 
 TiForgeOptixResult create_context(const TiForgeOptixContextDesc *desc,
@@ -703,9 +708,21 @@ TiForgeOptixResult update_triangle_scene(
   if (result != TI_FORGE_OPTIX_SUCCESS) {
     return result;
   }
-  return cuda_check(
-      cuStreamSynchronize(reinterpret_cast<CUstream>(desc->cuda_stream)),
-      "cuStreamSynchronize(scene update)");
+  // A changed GAS bound does not refresh its parent IAS. The topology and GAS
+  // handle are fixed, so reuse the instance description and retained scratch.
+  // Both updates are ordered on the caller's stream; there is no readback or
+  // host synchronization between the producer, these updates and later rays.
+  OptixBuildInput instance_input{};
+  instance_input.type = OPTIX_BUILD_INPUT_TYPE_INSTANCES;
+  instance_input.instanceArray.instances = scene->instance.pointer;
+  instance_input.instanceArray.numInstances = 1;
+  return optix_check(
+      optixAccelBuild(scene->context->optix_context,
+                      reinterpret_cast<CUstream>(desc->cuda_stream), &options,
+                      &instance_input, 1, scene->ias_scratch.pointer,
+                      scene->ias_scratch.bytes, scene->ias.pointer,
+                      scene->ias.bytes, &scene->ias_handle, nullptr, 0),
+      "optixAccelBuild(IAS update)");
 }
 
 TiForgeOptixResult trace(TiForgeOptixTriangleScene raw_scene,
@@ -746,7 +763,8 @@ TiForgeOptixResult get_scene_memory(TiForgeOptixTriangleScene raw_scene,
   out_memory->reserved = 0;
   out_memory->gas_bytes = scene->gas.bytes;
   out_memory->ias_bytes = scene->ias.bytes;
-  out_memory->build_update_scratch_bytes = scene->scratch.bytes;
+  out_memory->build_update_scratch_bytes =
+      scene->scratch.bytes + scene->ias_scratch.bytes;
   out_memory->instance_bytes = scene->instance.bytes;
   out_memory->launch_params_bytes = scene->launch_params.bytes;
   out_memory->shared_pipeline_sbt_bytes =
