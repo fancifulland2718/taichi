@@ -1,6 +1,7 @@
 """Transactional materialization for complete Forge Graph recipes."""
 
 import threading
+from uuid import uuid4
 from contextlib import suppress
 from dataclasses import dataclass, field
 
@@ -87,6 +88,10 @@ class GraphMaterializationProduct:
     executor: object = field(compare=False, hash=False, repr=False)
     manifest: CompiledGraphPhysicalManifest
     release: object = field(default=None, compare=False, hash=False, repr=False)
+    # Equal execution plans do not imply interchangeable mutable resources.
+    # Only providers that explicitly guarantee shared-executor semantics may
+    # opt into cross-recipe instance reuse within one materialization context.
+    shareable_executor: bool = False
 
     def __post_init__(self):
         if self.executor is None:
@@ -97,6 +102,8 @@ class GraphMaterializationProduct:
             )
         if self.release is not None and not callable(self.release):
             raise TypeError("Graph materialization product release must be callable")
+        if not isinstance(self.shareable_executor, bool):
+            raise TypeError("Graph executor shareability must be a boolean")
 
 
 class _OwnedValue:
@@ -266,6 +273,7 @@ class GraphMaterializationScope:
 class _PublishedMaterialization:
     __slots__ = (
         "executor",
+        "resource_instance_id",
         "handle_count",
         "manifest",
         "owners",
@@ -276,6 +284,7 @@ class _PublishedMaterialization:
 
     def __init__(self, recipe_id, product, owners):
         self.executor = product.executor
+        self.resource_instance_id = f"materialization-instance:{uuid4().hex}"
         self.manifest = product.manifest
         self.owners = owners
         self.representative_recipe_id = recipe_id
@@ -356,6 +365,11 @@ class GraphMaterializedRecipe:
         return self._state.manifest.materialized_physical_id
 
     @property
+    def resource_instance_id(self):
+        """Process-local resource ownership, never a cross-process reuse key."""
+        return self._state.resource_instance_id
+
+    @property
     def deduplicated(self):
         return self._deduplicated
 
@@ -364,7 +378,7 @@ class GraphMaterializedRecipe:
         return self._cache_hit
 
     def materialization_report(self):
-        return self.manifest.to_dict()
+        return {**self.manifest.to_dict(), "resource_instance_id": self.resource_instance_id}
 
     def close(self):
         if self._closed:
@@ -643,7 +657,7 @@ class GraphMaterializationContext:
         manifest = product.manifest
         duplicate = (
             self._physical_states.get(manifest.materialized_physical_id)
-            if manifest.identity_complete
+            if manifest.identity_complete and product.shareable_executor
             else None
         )
         if duplicate is not None:
@@ -669,7 +683,7 @@ class GraphMaterializationContext:
         owners = transaction.publish()
         state = _PublishedMaterialization(recipe.recipe_id, product, owners)
         self._recipe_states[recipe.recipe_id] = state
-        if manifest.identity_complete:
+        if manifest.identity_complete and product.shareable_executor:
             self._physical_states[manifest.materialized_physical_id] = state
         self._publication_order.append(state)
         self._statistics["publications"] += 1
@@ -814,10 +828,9 @@ class GraphMaterializationContext:
                 return
             errors = state.retire()
             self._statistics["releases"] += 1
-            self._physical_states.pop(
-                state.manifest.materialized_physical_id,
-                None,
-            )
+            physical_id = state.manifest.materialized_physical_id
+            if self._physical_states.get(physical_id) is state:
+                self._physical_states.pop(physical_id)
             if errors:
                 self._state = "poisoned"
                 self._statistics["rollback_failures"] += 1

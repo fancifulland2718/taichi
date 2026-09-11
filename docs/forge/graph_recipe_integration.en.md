@@ -69,6 +69,20 @@ equivalence. Providers must declare real coverage, binding, numerical and resour
 change domain/implementation identity when physical work changes. The example owns no scratch;
 a provider with scratch must report and retire it instead of declaring zero storage.
 
+## Execution identity and memory observations
+
+Physical manifest schema v2 separates the execution/allocation plan from memory observations.
+`materialized_physical_id` hashes compiled work, bindings and `resource_plan` (requested sizes,
+grouping and lifetime), not cold/warm cache allocations or backing-page sizes. `resources` and
+`memory` retain the observation. Earlier v1 physical IDs are not interchangeable with v2;
+resolve the structural selection again and renew measurement evidence when required.
+
+`handle.resource_instance_id` identifies a live ownership instance, not a portable selection.
+Equal physical IDs permit candidate comparison, not sharing mutable executors. Cross-recipe
+instance sharing is disabled unless the provider explicitly returns
+`GraphMaterializationProduct(..., shareable_executor=True)` and guarantees safe shared state.
+Repeated requests for the same recipe within one context still reuse that context's instance.
+
 ## Evaluation boundaries
 
 Restore equivalent input state for every evaluation, bind once, warm up, then measure.

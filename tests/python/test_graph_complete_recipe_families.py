@@ -1314,6 +1314,16 @@ def test_mixed_map_control_recipes_own_independent_control_state(monkeypatch):
                 arguments[name].fill(0)
             arguments["target"] = index + 2
             handle.executor.run(arguments)
+            warmed = observe_graph_physical_manifest(
+                definition,
+                next(
+                    recipe
+                    for recipe, _ in recipes
+                    if recipe.recipe_id == handle.recipe_id
+                ),
+                handle.executor,
+            )
+            assert warmed.materialized_physical_id == handle.materialized_physical_id
             report = handle.executor.control_flow_stats()[0]
             assert report.logical_iterations == index + 2
             assert report.lowering == expected_route

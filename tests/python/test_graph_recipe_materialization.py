@@ -468,7 +468,8 @@ def test_failed_candidate_rolls_back_without_disturbing_baseline_or_next_candida
     assert releases == ["failed-candidate", "good", "baseline"]
 
 
-def test_actual_physical_identity_deduplicates_distinct_plans_before_measurement():
+@pytest.mark.parametrize("shareable", [False, True])
+def test_actual_physical_identity_only_shares_explicitly_shareable_executors(shareable):
     definition = _definition()
     releases = []
 
@@ -519,6 +520,7 @@ def test_actual_physical_identity_deduplicates_distinct_plans_before_measurement
                 provenance={"candidate": name},
             ),
             release=lambda _value: releases.append(f"executor:{name}"),
+            shareable_executor=shareable,
         )
 
     context = GraphMaterializationContext(
@@ -537,11 +539,11 @@ def test_actual_physical_identity_deduplicates_distinct_plans_before_measurement
     assert first_result.materialized_physical_id == (
         second_result.materialized_physical_id
     )
-    assert second_result.deduplicated
-    assert second_result.representative_recipe_id == first_recipe.recipe_id
-    assert second_result.executor is first_result.executor
-    assert releases == ["executor:b", "compile:b"]
-    assert context.statistics()["materialized_physical_deduplications"] == 1
+    assert second_result.deduplicated == shareable
+    assert (second_result.executor is first_result.executor) == shareable
+    assert (second_result.resource_instance_id == first_result.resource_instance_id) == shareable
+    assert releases == (["executor:b", "compile:b"] if shareable else [])
+    assert context.statistics()["materialized_physical_deduplications"] == int(shareable)
     assert third_result.materialized_physical_id != (
         first_result.materialized_physical_id
     )
@@ -549,16 +551,48 @@ def test_actual_physical_identity_deduplicates_distinct_plans_before_measurement
     assert third_result.manifest.persistent_allocated_bytes == 256
 
     first_result.close()
-    assert releases == ["executor:b", "compile:b"]
+    assert releases == (["executor:b", "compile:b"] if shareable else ["executor:a", "compile:a"])
     second_result.close()
-    assert releases == [
-        "executor:b",
-        "compile:b",
-        "executor:a",
-        "compile:a",
-    ]
+    order = ("b", "a") if shareable else ("a", "b")
+    assert releases == [label for name in order for label in (f"executor:{name}", f"compile:{name}")]
     third_result.close()
     assert releases[-2:] == ["executor:c", "compile:c"]
+
+
+def test_physical_identity_uses_allocation_policy_not_backing_page_size():
+    definition = _definition()
+    recipe = GraphRecipeComposer(definition).compose()
+    resource = GraphPhysicalResourceManifest(
+        resource_id="workspace",
+        kind="device_buffer",
+        requested_bytes=64,
+        allocated_bytes=256,
+        alignment=256,
+        ownership="graph_instance",
+        lifetime="graph",
+        allocation_members=("temporary",),
+        allocation_count=1,
+    )
+    baseline = _manifest(definition, recipe, "same-plan", resources=(resource,))
+    larger_backing = _manifest(
+        definition,
+        recipe,
+        "same-plan",
+        resources=(replace(resource, allocated_bytes=512),),
+    )
+    assert baseline.materialized_physical_id == larger_backing.materialized_physical_id
+    assert baseline.persistent_allocated_bytes == 256
+    assert larger_backing.persistent_allocated_bytes == 512
+    assert "allocated_bytes" not in baseline.to_dict()["resource_plan"][0]
+    for changed in (
+        replace(resource, requested_bytes=128),
+        replace(resource, allocation_count=2),
+        replace(resource, allocation_members=("different-temporary",)),
+        replace(resource, lifetime="submission"),
+    ):
+        assert _manifest(
+            definition, recipe, "same-plan", resources=(changed,)
+        ).materialized_physical_id != (baseline.materialized_physical_id)
 
 
 def test_allocated_resources_must_match_requirements_and_appear_in_manifest():
@@ -870,7 +904,7 @@ def test_external_provider_materializes_both_complete_recipe_assembly_protocols(
     assert ti.graph.GraphRecipeProviderDescriptor is GraphRecipeProviderDescriptor
 
 
-@test_utils.test(arch=ti.cpu)
+@test_utils.test(arch=[ti.cpu, ti.cuda, ti.vulkan])
 def test_native_task_observation_produces_stable_complete_baseline_manifest():
     @ti.kernel
     def add_one(
@@ -911,12 +945,23 @@ def test_native_task_observation_produces_stable_complete_baseline_manifest():
             "values",
         )
         assert first.materialized_physical_id == second.materialized_physical_id
+        assert first.resource_instance_id != second.resource_instance_id
 
         values = ti.ndarray(ti.i32, shape=8)
         output = ti.ndarray(ti.i32, shape=8)
         values.from_numpy(__import__("numpy").arange(8, dtype="int32"))
         first.executor.run({"values": values, "output": output})
         assert output.to_numpy().tolist() == list(range(1, 9))
+        warmed = CompiledGraphPhysicalManifest.from_graph(
+            definition,
+            definition.recipe_catalog(providers=()).baseline.recipe,
+            first.executor,
+        )
+        assert warmed.materialized_physical_id == first.materialized_physical_id
+        assert (
+            warmed.persistent_allocated_bytes
+            >= first.manifest.persistent_allocated_bytes
+        )
     finally:
         first.close()
         second.close()

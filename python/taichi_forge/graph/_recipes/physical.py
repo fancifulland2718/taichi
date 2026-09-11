@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field, replace
 from taichi_forge.graph._ir import ResourceEffect
 from taichi_forge.graph._recipes.definition import _canonical_json, _digest
 
-_PHYSICAL_MANIFEST_SCHEMA = "taichi_forge.compiled_graph_physical_manifest.v1"
+_PHYSICAL_MANIFEST_SCHEMA = "taichi_forge.compiled_graph_physical_manifest.v2"
 _MAX_SIGNED_BYTES = (1 << 63) - 1
 
 
@@ -596,7 +596,6 @@ def _resource_identity_payload(resources, public_bindings):
             "resource_index": index,
             "kind": resource.kind,
             "requested_bytes": resource.requested_bytes,
-            "allocated_bytes": resource.allocated_bytes,
             "alignment": resource.alignment,
             "ownership": resource.ownership,
             "lifetime": resource.lifetime,
@@ -610,6 +609,85 @@ def _resource_identity_payload(resources, public_bindings):
         }
         for index, resource in enumerate(resources)
     )
+
+
+def _graph_resource_plan(graph):
+    """Frozen allocation policy, independent of materialized cache/arena slots."""
+    from taichi_forge.graph._graph import _graph_internal_storage_bytes
+
+    spec = graph._spec
+    temporary = spec.temporary_memory_plan
+    plans = []
+    assigned = set()
+    owns_temporary = False
+    for index, plan in enumerate(getattr(spec, "_storage_plans", ())):
+        assigned.update(plan.binding_names)
+        size = _graph_internal_storage_bytes(
+            {name: spec.fixed_runtime_args[name] for name in plan.binding_names}
+        )
+        capacity = (
+            graph._instance._temporary_arena.capacity if plan.temporary_arena else 0
+        )
+        if plan.temporary_arena:
+            owns_temporary = True
+            size += temporary.planned_peak_bytes * capacity
+        size *= graph._workspace_lane_capacity
+        plans.append(
+            GraphPhysicalResourceManifest(
+                resource_id=f"storage_plan:{index}",
+                kind=plan.plan_id,
+                requested_bytes=size,
+                allocated_bytes=size,
+                alignment=1,
+                ownership="graph_instance",
+                lifetime="graph",
+                allocation_members=(
+                    *plan.binding_names,
+                    *(("temporary_arena",) if plan.temporary_arena else ()),
+                ),
+                allocation_count=(len(plan.binding_names) + capacity)
+                * graph._workspace_lane_capacity,
+                exclusive_submission=plan.ordered_temporary_reuse,
+            )
+        )
+    size = _graph_internal_storage_bytes(
+        {
+            name: value
+            for name, value in spec.fixed_runtime_args.items()
+            if name not in assigned
+        }
+    )
+    if size:
+        plans.append(
+            GraphPhysicalResourceManifest(
+                resource_id="internal_storage",
+                kind="graph_owned_storage",
+                requested_bytes=size * graph._workspace_lane_capacity,
+                allocated_bytes=size * graph._workspace_lane_capacity,
+                alignment=1,
+                ownership="graph_instance",
+                lifetime="graph",
+                allocation_count=graph._workspace_lane_capacity,
+                exclusive_submission=graph._instance._exclusive_internal_storage,
+            )
+        )
+    if temporary.planned_peak_bytes and not owns_temporary:
+        arena_slots = (
+            graph._instance._temporary_arena.capacity * graph._workspace_lane_capacity
+        )
+        plans.append(
+            GraphPhysicalResourceManifest(
+                resource_id="temporary_storage",
+                kind="graph_temporary_slots",
+                requested_bytes=temporary.planned_peak_bytes * arena_slots,
+                allocated_bytes=temporary.planned_peak_bytes * arena_slots,
+                alignment=1,
+                ownership="graph_instance",
+                lifetime="submission",
+                allocation_count=temporary.slot_count * arena_slots,
+            )
+        )
+    return tuple(plans)
 
 
 def _effect_identity(effect, resource_indices, public_bindings):
@@ -655,6 +733,7 @@ class CompiledGraphPhysicalManifest:
     task_topology_exact: bool
     command_topology_exact: bool
     allocation_topology_exact: bool
+    resource_plan: tuple[GraphPhysicalResourceManifest, ...] = ()
     _provenance_json: str = field(default="{}", repr=False)
 
     @classmethod
@@ -688,6 +767,7 @@ class CompiledGraphPhysicalManifest:
             tasks=tuple(replace(task, region_ids=coverage) for task in observed.tasks),
             commands=observed.commands, submissions=observed.submissions,
             resources=observed.resources, binding_abi=observed.binding_abi,
+            resource_plan=observed.resource_plan,
             task_topology_exact=observed.task_topology_exact,
             command_topology_exact=observed.command_topology_exact,
             allocation_topology_exact=observed.allocation_topology_exact,
@@ -710,6 +790,7 @@ class CompiledGraphPhysicalManifest:
         commands=(),
         submissions=(),
         resources=(),
+        resource_plan=None,
         binding_abi=(),
         task_topology_exact=True,
         command_topology_exact=True,
@@ -729,6 +810,10 @@ class CompiledGraphPhysicalManifest:
         commands = tuple(commands)
         submissions = tuple(submissions)
         resources = tuple(resources)
+        # Provider-supplied allocations normally describe a fixed plan. The
+        # runtime observer supplies a separate plan because lazy caches and
+        # backing pages are measurements, not execution choices.
+        resource_plan = resources if resource_plan is None else tuple(resource_plan)
         binding_abi = tuple(binding_abi)
         typed = (
             (kernels, GraphPhysicalKernelManifest, "kernel"),
@@ -736,6 +821,7 @@ class CompiledGraphPhysicalManifest:
             (commands, GraphPhysicalCommandManifest, "command"),
             (submissions, GraphPhysicalSubmissionManifest, "submission"),
             (resources, GraphPhysicalResourceManifest, "resource"),
+            (resource_plan, GraphPhysicalResourceManifest, "resource plan"),
             (binding_abi, GraphPhysicalBindingManifest, "binding"),
         )
         for values, expected_type, role in typed:
@@ -822,23 +908,21 @@ class CompiledGraphPhysicalManifest:
                     "Graph physical task references an absent ABI binding"
                 )
 
-        resource_ids = tuple(item.resource_id for item in resources)
-        if len(resource_ids) != len(set(resource_ids)):
-            raise GraphPhysicalManifestError(
-                "Graph physical resource IDs must be unique"
-            )
         public_bindings = {item.name for item in binding_abi if item.scope == "public"}
-        for resource in resources:
-            if (
-                resource.scope == "public_external"
-                and resource.binding_name not in public_bindings
-            ):
+        for resource_set in (resources, resource_plan):
+            resource_ids = tuple(item.resource_id for item in resource_set)
+            if len(resource_ids) != len(set(resource_ids)):
                 raise GraphPhysicalManifestError(
-                    "Graph external physical resource has no public ABI binding"
+                    "Graph physical resource IDs must be unique"
                 )
+            for resource in resource_set:
+                if resource.scope == "public_external" and resource.binding_name not in public_bindings:
+                    raise GraphPhysicalManifestError(
+                        "Graph external physical resource has no public ABI binding"
+                    )
 
         resource_indices, resource_payload = _resource_identity_payload(
-            resources,
+            resource_plan,
             public_bindings,
         )
         physical_payload = {
@@ -867,7 +951,6 @@ class CompiledGraphPhysicalManifest:
             "exactness": {
                 "task_topology": bool(task_topology_exact),
                 "command_topology": bool(command_topology_exact),
-                "allocation_topology": bool(allocation_topology_exact),
             },
         }
         return cls(
@@ -883,6 +966,7 @@ class CompiledGraphPhysicalManifest:
             commands=commands,
             submissions=submissions,
             resources=resources,
+            resource_plan=resource_plan,
             binding_abi=binding_abi,
             task_topology_exact=bool(task_topology_exact),
             command_topology_exact=bool(command_topology_exact),
@@ -947,6 +1031,10 @@ class CompiledGraphPhysicalManifest:
             "commands": tuple(item.to_dict() for item in self.commands),
             "submissions": tuple(item.to_dict() for item in self.submissions),
             "resources": tuple(item.to_dict() for item in self.resources),
+            "resource_plan": tuple(
+                {key: value for key, value in item.to_dict().items() if key != "allocated_bytes"}
+                for item in self.resource_plan
+            ),
             "binding_abi": tuple(item.to_dict() for item in self.binding_abi),
             "exactness": {
                 "task_topology": self.task_topology_exact,
@@ -1368,6 +1456,7 @@ def observe_graph_physical_manifest(definition, recipe, graph):
         commands=commands,
         submissions=submissions,
         resources=resources,
+        resource_plan=_graph_resource_plan(graph),
         binding_abi=_definition_binding_manifest(definition),
         task_topology_exact=task_topology_exact,
         command_topology_exact=command_topology_exact,

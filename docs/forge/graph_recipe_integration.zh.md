@@ -73,6 +73,16 @@ python -m taichi_forge.examples.graph.complete_recipe_provider --output restored
 外部 provider 仍须声明真实 coverage、资源/绑定/数值条件。物理改变时更新 domain/implementation 身份。
 示例没有自有 workspace；有 workspace 时应声明 requested ownership/lifetime，并实现相应释放，不能填成零。
 
+## 执行身份与内存观测
+
+物理 manifest schema v2 将执行/分配方案和显存观测分开。`materialized_physical_id` 对编译工作、绑定和
+`resource_plan`（请求大小、分组、生命周期）求身份，不包含冷/热缓存分配或 backing page 大小；
+`resources`、`memory` 保留观测。旧 v1 physical ID 与 v2 不等价，需重新解析结构选择，并按需更新测量证据。
+
+`handle.resource_instance_id` 表示具体资源所有权实例，不是跨进程选择键。物理 ID 相同不授权共享可变执行器。
+只有 provider 明确保证共享状态安全并返回 `GraphMaterializationProduct(..., shareable_executor=True)`，
+同一 context 才跨 recipe 共享实例。同一 recipe 在同一 context 的显式重复请求仍使用已有实例。
+
 ## evaluator 不应制造错误结论
 
 每次评估先建立等价输入状态、发布 binding、预热，再测量。输入恢复、正确性 readback 和库 probe 不应混入
