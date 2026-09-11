@@ -362,7 +362,8 @@ def test_graph_automatically_normalizes_dense_field_and_view_without_copy():
     builder.dispatch(increment, symbolic)
     builder.dispatch(increment, symbolic)
     graph = builder.compile()
-    graph.execution_stats()
+    # Public reports are passive; replay counters require explicit test opt-in.
+    _ = graph._graph_stats
 
     automatic = ti.field(ti.i32, shape=32)
     explicit_field = ti.field(ti.i32, shape=32)
@@ -395,8 +396,11 @@ def test_graph_automatically_normalizes_dense_field_and_view_without_copy():
         stats = graph._graph_stats[0]
         assert stats["ordinary_fallbacks"] == 0
         assert stats["captures"] == 1
-        assert stats["patched_replays"] == 1
-        assert stats["exact_replays"] == 16
+        # Each field owner has its own retained CUDA signature slot. These
+        # counters describe the active slot, not the sum of both executables.
+        assert stats["backend_replay_signature_slots"] == 2
+        assert stats["patched_replays"] == 0
+        assert stats["exact_replays"] == 8
         assert stats["recaptures"] == 0
         assert stats["last_path"] == "cuda_exact_replay"
         assert stats["last_fallback_reason"] == "none"
@@ -431,7 +435,7 @@ def test_graph_automatically_normalizes_packed_dense_field():
     builder = ti.graph.GraphBuilder()
     builder.dispatch(update, symbolic)
     graph = builder.compile()
-    graph.execution_stats()
+    _ = graph._graph_stats
 
     values = ti.Vector.field(3, ti.f32, shape=8)
     values.fill(4.0)
@@ -509,7 +513,7 @@ def test_cuda_graph_borrowed_field_rejects_retired_generation_and_recaptures():
     builder.dispatch(touch, symbolic)
     builder.dispatch(touch, symbolic)
     graph = builder.compile()
-    graph.execution_stats()
+    _ = graph._graph_stats
 
     old_values = ti.field(ti.f32)
     old_builder = ti.FieldsBuilder()
