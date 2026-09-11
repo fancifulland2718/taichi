@@ -116,6 +116,18 @@ struct VulkanBufferCommand {
 };
 
 class Program;
+// Cold-qualified immutable ray bindings. Python/Graph owns the original array
+// wrappers; submission still acquires the existing generation-qualified leases.
+struct VulkanRayQueryCommand {
+  Program *owner{nullptr};
+  std::uint64_t scene_handle{0};
+  bool instance_tlas{false};
+  std::size_t ray_count{0};
+  std::vector<const Ndarray *> arrays;
+  DeviceAllocation rays{kDeviceNullAllocation};
+  DeviceAllocation hits{kDeviceNullAllocation};
+  DeviceAllocation hit_indices{kDeviceNullAllocation};
+};
 class CudaFftPlan;
 class VulkanFftPlan;
 class VulkanParallelSortPlan;
@@ -1260,7 +1272,18 @@ class TI_DLL_EXPORT Program {
   std::size_t vulkan_triangle_ray_query(std::uint64_t handle,
                                         Ndarray *rays,
                                         Ndarray *hits,
-                                        std::size_t ray_count);
+                                        std::size_t ray_count,
+                                        Ndarray *hit_indices = nullptr);
+
+  void prepare_vulkan_typed_ray_query(std::uint64_t handle, bool instance_tlas);
+
+  VulkanRayQueryCommand prepare_vulkan_ray_query(std::uint64_t handle,
+                                                 bool instance_tlas,
+                                                 Ndarray *rays,
+                                                 Ndarray *hits,
+                                                 std::size_t ray_count,
+                                                 Ndarray *hit_indices);
+  std::size_t execute_vulkan_ray_query(const VulkanRayQueryCommand &command);
 
   std::size_t vulkan_triangle_ray_refit(std::uint64_t handle,
                                         Ndarray *vertices,
@@ -1296,7 +1319,8 @@ class TI_DLL_EXPORT Program {
   std::size_t vulkan_instance_tlas_query(std::uint64_t handle,
                                          Ndarray *rays,
                                          Ndarray *hits,
-                                         std::size_t ray_count);
+                                         std::size_t ray_count,
+                                         Ndarray *hit_indices = nullptr);
 
   VulkanTriangleRaySceneMemoryStatistics
   vulkan_ray_resource_memory_statistics(std::uint64_t handle);

@@ -1,6 +1,7 @@
 """Explicit Vulkan acceleration-structure and batch ray-query provider."""
 
 from dataclasses import dataclass
+from functools import partial
 import math
 
 from taichi_forge._lib import core as _ti_core
@@ -17,12 +18,14 @@ from taichi_forge.hardware._native_adapter import (
     static_resource_effect,
     validate_exact_bindings,
     validate_runtime_generation,
+    graph_bindings_are_validated,
 )
 from taichi_forge.hardware._runtime import active_backend
 from taichi_forge.lang import impl
 from taichi_forge.lang._ndarray import Ndarray
 from taichi_forge.lang.exception import TaichiRuntimeError
-from taichi_forge.types.primitive_types import f32, i32
+from taichi_forge.types.primitive_types import f32, i32, u32
+
 
 def _item_count(value, width, dtype, name):
     if not isinstance(value, Ndarray):
@@ -45,15 +48,21 @@ def _item_count(value, width, dtype, name):
     return count
 
 
+@dataclass(frozen=True)
+class _PreparedRayQuery:
+    command: object
+    # Keep the native ndarray wrappers themselves, not just mutable Python shells.
+    owners: tuple
+
+
 @instrument_hardware_recording("ray.query.batch.vulkan")
 class VulkanRayQueryRecording(BackendCommandRecording):
     """One batch query against a fixed scene or TLAS generation."""
 
-    def __init__(self, scene, ray_count, *, rays="rays", hits="hits"):
+    def __init__(self, scene, ray_count, *, rays="rays", hits="hits", hit_indices=None):
         if not isinstance(scene, (TriangleScene, InstanceTLAS)):
             raise TypeError(
-                "Vulkan ray query recording requires a TriangleScene or "
-                "InstanceTLAS"
+                "Vulkan ray query recording requires a TriangleScene or " "InstanceTLAS"
             )
         if (
             isinstance(ray_count, bool)
@@ -62,13 +71,14 @@ class VulkanRayQueryRecording(BackendCommandRecording):
             or ray_count > 0xFFFFFFFF
         ):
             raise ValueError("Vulkan ray query count must be in [1, UINT32_MAX]")
-        if any(not isinstance(name, str) or not name for name in (rays, hits)):
+        names = (rays, hits) if hit_indices is None else (rays, hits, hit_indices)
+        if any(not isinstance(name, str) or not name for name in names):
             raise ValueError("Vulkan ray query binding names must be nonempty strings")
-        if rays == hits:
+        if len(set(names)) != len(names):
             raise ValueError("Vulkan ray query binding names must be unique")
         super().__init__(
             backend="vulkan",
-            binding_names=(rays, hits),
+            binding_names=names,
             command_count=1,
             queue="compute",
             stream_binding="runtime_ordered",
@@ -81,18 +91,59 @@ class VulkanRayQueryRecording(BackendCommandRecording):
         object.__setattr__(self, "ray_count", ray_count)
         object.__setattr__(self, "rays", rays)
         object.__setattr__(self, "hits", hits)
+        object.__setattr__(self, "hit_indices", hit_indices)
+        if hit_indices is not None:
+            scene._validate_lifetime()
+            scene._runtime_prog._prepare_vulkan_typed_ray_query(
+                scene._handle, isinstance(scene, InstanceTLAS)
+            )
 
     @property
     def resource_effects(self):
-        return (
+        effects = (
             ResourceEffect(self.rays, GraphAccess.READ),
             ResourceEffect(self.hits, GraphAccess.WRITE),
             static_resource_effect(self.scene._effect_name, GraphAccess.READ),
         )
+        if self.hit_indices is not None:
+            effects += (ResourceEffect(self.hit_indices, GraphAccess.WRITE),)
+        return effects
 
     def execute(self, bindings):
-        validate_exact_bindings(self, bindings, "Vulkan ray query")
+        if isinstance(bindings, _PreparedRayQuery):
+            with hardware_failure_phase("provider_execution_failure"):
+                return self.scene._runtime_prog._execute_vulkan_ray_query(
+                    bindings.command
+                )
+        if not graph_bindings_are_validated(bindings):
+            validate_exact_bindings(self, bindings, "Vulkan ray query")
+            self.validate_graph_bindings(bindings)
         self.validate_graph_lifetime()
+        with hardware_failure_phase("provider_execution_failure"):
+            self.scene._execute_query(
+                bindings[self.rays],
+                bindings[self.hits],
+                self.ray_count,
+                None if self.hit_indices is None else bindings[self.hit_indices],
+            )
+
+    def prepare_graph_execute(self, bindings):
+        """Prepare fixed native bindings without tracing rays or synchronizing."""
+        validate_exact_bindings(self, bindings, "Vulkan ray query")
+        self.validate_graph_bindings(bindings)
+        self.validate_graph_lifetime()
+        owners = tuple(bindings[name].arr for name in self.binding_names)
+        command = self.scene._runtime_prog._prepare_vulkan_ray_query(
+            self.scene._handle,
+            isinstance(self.scene, InstanceTLAS),
+            owners[0],
+            owners[1],
+            self.ray_count,
+            None if self.hit_indices is None else owners[2],
+        )
+        return partial(self.execute, _PreparedRayQuery(command, owners))
+
+    def validate_graph_bindings(self, bindings):
         rays = bindings[self.rays]
         hits = bindings[self.hits]
         if _item_count(rays, 8, f32, self.rays) != self.ray_count:
@@ -103,8 +154,17 @@ class VulkanRayQueryRecording(BackendCommandRecording):
             raise TaichiRuntimeError(
                 f"Vulkan ray binding {self.hits!r} has the wrong ray count"
             )
-        with hardware_failure_phase("provider_execution_failure"):
-            self.scene._execute_query(rays, hits, self.ray_count)
+        if self.hit_indices is not None:
+            indices = bindings[self.hit_indices]
+            dtype = getattr(indices, "dtype", None)
+            if dtype not in (i32, u32):
+                raise TaichiRuntimeError(
+                    "Vulkan ray hit_indices must use dtype i32 or u32"
+                )
+            if _item_count(indices, 4, dtype, self.hit_indices) != self.ray_count:
+                raise TaichiRuntimeError(
+                    "Vulkan ray hit_indices has the wrong ray count"
+                )
 
     def validate_graph_lifetime(self):
         self.scene._validate_lifetime()
@@ -120,7 +180,11 @@ class VulkanRayQueryRecording(BackendCommandRecording):
                 "kind": "vulkan_triangle_ray_query",
                 "ray_count": item.ray_count,
                 "scene_kind": item.scene._scene_kind,
+                "hit_layout": (
+                    "typed" if item.hit_indices is not None else "legacy_float4"
+                ),
             },
+            publish_time_binding_validation_stable=True,
         )
 
 
@@ -132,9 +196,7 @@ class VulkanRayRefitRecording(BackendCommandRecording):
         if not isinstance(scene, TriangleScene):
             raise TypeError("Vulkan ray refit recording requires a TriangleScene")
         if not isinstance(vertices, str) or not vertices:
-            raise ValueError(
-                "Vulkan ray refit binding name must be a nonempty string"
-            )
+            raise ValueError("Vulkan ray refit binding name must be a nonempty string")
         super().__init__(
             backend="vulkan",
             binding_names=(vertices,),
@@ -185,7 +247,39 @@ class VulkanRayRefitRecording(BackendCommandRecording):
         )
 
 
-class TriangleScene:
+class _TypedRayScene:
+    # Every native scene operation resolves a live handle under the Program's
+    # submission gate. A second Python lifetime check cannot extend that lease.
+    graph_runtime_lifetime_check_required = False
+
+    def record_typed(
+        self, ray_count, *, rays="rays", hits="hits", hit_indices="hit_indices"
+    ):
+        """Record typed triangle hits without an intermediate conversion kernel.
+
+        ``hits`` is f32 ``(N, 4)``: (t, u, v, reserved=0).
+        ``hit_indices`` is i32/u32 ``(N, 4)``: (primitive, instance, custom, hit).
+        Instance is the zero-based TLAS ordinal, not the application custom ID.
+        Misses write (-1, 0, 0, 0) and (-1, -1, -1, 0), respectively;
+        u32 uses UINT32_MAX for absent indices. u32 preserves the full unsigned
+        index range; i32 interprets those same 32 bits as signed integers.
+        Vector-4 AOS arrays are also supported. ``t`` is the ray parameter;
+        it is a metric distance only for a unit direction. Triangle weights are
+        (1-u-v, u, v). The legacy :meth:`record` output is unchanged.
+        """
+        self._validate_lifetime()
+        return VulkanRayQueryRecording(
+            self, ray_count, rays=rays, hits=hits, hit_indices=hit_indices
+        )
+
+    def trace_typed(self, rays, hits, hit_indices):
+        """Execute :meth:`record_typed` into caller-owned device arrays."""
+        recording = self.record_typed(_item_count(rays, 8, f32, "rays"))
+        recording.execute({"rays": rays, "hits": hits, "hit_indices": hit_indices})
+        return hits, hit_indices
+
+
+class TriangleScene(_TypedRayScene):
     """One updatable triangle BLAS and one identity-instance TLAS.
 
     ``vertices`` and ``indices`` accept scalar ``(N, 3)`` ndarrays or AOS
@@ -260,10 +354,14 @@ class TriangleScene:
         recording.execute({"vertices": vertices})
         return self
 
-    def _execute_query(self, rays, hits, ray_count):
+    def _execute_query(self, rays, hits, ray_count, hit_indices=None):
         self._validate_lifetime()
         self._runtime_prog._vulkan_triangle_ray_query(
-            self._handle, rays.arr, hits.arr, ray_count
+            self._handle,
+            rays.arr,
+            hits.arr,
+            ray_count,
+            None if hit_indices is None else hit_indices.arr,
         )
 
     def _execute_refit(self, vertices):
@@ -796,7 +894,7 @@ class _KernelAccelerationStructureDescriptor:
             )
 
 
-class InstanceTLAS:
+class InstanceTLAS(_TypedRayScene):
     """Independent Vulkan TLAS with fixed BLAS topology and mutable metadata."""
 
     def __init__(self, instances):
@@ -930,10 +1028,14 @@ class InstanceTLAS:
             bool(update),
         )
 
-    def _execute_query(self, rays, hits, ray_count):
+    def _execute_query(self, rays, hits, ray_count, hit_indices=None):
         self._validate_lifetime()
         self._runtime_prog._vulkan_instance_tlas_query(
-            self._handle, rays.arr, hits.arr, ray_count
+            self._handle,
+            rays.arr,
+            hits.arr,
+            ray_count,
+            None if hit_indices is None else hit_indices.arr,
         )
 
     def _validate_lifetime(self):

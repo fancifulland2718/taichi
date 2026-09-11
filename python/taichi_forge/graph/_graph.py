@@ -4970,6 +4970,7 @@ class _GraphRunContext:
         self._last_arg_signature = None
         self._last_flattened = None
         self._trace_recorder = None
+        self._native_actions = None
 
     def begin(
         self,
@@ -4978,6 +4979,7 @@ class _GraphRunContext:
         trace_recorder=None,
         *,
         flattened_args=None,
+        native_actions=None,
     ):
         if flattened_args is not None and fixed_args:
             raise TaichiRuntimeError(
@@ -4997,6 +4999,7 @@ class _GraphRunContext:
             self._args = args
         self._flattened_args = flattened_args
         self._trace_recorder = trace_recorder
+        self._native_actions = native_actions
 
     def end(self):
         # Runtime resource completion is owned by the native Program registry.
@@ -5006,6 +5009,7 @@ class _GraphRunContext:
         self._args = None
         self._flattened_args = None
         self._trace_recorder = None
+        self._native_actions = None
 
     def begin_control_trace(self, node):
         recorder = self._trace_recorder
@@ -5452,6 +5456,9 @@ class _CompiledNativeGraphNode:
 
     def run(self, context, temporaries=None):
         if isinstance(self.recordable_action, BackendCommandGraphAction):
+            prepared = context._native_actions
+            if prepared is not None and self in prepared:
+                return prepared[self]()
             all_args = context.runtime_args()
             names = self.recordable_action.backend_command_recording.binding_names
             bindings = {name: all_args[name] for name in names}
@@ -10206,6 +10213,7 @@ class _PreparedGraphInvocation:
     submission_owners: tuple
     flattened_args: object = None
     binding_version: object = None
+    native_actions: object = None
 
 
 @dataclass(frozen=True)
@@ -10284,6 +10292,7 @@ class _GraphBindingVersion:
     fast_path_qualified: bool
     volatile_reasons: tuple
     execution_frame: object = None
+    native_actions: object = None
 
 
 @dataclass(frozen=True)
@@ -11048,6 +11057,19 @@ class _GraphSpec:
         self.observation_count = sum(
             isinstance(n, _CompiledObservationGraphNode) for n in self.nodes
         )
+        self._native_preparers = tuple(
+            (n, n.recordable_action.backend_command_recording)
+            for n in self.nodes
+            if isinstance(n, _CompiledNativeGraphNode)
+            and isinstance(n.recordable_action, BackendCommandGraphAction)
+            and callable(
+                getattr(
+                    n.recordable_action.backend_command_recording,
+                    "prepare_graph_execute",
+                    None,
+                )
+            )
+        )
         self.temporary_actions = _merge_temporary_actions(self.nodes)
         self._temporary_binding_cache = {}
         # Mutable compatibility dictionaries still need a fresh owner check on
@@ -11688,6 +11710,9 @@ class _GraphSpec:
             ),
             fast_path_qualified=not blockers,
             volatile_reasons=tuple(blockers),
+            native_actions=(
+                self._prepare_native_actions(validation_args) if not blockers else None
+            ),
         )
 
     def prepare_invocation(
@@ -11712,6 +11737,7 @@ class _GraphSpec:
                 (binding_version,),
                 binding_version.flattened_args,
                 binding_version,
+                binding_version.native_actions,
             )
 
         if binding_version is None:
@@ -11731,6 +11757,7 @@ class _GraphSpec:
             (*prepared.submission_owners, binding_version),
             None,
             binding_version,
+            prepared.native_actions,
         )
 
     def binding_statistics(self):
@@ -11843,7 +11870,32 @@ class _GraphSpec:
                         f"{name!r}"
                     )
                 bound[name] = value
-        return _PreparedGraphInvocation(bound, tuple(submission_owners))
+        return _PreparedGraphInvocation(
+            bound,
+            tuple(submission_owners),
+            native_actions=(
+                self._prepare_native_actions(bound) if self._native_preparers else None
+            ),
+        )
+
+    def _prepare_native_actions(self, arguments):
+        """Bind optional root command packets once per immutable binding frame.
+
+        Preparation must not submit work. The packet retains its precise bindings;
+        runtime owners still retire/invalidate through their existing native gates.
+        Structured nodes and providers without this hook retain their current route.
+        """
+        if not self._native_preparers:
+            return None
+        prepared = {}
+        for node, recording in self._native_preparers:
+            execute = recording.prepare_graph_execute(
+                {name: arguments[name] for name in recording.binding_names}
+            )
+            if not callable(execute):
+                raise TypeError("Prepared native Graph action must be callable")
+            prepared[node] = execute
+        return MappingProxyType(prepared) if prepared else None
 
     def bind_runtime_args(self, args, temporaries=None, fixed_runtime_args=None):
         return self.prepare_runtime_args(
@@ -12608,6 +12660,7 @@ class _GraphExecutable:
                 None,
                 trace_recorder,
                 flattened_args=prepared.flattened_args,
+                native_actions=prepared.native_actions,
             )
         try:
             for node in self.spec.nodes:
@@ -12625,6 +12678,7 @@ class _GraphExecutable:
             context.begin(
                 prepared.arguments,
                 flattened_args=prepared.flattened_args,
+                native_actions=prepared.native_actions,
             )
         try:
             for (
@@ -12781,6 +12835,7 @@ class _GraphInstance:
         context.begin(
             prepared.arguments,
             flattened_args=prepared.flattened_args,
+            native_actions=prepared.native_actions,
         )
         try:
             self._backend_executable.run_cuda_concurrent_batch(context)
@@ -12952,6 +13007,7 @@ class _GraphInstance:
             context.begin(
                 prepared.arguments,
                 flattened_args=prepared.flattened_args,
+                native_actions=prepared.native_actions,
             )
         try:
             self._backend_executable.run(context, temporaries)

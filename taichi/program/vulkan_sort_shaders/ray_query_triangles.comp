@@ -18,6 +18,12 @@ layout(std430, set = 0, binding = 2) writeonly buffer HitBuffer {
   vec4 hits[];
 };
 
+#ifdef TYPED_HITS
+layout(std430, set = 0, binding = 3) writeonly buffer HitIndexBuffer {
+  ivec4 hit_indices[];
+};
+#endif
+
 layout(push_constant) uniform Parameters {
   uint ray_count;
 } parameters;
@@ -38,11 +44,25 @@ void main() {
 
   if (rayQueryGetIntersectionTypeEXT(query, true) ==
       gl_RayQueryCommittedIntersectionTriangleEXT) {
+#ifdef TYPED_HITS
+    vec2 uv = rayQueryGetIntersectionBarycentricsEXT(query, true);
+    hits[ray_index] = vec4(rayQueryGetIntersectionTEXT(query, true), uv, 0.0);
+    hit_indices[ray_index] = ivec4(
+        rayQueryGetIntersectionPrimitiveIndexEXT(query, true),
+        rayQueryGetIntersectionInstanceIdEXT(query, true),
+        rayQueryGetIntersectionInstanceCustomIndexEXT(query, true), 1);
+#else
     hits[ray_index] = vec4(
         rayQueryGetIntersectionTEXT(query, true),
         float(rayQueryGetIntersectionPrimitiveIndexEXT(query, true)),
         float(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true)), 1.0);
+#endif
   } else {
+#ifdef TYPED_HITS
+    hits[ray_index] = vec4(-1.0, 0.0, 0.0, 0.0);
+    hit_indices[ray_index] = ivec4(-1, -1, -1, 0);
+#else
     hits[ray_index] = vec4(-1.0, -1.0, -1.0, 0.0);
+#endif
   }
 }

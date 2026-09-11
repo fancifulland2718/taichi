@@ -421,16 +421,40 @@ with ti.hardware.ray.TriangleScene(vertices, indices) as scene:
 Vertices are f32 and indices are i32, using scalar `(N, 3)` or AOS vector-3
 layout. Rays are f32 `(N, 8)` values
 `[ox, oy, oz, tmin, dx, dy, dz, tmax]`; hits are f32 `(N, 4)` values
-`[t, primitive_id, instance_id, hit_flag]`, with misses encoded as
+`[t, primitive_id, instance_custom_index, hit_flag]`, with misses encoded as
 `[-1, -1, -1, 0]`. Input indices must be nonnegative and in range; the provider
 does not read them back to validate mesh topology.
+
+For integer IDs and triangle barycentrics, both `TriangleScene` and `InstanceTLAS`
+provide `trace_typed(rays, hits, hit_indices)` and `record_typed(ray_count)`.
+The caller supplies distinct device arrays: f32 `hits` `(N, 4)` contains
+`[t, u, v, 0]`, and i32/u32 `hit_indices` `(N, 4)` contains
+`[primitive_index, instance_index, instance_custom_index, hit_flag]`.
+AOS vector-4 arrays are also accepted. `instance_index` is the zero-based TLAS
+ordinal, not the caller's custom index; the single-instance wrapper uses zero
+for both. Triangle vertex weights are `[1-u-v, u, v]`; `t` is a ray parameter,
+not a metric distance unless the direction is normalized. Misses write
+`[-1, 0, 0, 0]` and `[-1, -1, -1, 0]` respectively.
+Use u32 for the full unsigned index range (absent indices are `UINT32_MAX`);
+i32 interprets the same bits as signed integers.
+Typed output is written directly by the ray shader. It uses 16 additional
+caller-owned bytes per ray and no intermediate conversion buffer.
+Append `scene.record_typed(count)` as a root native Graph node and bind
+`rays`, `hits`, and `hit_indices`; subsequent kernels can consume both outputs.
+This remains runtime-ordered native rerecording, not Vulkan command-buffer
+replay. Legacy `trace` / `record` retain their float4 output contract.
+`graph.bind(...)` prepares immutable native packets without tracing rays.
+Reusing that binding does not revalidate shapes, dtypes, or non-aliasing;
+`binding.update(...)` prepares a replacement. Provider close/reset and in-flight
+resource retention remain enforced by the native owner.
 
 The provider requires Vulkan 1.2 plus buffer-device-address,
 `VK_KHR_acceleration_structure`, and `VK_KHR_ray_query`. Its SPIR-V shader is
 embedded at build time, so it adds no Vulkan SDK runtime dependency and no
-official wheel variant. It is not callable inside `@ti.kernel` and never
-replaces ordinary kernels or collision detection. Topology-changing BLAS/TLAS
-changes, procedural geometry, and inline kernel query remain unsupported.
+official wheel variant. These batch methods are not callable inside
+`@ti.kernel`; inline queries instead use `ti.ray_query` with `InstanceTLAS`.
+Neither route replaces ordinary kernels or collision detection automatically.
+Topology-changing updates and procedural geometry remain outside this contract.
 
 ### `ti.hardware.fft.CufftPlan1D` / `CufftPlanND` (0.6.3 in development)
 

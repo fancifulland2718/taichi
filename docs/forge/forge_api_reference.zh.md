@@ -354,15 +354,33 @@ with ti.hardware.ray.TriangleScene(vertices, indices) as scene:
 
 vertex 为 f32、index 为 i32，可使用 scalar `(N, 3)` 或 AOS vector-3 layout。
 ray 为 f32 `(N, 8)`：`[ox, oy, oz, tmin, dx, dy, dz, tmax]`；hit 为 f32
-`(N, 4)`：`[t, primitive_id, instance_id, hit_flag]`，miss 编码为
+`(N, 4)`：`[t, primitive_id, instance_custom_index, hit_flag]`，miss 编码为
 `[-1, -1, -1, 0]`。index 必须非负且在 vertex 范围内；provider 不会为验证 mesh
 topology 而把 index 回读到 host。
 
+`TriangleScene` 和 `InstanceTLAS` 另提供 `trace_typed(rays, hits, hit_indices)`
+与 `record_typed(ray_count)`。调用者提供互不重叠的 device 数组：f32 `hits`
+`(N, 4)` 写入 `[t, u, v, 0]`，i32/u32 `hit_indices` `(N, 4)` 写入
+`[primitive_index, instance_index, instance_custom_index, hit_flag]`；也接受
+AOS vector-4 数组。`instance_index` 是从零开始的 TLAS 实例序号，不是调用者的
+custom index；单实例 wrapper 的两者均为零。三角形顶点权重为 `[1-u-v, u, v]`；
+`t` 是射线参数，方向归一化时才等于距离。miss 分别写入 `[-1, 0, 0, 0]` 和
+`[-1, -1, -1, 0]`。完整无符号索引范围使用 u32（缺失索引为 `UINT32_MAX`）；i32 将
+相同的位模式解释为有符号整数。typed 输出由 ray shader 直接产生，每条射线增加 16 字节调用者
+输出存储，不分配中间转换缓冲。`scene.record_typed(count)` 可作为 root native
+Graph 节点，绑定 `rays`、`hits`、`hit_indices` 后由后续 kernel 直接消费。
+这仍是 runtime-ordered native rerecording，不是 Vulkan command-buffer replay。
+原有 `trace` / `record` 的 float4 合同不变。
+`graph.bind(...)` 准备不可变 native packet，不执行射线查询；复用该绑定不重复验证
+shape、dtype 或 non-aliasing，`binding.update(...)` 则准备替代 packet。
+provider 的 close/reset 和在途资源保留仍由 native owner 管理。
+
 该 provider 要求 Vulkan 1.2、buffer device address、
 `VK_KHR_acceleration_structure` 与 `VK_KHR_ray_query`。其 SPIR-V shader 在构建时
-嵌入 runtime，因此不新增 Vulkan SDK runtime 依赖或官方 wheel 变体。它不能在
-`@ti.kernel` 内调用，不会替换普通 kernel 或 collision detection。改变 BLAS/TLAS
-topology、procedural geometry 与 kernel-inline query 仍不支持。
+嵌入 runtime，因此不新增 Vulkan SDK runtime 依赖或官方 wheel 变体。这些 batch 方法
+不能在 `@ti.kernel` 内调用；inline 查询使用 `ti.ray_query` 与 `InstanceTLAS`。
+两条路径均不会自动替换普通 kernel 或 collision detection。改变 topology 的更新与
+procedural geometry 不属于此合同。
 
 ### `ti.hardware.fft.CufftPlan1D` / `CufftPlanND`（0.6.3 开发中）
 

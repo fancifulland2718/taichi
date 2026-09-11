@@ -283,6 +283,14 @@ class BackendCommandRecording:
     records the complete command sequence.  The Graph runtime invokes it once
     per action; a Python loop over individual driver or RHI commands is not an
     admissible implementation.
+
+    A recording may implement ``prepare_graph_execute(bindings)`` to return a
+    zero-argument callable for one exact root-Graph binding frame. Preparation
+    must not submit work, synchronize, or mutate application data. The callable
+    owns its native binding wrappers and must retain the provider's existing
+    generation/lifetime enforcement. Qualified BindingVersions reuse it;
+    changing a binding creates a new packet. This is not device command-buffer
+    replay and does not change ``replay_mode``.
     """
 
     backend: str

@@ -555,6 +555,8 @@ if (TI_WITH_VULKAN)
     # a build-only tool and never becomes a wheel/runtime dependency.
     ti_vulkan_builtin_shader(ray_query_triangles.comp
         ray_query_triangles.comp.spv.h vulkan1.2)
+    ti_vulkan_builtin_shader(ray_query_triangles.comp
+        ray_query_triangles_typed.comp.spv.h vulkan1.2 "-DTYPED_HITS")
 
     foreach(shift 0 4 8 12 16 20 24 28)
         ti_vulkan_sort_shader(rank_hist.comp

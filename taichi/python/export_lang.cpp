@@ -1296,6 +1296,8 @@ void export_lang(py::module &m) {
       .def_readwrite("mask", &VulkanRayInstanceInfo::mask)
       .def_readwrite("custom_index", &VulkanRayInstanceInfo::custom_index);
 
+  py::class_<VulkanRayQueryCommand>(m, "_VulkanRayQueryCommand");
+
   py::class_<Program>(m, "Program")
       .def(py::init<>())
       .def("config", &Program::compile_config,
@@ -3135,7 +3137,19 @@ void export_lang(py::module &m) {
            tracked_native_program_method(
                &Program::vulkan_triangle_ray_query),
            py::arg("handle"), py::arg("rays"), py::arg("hits"),
-           py::arg("ray_count"), py::call_guard<py::gil_scoped_release>())
+           py::arg("ray_count"), py::arg("hit_indices") = nullptr,
+           py::call_guard<py::gil_scoped_release>())
+      .def("_prepare_vulkan_typed_ray_query",
+           &Program::prepare_vulkan_typed_ray_query,
+           py::arg("handle"), py::arg("instance_tlas"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("_prepare_vulkan_ray_query", &Program::prepare_vulkan_ray_query,
+           py::arg("handle"), py::arg("instance_tlas"), py::arg("rays"),
+           py::arg("hits"), py::arg("ray_count"), py::arg("hit_indices") = nullptr,
+           py::call_guard<py::gil_scoped_release>())
+      .def("_execute_vulkan_ray_query",
+           tracked_native_program_method(&Program::execute_vulkan_ray_query),
+           py::call_guard<py::gil_scoped_release>())
       .def("_vulkan_triangle_ray_refit",
            tracked_native_program_method(
                &Program::vulkan_triangle_ray_refit),
@@ -3185,7 +3199,8 @@ void export_lang(py::module &m) {
       .def("_vulkan_instance_tlas_query",
            tracked_native_program_method(&Program::vulkan_instance_tlas_query),
            py::arg("handle"), py::arg("rays"), py::arg("hits"),
-           py::arg("ray_count"), py::call_guard<py::gil_scoped_release>())
+           py::arg("ray_count"), py::arg("hit_indices") = nullptr,
+           py::call_guard<py::gil_scoped_release>())
       .def("_vulkan_ray_resource_memory_stats",
            [](Program &program, std::uint64_t handle) {
              const auto stats =

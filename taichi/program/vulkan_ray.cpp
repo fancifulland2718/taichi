@@ -20,6 +20,22 @@ static const std::uint32_t kRayQueryTrianglesSpv[] =
 #include "taichi/program/vulkan_sort_shaders/ray_query_triangles.comp.spv.h"
     ;
 
+static const std::uint32_t kRayQueryTrianglesTypedSpv[] =
+#include "taichi/program/vulkan_sort_shaders/ray_query_triangles_typed.comp.spv.h"
+    ;
+
+std::unique_ptr<Pipeline> create_typed_query_pipeline(
+    vulkan::VulkanDevice *device) {
+  PipelineSourceDesc source{
+      PipelineSourceType::spirv_binary, kRayQueryTrianglesTypedSpv,
+      sizeof(kRayQueryTrianglesTypedSpv), PipelineStageType::compute};
+  auto [pipeline, result] = device->create_pipeline_unique(
+      source, "vulkan_ray_query_triangles_typed");
+  TI_ERROR_IF(result != RhiResult::success || !pipeline,
+              "Failed to create typed Vulkan ray query pipeline: {}.", result);
+  return std::move(pipeline);
+}
+
 template <typename Function>
 Function load_vulkan_device_function(VkDevice device, const char *name) {
   auto function = reinterpret_cast<Function>(vkGetDeviceProcAddr(device, name));
@@ -112,6 +128,8 @@ class VulkanTriangleRayScene {
   }
 
   ~VulkanTriangleRayScene() {
+    typed_query_bindings_.reset();
+    typed_query_pipeline_.reset();
     query_bindings_.reset();
     query_pipeline_.reset();
     tlas_.reset();
@@ -258,28 +276,41 @@ class VulkanTriangleRayScene {
     return vertex_count_;
   }
 
+  void prepare_typed_query() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!typed_query_pipeline_) {
+      auto pipeline = create_typed_query_pipeline(device_);
+      std::unique_ptr<ShaderResourceSet> bindings(
+          device_->create_resource_set());
+      typed_query_pipeline_ = std::move(pipeline);
+      typed_query_bindings_ = std::move(bindings);
+    }
+  }
+
   void record_query(CommandList *command_list,
                     DeviceAllocation rays,
                     DeviceAllocation hits,
-                    std::size_t ray_count) {
+                    std::size_t ray_count,
+                    DeviceAllocation hit_indices) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto *vk_commands = static_cast<vulkan::VulkanCommandList *>(command_list);
-    TI_ERROR_IF(ray_count == 0 ||
-                    ray_count > static_cast<std::size_t>(
-                                    (std::numeric_limits<std::uint32_t>::max)()),
-                "Vulkan ray query count must be in [1, UINT32_MAX].");
-    const std::size_t ray_bytes =
-        checked_mul(ray_count, 8 * sizeof(float), "query input");
-    const std::size_t hit_bytes =
-        checked_mul(ray_count, 4 * sizeof(float), "query output");
+    // Count and byte extents were certified while preparing the immutable
+    // packet.
+    const std::size_t ray_bytes = ray_count * 8 * sizeof(float);
+    const std::size_t hit_bytes = ray_count * 4 * sizeof(float);
 
     command_list->buffer_barrier(rays);
-    auto *bindings =
-        static_cast<vulkan::VulkanResourceSet *>(query_bindings_.get());
+    const bool typed = hit_indices != kDeviceNullAllocation;
+    auto *bindings = static_cast<vulkan::VulkanResourceSet *>(
+        typed ? typed_query_bindings_.get() : query_bindings_.get());
     bindings->acceleration_structure(0, tlas_);
     bindings->rw_buffer(1, rays.get_ptr(), ray_bytes);
     bindings->rw_buffer(2, hits.get_ptr(), hit_bytes);
-    command_list->bind_pipeline(query_pipeline_.get());
+    if (typed) {
+      bindings->rw_buffer(3, hit_indices.get_ptr(), hit_bytes);
+    }
+    command_list->bind_pipeline(typed ? typed_query_pipeline_.get()
+                                      : query_pipeline_.get());
     const auto bind_result = command_list->bind_shader_resources(bindings, 0);
     TI_ERROR_IF(bind_result != RhiResult::success,
                 "Failed to bind Vulkan ray query resources: RhiResult({}).",
@@ -293,6 +324,9 @@ class VulkanTriangleRayScene {
                 "Failed to dispatch Vulkan ray query: RhiResult({}).",
                 dispatch_result);
     command_list->buffer_barrier(hits);
+    if (typed) {
+      command_list->buffer_barrier(hit_indices);
+    }
   }
 
  private:
@@ -537,6 +571,8 @@ class VulkanTriangleRayScene {
   vkapi::IVkAccelerationStructureKHR blas_{nullptr};
   vkapi::IVkAccelerationStructureKHR tlas_{nullptr};
   std::unique_ptr<Pipeline> query_pipeline_;
+  std::unique_ptr<Pipeline> typed_query_pipeline_;
+  std::unique_ptr<ShaderResourceSet> typed_query_bindings_;
   std::unique_ptr<ShaderResourceSet> query_bindings_;
   PFN_vkGetAccelerationStructureBuildSizesKHR get_build_sizes_{nullptr};
   PFN_vkGetAccelerationStructureDeviceAddressKHR get_as_address_{nullptr};
@@ -910,6 +946,8 @@ class VulkanInstanceTlasResource final : public VulkanRayResource {
   }
 
   ~VulkanInstanceTlasResource() override {
+    typed_query_bindings_.reset();
+    typed_query_pipeline_.reset();
     query_bindings_.reset();
     query_pipeline_.reset();
     tlas_.reset();
@@ -1030,28 +1068,40 @@ class VulkanInstanceTlasResource final : public VulkanRayResource {
     retain(command_buffer);
   }
 
+  void prepare_typed_query() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!typed_query_pipeline_) {
+      auto pipeline = create_typed_query_pipeline(device_);
+      std::unique_ptr<ShaderResourceSet> bindings(
+          device_->create_resource_set());
+      typed_query_pipeline_ = std::move(pipeline);
+      typed_query_bindings_ = std::move(bindings);
+    }
+  }
+
   void record_query(CommandList *command_list,
                     DeviceAllocation rays,
                     DeviceAllocation hits,
-                    std::size_t ray_count) {
+                    std::size_t ray_count,
+                    DeviceAllocation hit_indices) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto *vk_commands = static_cast<vulkan::VulkanCommandList *>(command_list);
-    TI_ERROR_IF(ray_count == 0 ||
-                    ray_count > static_cast<std::size_t>(
-                                    (std::numeric_limits<
-                                        std::uint32_t>::max)()),
-                "Vulkan ray query count must be in [1, UINT32_MAX].");
-    const std::size_t ray_bytes =
-        checked_mul(ray_count, 8 * sizeof(float), "query input");
-    const std::size_t hit_bytes =
-        checked_mul(ray_count, 4 * sizeof(float), "query output");
+    // Count and byte extents were certified while preparing the immutable
+    // packet.
+    const std::size_t ray_bytes = ray_count * 8 * sizeof(float);
+    const std::size_t hit_bytes = ray_count * 4 * sizeof(float);
     command_list->buffer_barrier(rays);
-    auto *bindings =
-        static_cast<vulkan::VulkanResourceSet *>(query_bindings_.get());
+    const bool typed = hit_indices != kDeviceNullAllocation;
+    auto *bindings = static_cast<vulkan::VulkanResourceSet *>(
+        typed ? typed_query_bindings_.get() : query_bindings_.get());
     bindings->acceleration_structure(0, tlas_);
     bindings->rw_buffer(1, rays.get_ptr(), ray_bytes);
     bindings->rw_buffer(2, hits.get_ptr(), hit_bytes);
-    command_list->bind_pipeline(query_pipeline_.get());
+    if (typed) {
+      bindings->rw_buffer(3, hit_indices.get_ptr(), hit_bytes);
+    }
+    command_list->bind_pipeline(typed ? typed_query_pipeline_.get()
+                                      : query_pipeline_.get());
     const auto bind_result = command_list->bind_shader_resources(bindings, 0);
     TI_ERROR_IF(bind_result != RhiResult::success,
                 "Failed to bind independent Vulkan TLAS query resources: "
@@ -1067,6 +1117,9 @@ class VulkanInstanceTlasResource final : public VulkanRayResource {
                 "RhiResult({}).",
                 dispatch_result);
     command_list->buffer_barrier(hits);
+    if (typed) {
+      command_list->buffer_barrier(hit_indices);
+    }
     retain(vk_commands->vk_command_buffer());
   }
 
@@ -1223,6 +1276,8 @@ class VulkanInstanceTlasResource final : public VulkanRayResource {
   DeviceAllocation scratch_{kDeviceNullAllocation};
   vkapi::IVkAccelerationStructureKHR tlas_{nullptr};
   std::unique_ptr<Pipeline> query_pipeline_;
+  std::unique_ptr<Pipeline> typed_query_pipeline_;
+  std::unique_ptr<ShaderResourceSet> typed_query_bindings_;
   std::unique_ptr<ShaderResourceSet> query_bindings_;
   PFN_vkGetAccelerationStructureBuildSizesKHR get_build_sizes_{nullptr};
   PFN_vkCmdBuildAccelerationStructuresKHR cmd_build_{nullptr};
@@ -1352,19 +1407,40 @@ std::uint64_t Program::create_vulkan_triangle_ray_scene(
   return handle;
 }
 
-std::size_t Program::vulkan_triangle_ray_query(std::uint64_t handle,
-                                               Ndarray *rays,
-                                               Ndarray *hits,
-                                               std::size_t ray_count) {
+void Program::prepare_vulkan_typed_ray_query(std::uint64_t handle,
+                                             bool instance_tlas) {
   auto submission_guard = acquire_runtime_resource_submission_guard();
-  TI_ERROR_IF(!rays || !hits,
-              "Vulkan triangle ray query received a null ndarray.");
-  TI_ERROR_IF(ray_count == 0 ||
-                  ray_count > static_cast<std::size_t>(
-                                  (std::numeric_limits<std::uint32_t>::max)()),
-              "Vulkan ray query count must be in [1, UINT32_MAX].");
-  const auto check_array = [ray_count](const char *name, Ndarray *array,
-                                       std::size_t width) {
+  std::lock_guard<std::mutex> lock(vulkan_ray_scene_mutex_);
+  if (instance_tlas) {
+    const auto found = vulkan_ray_resources_.find(handle);
+    TI_ERROR_IF(found == vulkan_ray_resources_.end(),
+                "Vulkan instance TLAS handle is stale or closed.");
+    auto resource =
+        std::dynamic_pointer_cast<VulkanInstanceTlasResource>(found->second);
+    TI_ERROR_IF(!resource, "Vulkan ray resource is not an instance TLAS.");
+    resource->prepare_typed_query();
+  } else {
+    const auto found = vulkan_ray_scenes_.find(handle);
+    TI_ERROR_IF(found == vulkan_ray_scenes_.end(),
+                "Vulkan triangle ray scene handle is stale or closed.");
+    found->second->prepare_typed_query();
+  }
+}
+
+VulkanRayQueryCommand Program::prepare_vulkan_ray_query(std::uint64_t handle,
+                                                        bool instance_tlas,
+                                                        Ndarray *rays,
+                                                        Ndarray *hits,
+                                                        std::size_t ray_count,
+                                                        Ndarray *hit_indices) {
+  auto submission_guard = acquire_runtime_resource_submission_guard();
+  TI_ERROR_IF(!rays || !hits || ray_count == 0 ||
+                  ray_count > (std::numeric_limits<std::uint32_t>::max)(),
+              "Vulkan ray query requires arrays and count in [1, UINT32_MAX].");
+  auto check_array = [this, ray_count](const char *name, Ndarray *array,
+                                       std::size_t width, DataType dtype) {
+    TI_ERROR_IF(array->owning_program() != this,
+                "Vulkan ray {} must belong to the active runtime.", name);
     const auto element_shape = array->get_element_shape();
     const bool scalar_layout =
         element_shape.empty() &&
@@ -1374,42 +1450,94 @@ std::size_t Program::vulkan_triangle_ray_query(std::uint64_t handle,
         element_shape == std::vector<int>{static_cast<int>(width)} &&
         array->get_nelement() == ray_count &&
         array->get_element_size() == width * sizeof(float);
-    TI_ERROR_IF(array->get_element_data_type() != PrimitiveType::f32 ||
+    TI_ERROR_IF(array->get_element_data_type() != dtype ||
                     (!scalar_layout && !vector_layout),
-                "Vulkan triangle ray {} must be a compact scalar f32 ndarray "
-                "with shape (N, {}) or an AOS vector-{} ndarray with shape "
-                "(N,).",
-                name, width, width);
+                "Vulkan ray {} must use compact {} records of width {}.", name,
+                dtype->to_string(), width);
   };
-  check_array("rays", rays, 8);
-  check_array("hits", hits, 4);
-  TI_ERROR_IF(rays->owning_program() != this || hits->owning_program() != this,
-              "Vulkan triangle ray query arrays must belong to the active "
-              "runtime.");
-  TI_ERROR_IF(rays->get_device_allocation() == hits->get_device_allocation(),
-              "Vulkan triangle ray hits must not alias rays.");
-
-  std::shared_ptr<VulkanTriangleRayScene> scene;
-  {
-    std::lock_guard<std::mutex> lock(vulkan_ray_scene_mutex_);
-    const auto found = vulkan_ray_scenes_.find(handle);
-    TI_ERROR_IF(found == vulkan_ray_scenes_.end(),
-                "Vulkan triangle ray scene handle is stale or closed.");
-    scene = found->second;
+  check_array("rays", rays, 8, PrimitiveType::f32);
+  check_array("hits", hits, 4, PrimitiveType::f32);
+  checked_mul(ray_count, 8 * sizeof(float), "query input bytes");
+  VulkanRayQueryCommand command;
+  command.owner = this;
+  command.scene_handle = handle;
+  command.instance_tlas = instance_tlas;
+  command.ray_count = ray_count;
+  command.arrays = {rays, hits};
+  command.rays = rays->get_device_allocation();
+  command.hits = hits->get_device_allocation();
+  TI_ERROR_IF(command.rays == command.hits,
+              "Vulkan ray hits must not alias rays.");
+  if (hit_indices) {
+    const auto dtype = hit_indices->get_element_data_type();
+    TI_ERROR_IF(dtype != PrimitiveType::i32 && dtype != PrimitiveType::u32,
+                "Vulkan ray hit_indices must use i32 or u32.");
+    check_array("hit_indices", hit_indices, 4, dtype);
+    command.arrays.push_back(hit_indices);
+    command.hit_indices = hit_indices->get_device_allocation();
+    TI_ERROR_IF(command.hit_indices == command.rays ||
+                    command.hit_indices == command.hits,
+                "Vulkan ray hit_indices must not alias rays or hits.");
+    prepare_vulkan_typed_ray_query(handle, instance_tlas);
   }
-  auto leases = acquire_ndarray_leases({rays, hits});
+  // No submission or mathematical work takes place during preparation.
+  return command;
+}
+
+std::size_t Program::execute_vulkan_ray_query(
+    const VulkanRayQueryCommand &command) {
+  auto submission_guard = acquire_runtime_resource_submission_guard();
+  TI_ERROR_IF(command.owner != this,
+              "Vulkan ray query command belongs to another runtime.");
+  auto leases = acquire_ndarray_leases(command.arrays);
+  const auto rays = command.rays;
+  const auto hits = command.hits;
+  const auto indices = command.hit_indices;
+  const auto count = command.ray_count;
+  if (command.instance_tlas) {
+    std::shared_ptr<VulkanInstanceTlasResource> resource;
+    {
+      std::lock_guard<std::mutex> lock(vulkan_ray_scene_mutex_);
+      const auto found = vulkan_ray_resources_.find(command.scene_handle);
+      TI_ERROR_IF(found == vulkan_ray_resources_.end(),
+                  "Vulkan instance TLAS handle is stale or closed.");
+      resource =
+          std::dynamic_pointer_cast<VulkanInstanceTlasResource>(found->second);
+    }
+    TI_ERROR_IF(!resource, "Vulkan ray resource is not an instance TLAS.");
+    enqueue_compute_op_lambda(
+        [resource, rays, hits, count, indices](Device *,
+                                               CommandList *commands) {
+          resource->record_query(commands, rays, hits, count, indices);
+        },
+        {});
+  } else {
+    std::shared_ptr<VulkanTriangleRayScene> scene;
+    {
+      std::lock_guard<std::mutex> lock(vulkan_ray_scene_mutex_);
+      const auto found = vulkan_ray_scenes_.find(command.scene_handle);
+      TI_ERROR_IF(found == vulkan_ray_scenes_.end(),
+                  "Vulkan triangle ray scene handle is stale or closed.");
+      scene = found->second;
+    }
+    enqueue_compute_op_lambda(
+        [scene, rays, hits, count, indices](Device *, CommandList *commands) {
+          scene->record_query(commands, rays, hits, count, indices);
+        },
+        {});
+  }
   pin_ndarray_launch_leases(leases);
-  const auto ray_allocation = rays->get_device_allocation();
-  const auto hit_allocation = hits->get_device_allocation();
-  enqueue_compute_op_lambda(
-      [scene, ray_allocation, hit_allocation, ray_count](Device *,
-                                                         CommandList *commands) {
-        scene->record_query(commands, ray_allocation, hit_allocation,
-                            ray_count);
-      },
-      {});
   mark_runtime_submission_pending();
   return 0;
+}
+
+std::size_t Program::vulkan_triangle_ray_query(std::uint64_t handle,
+                                               Ndarray *rays,
+                                               Ndarray *hits,
+                                               std::size_t ray_count,
+                                               Ndarray *hit_indices) {
+  return execute_vulkan_ray_query(prepare_vulkan_ray_query(
+      handle, false, rays, hits, ray_count, hit_indices));
 }
 
 std::size_t Program::vulkan_triangle_ray_refit(std::uint64_t handle,
@@ -1617,63 +1745,10 @@ std::size_t Program::vulkan_instance_tlas_build(
 std::size_t Program::vulkan_instance_tlas_query(std::uint64_t handle,
                                                 Ndarray *rays,
                                                 Ndarray *hits,
-                                                std::size_t ray_count) {
-  auto submission_guard = acquire_runtime_resource_submission_guard();
-  TI_ERROR_IF(!rays || !hits,
-              "Vulkan instance TLAS query received a null ndarray.");
-  TI_ERROR_IF(ray_count == 0 ||
-                  ray_count > static_cast<std::size_t>(
-                                  (std::numeric_limits<std::uint32_t>::max)()),
-              "Vulkan ray query count must be in [1, UINT32_MAX].");
-  const auto check_array = [ray_count](const char *name, Ndarray *array,
-                                       std::size_t width) {
-    const auto element_shape = array->get_element_shape();
-    const bool scalar_layout =
-        element_shape.empty() &&
-        array->get_nelement() == checked_mul(ray_count, width, name) &&
-        array->get_element_size() == sizeof(float);
-    const bool vector_layout =
-        element_shape == std::vector<int>{static_cast<int>(width)} &&
-        array->get_nelement() == ray_count &&
-        array->get_element_size() == width * sizeof(float);
-    TI_ERROR_IF(array->get_element_data_type() != PrimitiveType::f32 ||
-                    (!scalar_layout && !vector_layout),
-                "Vulkan instance TLAS {} must be a compact scalar f32 ndarray "
-                "with shape (N, {}) or an AOS vector-{} ndarray with shape "
-                "(N,).",
-                name, width, width);
-  };
-  check_array("rays", rays, 8);
-  check_array("hits", hits, 4);
-  TI_ERROR_IF(rays->owning_program() != this || hits->owning_program() != this,
-              "Vulkan instance TLAS query arrays must belong to the active "
-              "runtime.");
-  TI_ERROR_IF(rays->get_device_allocation() == hits->get_device_allocation(),
-              "Vulkan instance TLAS hits must not alias rays.");
-
-  std::shared_ptr<VulkanInstanceTlasResource> resource;
-  {
-    std::lock_guard<std::mutex> lock(vulkan_ray_scene_mutex_);
-    const auto found = vulkan_ray_resources_.find(handle);
-    TI_ERROR_IF(found == vulkan_ray_resources_.end(),
-                "Vulkan instance TLAS handle is stale or closed.");
-    resource =
-        std::dynamic_pointer_cast<VulkanInstanceTlasResource>(found->second);
-  }
-  TI_ERROR_IF(!resource, "Vulkan ray resource is not an instance TLAS.");
-  auto leases = acquire_ndarray_leases({rays, hits});
-  pin_ndarray_launch_leases(leases);
-  const auto ray_allocation = rays->get_device_allocation();
-  const auto hit_allocation = hits->get_device_allocation();
-  enqueue_compute_op_lambda(
-      [resource, ray_allocation, hit_allocation,
-       ray_count](Device *, CommandList *commands) {
-        resource->record_query(commands, ray_allocation, hit_allocation,
-                               ray_count);
-      },
-      {});
-  mark_runtime_submission_pending();
-  return 0;
+                                                std::size_t ray_count,
+                                                Ndarray *hit_indices) {
+  return execute_vulkan_ray_query(prepare_vulkan_ray_query(
+      handle, true, rays, hits, ray_count, hit_indices));
 }
 
 VulkanTriangleRaySceneMemoryStatistics
@@ -1860,10 +1935,28 @@ std::uint64_t Program::create_vulkan_triangle_ray_scene(
   TI_ERROR("Vulkan ray query requires TI_WITH_VULKAN=ON.");
 }
 
+void Program::prepare_vulkan_typed_ray_query(std::uint64_t, bool) {
+  TI_ERROR("Vulkan ray query requires TI_WITH_VULKAN=ON.");
+}
+
+VulkanRayQueryCommand Program::prepare_vulkan_ray_query(std::uint64_t,
+                                                        bool,
+                                                        Ndarray *,
+                                                        Ndarray *,
+                                                        std::size_t,
+                                                        Ndarray *) {
+  TI_ERROR("Vulkan ray query requires TI_WITH_VULKAN=ON.");
+}
+
+std::size_t Program::execute_vulkan_ray_query(const VulkanRayQueryCommand &) {
+  TI_ERROR("Vulkan ray query requires TI_WITH_VULKAN=ON.");
+}
+
 std::size_t Program::vulkan_triangle_ray_query(std::uint64_t,
                                                Ndarray *,
                                                Ndarray *,
-                                               std::size_t) {
+                                               std::size_t,
+                                               Ndarray *) {
   TI_ERROR("Vulkan ray query requires TI_WITH_VULKAN=ON.");
 }
 
@@ -1907,7 +2000,8 @@ std::size_t Program::vulkan_instance_tlas_build(
 std::size_t Program::vulkan_instance_tlas_query(std::uint64_t,
                                                 Ndarray *,
                                                 Ndarray *,
-                                                std::size_t) {
+                                                std::size_t,
+                                                Ndarray *) {
   TI_ERROR("Vulkan ray query requires TI_WITH_VULKAN=ON.");
 }
 
