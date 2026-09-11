@@ -168,6 +168,13 @@ struct VulkanRayQueryCommand {
   std::array<PreparedNativeStorage::Binding, 3> shader_bindings{};
   std::array<std::uint32_t, 4> parameters{};  // count, ray/hit/index scalar offset
 };
+
+struct VulkanRayGeometryCommand {
+  std::shared_ptr<PreparedNativeStorage> storage;
+  std::uint64_t handle{0};
+  bool independent_blas{false};
+  bool update{true};
+};
 class CudaFftPlan;
 class VulkanFftPlan;
 class VulkanParallelSortPlan;
@@ -1312,10 +1319,11 @@ class TI_DLL_EXPORT Program {
 
   void vulkan_clear_graphics_pipelines();
 
-  std::uint64_t create_vulkan_triangle_ray_scene(Ndarray *vertices,
-                                                 Ndarray *indices,
-                                                 std::size_t vertex_count,
-                                                 std::size_t triangle_count);
+  std::uint64_t create_vulkan_triangle_ray_scene(
+      const storage::DenseStorageDescriptor &vertices,
+      const storage::DenseStorageDescriptor &indices,
+      std::size_t vertex_count,
+      std::size_t triangle_count);
 
   std::size_t vulkan_triangle_ray_query(std::uint64_t handle,
                                         Ndarray *rays,
@@ -1330,15 +1338,23 @@ class TI_DLL_EXPORT Program {
                                                  std::size_t ray_count,
                                                  Ndarray *hit_indices);
   VulkanRayQueryCommand prepare_vulkan_ray_query_storage(
-      std::uint64_t handle, bool instance_tlas,
+      std::uint64_t handle,
+      bool instance_tlas,
       const storage::DenseStorageDescriptor &rays,
-      const storage::DenseStorageDescriptor &hits, std::size_t ray_count,
+      const storage::DenseStorageDescriptor &hits,
+      std::size_t ray_count,
       const storage::DenseStorageDescriptor *hit_indices);
   std::size_t execute_vulkan_ray_query(const VulkanRayQueryCommand &command);
 
-  std::size_t vulkan_triangle_ray_refit(std::uint64_t handle,
-                                        Ndarray *vertices,
-                                        std::size_t vertex_count);
+  VulkanRayGeometryCommand prepare_vulkan_ray_geometry(
+      std::uint64_t handle,
+      bool independent_blas,
+      const storage::DenseStorageDescriptor &vertices,
+      const storage::DenseStorageDescriptor *indices,
+      std::size_t vertex_count,
+      std::size_t triangle_count);
+  std::size_t execute_vulkan_ray_geometry(
+      const VulkanRayGeometryCommand &command);
 
   VulkanTriangleRaySceneMemoryStatistics
   vulkan_triangle_ray_scene_memory_statistics(std::uint64_t handle);
@@ -1351,13 +1367,6 @@ class TI_DLL_EXPORT Program {
   std::uint64_t create_vulkan_triangle_blas_resource(
       std::size_t vertex_count,
       std::size_t triangle_count);
-
-  std::size_t vulkan_triangle_blas_build(std::uint64_t handle,
-                                         Ndarray *vertices,
-                                         Ndarray *indices,
-                                         std::size_t vertex_count,
-                                         std::size_t triangle_count,
-                                         bool update);
 
   std::uint64_t create_vulkan_instance_tlas_resource(
       const std::vector<std::uint64_t> &blas_handles);

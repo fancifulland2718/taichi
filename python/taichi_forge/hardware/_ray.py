@@ -27,35 +27,14 @@ from taichi_forge.lang.exception import TaichiRuntimeError
 from taichi_forge.types.primitive_types import f32, i32, u32
 
 
-def _item_count(value, width, dtype, name):
-    if not isinstance(value, Ndarray):
-        raise TaichiRuntimeError(f"Vulkan ray {name} must be a Taichi ndarray")
-    shape = tuple(value.shape)
-    element_shape = tuple(value.element_shape)
-    if value.dtype != dtype:
-        raise TaichiRuntimeError(f"Vulkan ray {name} must use dtype {dtype}")
-    if element_shape == () and len(shape) == 2 and shape[1] == width:
-        count = shape[0]
-    elif element_shape == (width,) and len(shape) == 1:
-        count = shape[0]
-    else:
-        raise TaichiRuntimeError(
-            f"Vulkan ray {name} must have scalar shape (N, {width}) or "
-            f"AOS vector-{width} shape (N,)"
-        )
-    if count <= 0:
-        raise TaichiRuntimeError(f"Vulkan ray {name} must not be empty")
-    return count
-
-
 @dataclass(frozen=True)
-class _PreparedRayQuery:
+class _PreparedRayCommand:
     command: object
     # Keep the native ndarray wrappers themselves, not just mutable Python shells.
     owners: tuple
 
 
-def _query_storage(value, width, dtypes, name):
+def _ray_storage(value, width, dtypes, name):
     description = describe_storage(value)
     if not description.supported:
         raise TaichiRuntimeError(
@@ -132,7 +111,7 @@ class VulkanRayQueryRecording(BackendCommandRecording):
     def execute(self, bindings):
         packet = (
             bindings
-            if isinstance(bindings, _PreparedRayQuery)
+            if isinstance(bindings, _PreparedRayCommand)
             else self._prepare_packet(bindings)
         )
         with hardware_failure_phase("provider_execution_failure"):
@@ -160,7 +139,7 @@ class VulkanRayQueryRecording(BackendCommandRecording):
             *descriptions,
             *(value.arr for value in values if isinstance(value, Ndarray)),
         )
-        return _PreparedRayQuery(command, owners)
+        return _PreparedRayCommand(command, owners)
 
     def _binding_descriptions(self, bindings):
         specifications = [(self.rays, 8, (f32,)), (self.hits, 4, (f32,))]
@@ -168,7 +147,7 @@ class VulkanRayQueryRecording(BackendCommandRecording):
             specifications.append((self.hit_indices, 4, (i32, u32)))
         descriptions = []
         for name, width, dtypes in specifications:
-            description, count = _query_storage(bindings[name], width, dtypes, name)
+            description, count = _ray_storage(bindings[name], width, dtypes, name)
             if count != self.ray_count:
                 raise TaichiRuntimeError(
                     f"Vulkan ray binding {name!r} has the wrong ray count"
@@ -201,8 +180,67 @@ class VulkanRayQueryRecording(BackendCommandRecording):
         )
 
 
+class _GeometryRecording:
+    """Provider-local cold bindings shared by scene refit and BLAS build/refit."""
+
+    def _binding_descriptions(self, bindings):
+        owner = self.geometry_owner
+        specifications = [(self.vertices, f32, owner.vertex_count, "vertex")]
+        if hasattr(self, "indices"):
+            specifications.append((self.indices, i32, owner.triangle_count, "triangle"))
+        descriptions = []
+        for name, dtype, expected, kind in specifications:
+            description, count = _ray_storage(bindings[name], 3, (dtype,), name)
+            if count != expected:
+                raise TaichiRuntimeError(
+                    f"Vulkan ray binding {name!r} has the wrong {kind} count"
+                )
+            descriptions.append(description)
+        return descriptions
+
+    def validate_graph_bindings(self, bindings):
+        self._binding_descriptions(bindings)
+
+    def _prepare_packet(self, bindings):
+        validate_exact_bindings(self, bindings, "Vulkan ray geometry")
+        self.validate_graph_lifetime()
+        descriptions = self._binding_descriptions(bindings)
+        owner = self.geometry_owner
+        command = owner._runtime_prog._prepare_vulkan_ray_geometry(
+            owner._handle,
+            isinstance(owner, TriangleBLAS),
+            descriptions[0].descriptor,
+            descriptions[1].descriptor if len(descriptions) == 2 else None,
+            owner.vertex_count,
+            owner.triangle_count,
+        )
+        values = tuple(bindings[name] for name in self.binding_names)
+        return _PreparedRayCommand(
+            command,
+            (
+                *values,
+                *descriptions,
+                *(value.arr for value in values if isinstance(value, Ndarray)),
+            ),
+        )
+
+    def prepare_graph_execute(self, bindings):
+        return partial(self.execute, self._prepare_packet(bindings))
+
+    def execute(self, bindings):
+        packet = (
+            bindings
+            if isinstance(bindings, _PreparedRayCommand)
+            else self._prepare_packet(bindings)
+        )
+        with hardware_failure_phase("provider_execution_failure"):
+            return self.geometry_owner._runtime_prog._execute_vulkan_ray_geometry(
+                packet.command
+            )
+
+
 @instrument_hardware_recording("ray.as_refit.vulkan")
-class VulkanRayRefitRecording(BackendCommandRecording):
+class VulkanRayRefitRecording(_GeometryRecording, BackendCommandRecording):
     """One vertex-only BLAS update for a :class:`TriangleScene`."""
 
     def __init__(self, scene, *, vertices="vertices"):
@@ -222,6 +260,7 @@ class VulkanRayRefitRecording(BackendCommandRecording):
             no_host_readback=True,
         )
         object.__setattr__(self, "scene", scene)
+        object.__setattr__(self, "geometry_owner", scene)
         object.__setattr__(self, "vertices", vertices)
 
     @property
@@ -230,17 +269,6 @@ class VulkanRayRefitRecording(BackendCommandRecording):
             ResourceEffect(self.vertices, GraphAccess.READ),
             static_resource_effect(self.scene._effect_name, GraphAccess.WRITE),
         )
-
-    def execute(self, bindings):
-        validate_exact_bindings(self, bindings, "Vulkan ray refit")
-        self.validate_graph_lifetime()
-        vertices = bindings[self.vertices]
-        if _item_count(vertices, 3, f32, self.vertices) != self.scene.vertex_count:
-            raise TaichiRuntimeError(
-                f"Vulkan ray binding {self.vertices!r} has the wrong vertex count"
-            )
-        with hardware_failure_phase("provider_execution_failure"):
-            self.scene._execute_refit(vertices)
 
     def validate_graph_lifetime(self):
         self.scene._validate_lifetime()
@@ -257,6 +285,7 @@ class VulkanRayRefitRecording(BackendCommandRecording):
                 "vertex_count": item.scene.vertex_count,
                 "scene_kind": "updatable_triangle_blas_tlas",
             },
+            publish_time_binding_validation_stable=True,
         )
 
 
@@ -287,7 +316,7 @@ class _TypedRayScene:
 
     def trace_typed(self, rays, hits, hit_indices):
         """Execute :meth:`record_typed` into caller-owned compact device storage."""
-        recording = self.record_typed(_query_storage(rays, 8, (f32,), "rays")[1])
+        recording = self.record_typed(_ray_storage(rays, 8, (f32,), "rays")[1])
         recording.execute({"rays": rays, "hits": hits, "hit_indices": hit_indices})
         return hits, hit_indices
 
@@ -295,13 +324,16 @@ class _TypedRayScene:
 class TriangleScene(_TypedRayScene):
     """One updatable triangle BLAS and one identity-instance TLAS.
 
-    ``vertices`` and ``indices`` accept scalar ``(N, 3)`` ndarrays or AOS
-    vector-3 ndarrays with shape ``(N,)``. Indices are signed i32 for parity
-    with Forge mesh storage but must all be nonnegative and in range; this
-    low-level provider does not perform a host readback to validate them.
+    ``vertices`` and ``indices`` accept compact dense fields, ndarrays and
+    program-owned views with scalar ``(N, 3)`` or AOS vector-3 ``(N,)`` layout.
+    Indices are signed i32 for parity with Forge mesh storage but must all be
+    nonnegative and in range; this provider does not read them back to validate
+    mesh topology.
 
-    :meth:`refit` updates vertex positions in hardware without rebuilding the
-    topology. The vertex count and indices are fixed for the scene lifetime.
+    :meth:`refit` updates the BLAS and refreshes this owner's one-instance TLAS
+    bounds. The vertex count and indices are fixed for the scene lifetime.
+    Inputs are copied device-to-device into retained build buffers; no geometry
+    upload or host bounds readback is introduced for field/view inputs.
     """
 
     def __init__(self, vertices, indices):
@@ -320,14 +352,14 @@ class TriangleScene(_TypedRayScene):
                 "TriangleScene requires VK_KHR_acceleration_structure and "
                 "VK_KHR_ray_query"
             )
-        vertex_count = _item_count(vertices, 3, f32, "vertices")
-        triangle_count = _item_count(indices, 3, i32, "indices")
+        vertex_storage, vertex_count = _ray_storage(vertices, 3, (f32,), "vertices")
+        index_storage, triangle_count = _ray_storage(indices, 3, (i32,), "indices")
         self._runtime_prog = program
         self._runtime_generation = int(impl.runtime_generation())
         self._handle = int(
             program._create_vulkan_triangle_ray_scene(
-                vertices.arr,
-                indices.arr,
+                vertex_storage.descriptor,
+                index_storage.descriptor,
                 vertex_count,
                 triangle_count,
             )
@@ -353,7 +385,7 @@ class TriangleScene(_TypedRayScene):
         )
 
     def trace(self, rays, hits):
-        ray_count = _query_storage(rays, 8, (f32,), "rays")[1]
+        ray_count = _ray_storage(rays, 8, (f32,), "rays")[1]
         recording = self.record(ray_count)
         recording.execute({"rays": rays, "hits": hits})
         return hits
@@ -366,12 +398,6 @@ class TriangleScene(_TypedRayScene):
         recording = self.record_refit()
         recording.execute({"vertices": vertices})
         return self
-
-    def _execute_refit(self, vertices):
-        self._validate_lifetime()
-        self._runtime_prog._vulkan_triangle_ray_refit(
-            self._handle, vertices.arr, self.vertex_count
-        )
 
     def _validate_lifetime(self):
         if self._handle is None:
@@ -463,7 +489,7 @@ class TriangleScene(_TypedRayScene):
 
 
 @instrument_hardware_recording("ray.as_build.vulkan")
-class VulkanBLASBuildRecording(BackendCommandRecording):
+class VulkanBLASBuildRecording(_GeometryRecording, BackendCommandRecording):
     """One explicit triangle BLAS rebuild with fixed allocation shape."""
 
     def __init__(self, blas, *, vertices="vertices", indices="indices"):
@@ -488,6 +514,7 @@ class VulkanBLASBuildRecording(BackendCommandRecording):
             no_host_readback=True,
         )
         object.__setattr__(self, "blas", blas)
+        object.__setattr__(self, "geometry_owner", blas)
         object.__setattr__(self, "vertices", vertices)
         object.__setattr__(self, "indices", indices)
 
@@ -511,22 +538,6 @@ class VulkanBLASBuildRecording(BackendCommandRecording):
             "triangle_count": self.blas.triangle_count,
         }
 
-    def execute(self, bindings):
-        validate_exact_bindings(self, bindings, "Vulkan BLAS build")
-        self.validate_graph_lifetime()
-        vertices = bindings[self.vertices]
-        indices = bindings[self.indices]
-        if _item_count(vertices, 3, f32, self.vertices) != self.blas.vertex_count:
-            raise TaichiRuntimeError(
-                f"Vulkan ray binding {self.vertices!r} has the wrong vertex count"
-            )
-        if _item_count(indices, 3, i32, self.indices) != self.blas.triangle_count:
-            raise TaichiRuntimeError(
-                f"Vulkan ray binding {self.indices!r} has the wrong triangle count"
-            )
-        with hardware_failure_phase("provider_execution_failure"):
-            self.blas._execute_build(vertices, indices, update=False)
-
     def validate_graph_lifetime(self):
         self.blas._validate_lifetime()
 
@@ -538,11 +549,12 @@ class VulkanBLASBuildRecording(BackendCommandRecording):
             self,
             lifetime_leases=lambda item: item.lifetime_leases,
             debug_info=lambda item: item.debug_info,
+            publish_time_binding_validation_stable=True,
         )
 
 
 @instrument_hardware_recording("ray.as_refit.vulkan")
-class VulkanBLASRefitRecording(BackendCommandRecording):
+class VulkanBLASRefitRecording(_GeometryRecording, BackendCommandRecording):
     """One vertex-only triangle BLAS update with fixed topology."""
 
     def __init__(self, blas, *, vertices="vertices"):
@@ -562,6 +574,7 @@ class VulkanBLASRefitRecording(BackendCommandRecording):
             no_host_readback=True,
         )
         object.__setattr__(self, "blas", blas)
+        object.__setattr__(self, "geometry_owner", blas)
         object.__setattr__(self, "vertices", vertices)
 
     @property
@@ -582,17 +595,6 @@ class VulkanBLASRefitRecording(BackendCommandRecording):
             "vertex_count": self.blas.vertex_count,
         }
 
-    def execute(self, bindings):
-        validate_exact_bindings(self, bindings, "Vulkan BLAS refit")
-        self.validate_graph_lifetime()
-        vertices = bindings[self.vertices]
-        if _item_count(vertices, 3, f32, self.vertices) != self.blas.vertex_count:
-            raise TaichiRuntimeError(
-                f"Vulkan ray binding {self.vertices!r} has the wrong vertex count"
-            )
-        with hardware_failure_phase("provider_execution_failure"):
-            self.blas._execute_build(vertices, None, update=True)
-
     def validate_graph_lifetime(self):
         self.blas._validate_lifetime()
 
@@ -604,28 +606,27 @@ class VulkanBLASRefitRecording(BackendCommandRecording):
             self,
             lifetime_leases=lambda item: item.lifetime_leases,
             debug_info=lambda item: item.debug_info,
+            publish_time_binding_validation_stable=True,
         )
 
 
 class TriangleBLAS:
     """Independent fixed-topology Vulkan triangle BLAS resource."""
 
+    graph_runtime_lifetime_check_required = False
+
     def __init__(self, vertices, indices):
         program = _require_vulkan_ray_runtime("TriangleBLAS")
-        vertex_count = _item_count(vertices, 3, f32, "vertices")
-        triangle_count = _item_count(indices, 3, i32, "indices")
+        vertex_count = _ray_storage(vertices, 3, (f32,), "vertices")[1]
+        triangle_count = _ray_storage(indices, 3, (i32,), "indices")[1]
         self._runtime_prog = program
         self._runtime_generation = int(impl.runtime_generation())
         self.vertex_count = vertex_count
         self.triangle_count = triangle_count
         self._handle = int(
-            program._create_vulkan_triangle_blas_resource(
-                vertex_count, triangle_count
-            )
+            program._create_vulkan_triangle_blas_resource(vertex_count, triangle_count)
         )
-        self._effect_name = (
-            f"vulkan-ray-blas:{self._runtime_generation}:{self._handle}"
-        )
+        self._effect_name = f"vulkan-ray-blas:{self._runtime_generation}:{self._handle}"
         try:
             self._memory_stats = dict(
                 program._vulkan_ray_resource_memory_stats(self._handle)
@@ -641,9 +642,7 @@ class TriangleBLAS:
 
     def record_build(self, *, vertices="vertices", indices="indices"):
         self._validate_lifetime()
-        return VulkanBLASBuildRecording(
-            self, vertices=vertices, indices=indices
-        )
+        return VulkanBLASBuildRecording(self, vertices=vertices, indices=indices)
 
     def build(self, vertices, indices):
         self.record_build().execute({"vertices": vertices, "indices": indices})
@@ -656,17 +655,6 @@ class TriangleBLAS:
     def refit(self, vertices):
         self.record_refit().execute({"vertices": vertices})
         return self
-
-    def _execute_build(self, vertices, indices, *, update):
-        self._validate_lifetime()
-        self._runtime_prog._vulkan_triangle_blas_build(
-            self._handle,
-            vertices.arr,
-            None if indices is None else indices.arr,
-            self.vertex_count,
-            self.triangle_count,
-            bool(update),
-        )
 
     def _validate_runtime_identity(self):
         validate_runtime_generation(
@@ -836,6 +824,11 @@ class _VulkanTLASRecording(BackendCommandRecording):
         with hardware_failure_phase("provider_execution_failure"):
             self.tlas._execute_build(self.instances, update=self.update)
 
+    def validate_graph_bindings(self, bindings):
+        # There are no invocation bindings: instance metadata is captured by this
+        # immutable recording. Native handle lookup still owns retirement.
+        self.tlas._validate_topology(self.instances)
+
     def validate_graph_lifetime(self):
         self.tlas._validate_lifetime()
         self.tlas._validate_topology(self.instances)
@@ -848,6 +841,7 @@ class _VulkanTLASRecording(BackendCommandRecording):
             self,
             lifetime_leases=lambda item: item.lifetime_leases,
             debug_info=lambda item: item.debug_info,
+            publish_time_binding_validation_stable=True,
         )
 
 
@@ -993,7 +987,7 @@ class InstanceTLAS(_TypedRayScene):
         )
 
     def trace(self, rays, hits):
-        ray_count = _query_storage(rays, 8, (f32,), "rays")[1]
+        ray_count = _ray_storage(rays, 8, (f32,), "rays")[1]
         recording = self.record(ray_count)
         recording.execute({"rays": rays, "hits": hits})
         return hits

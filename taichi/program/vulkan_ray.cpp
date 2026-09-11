@@ -17,6 +17,48 @@ namespace {
 
 constexpr std::uint32_t kRayQueryWorkgroupSize = 128;
 
+void check_ray_storage(const storage::DenseStorageDescriptor &value,
+                       std::size_t count,
+                       unsigned width,
+                       DataType dtype,
+                       const char *name) {
+  TI_ERROR_IF(count == 0 || count > (std::numeric_limits<std::uint32_t>::max)(),
+              "Vulkan ray {} count must be in [1, UINT32_MAX].", name);
+  const auto shape = value.index_shape();
+  const auto element = value.element_shape();
+  const bool scalar =
+      element.empty() && shape == std::vector<std::int64_t>{
+                                      static_cast<std::int64_t>(count), width};
+  const bool vector =
+      element == std::vector<std::int64_t>{width} &&
+      shape == std::vector<std::int64_t>{static_cast<std::int64_t>(count)};
+  TI_ERROR_IF(value.scalar_type() != dtype || (!scalar && !vector),
+              "Vulkan ray {} requires dtype {} and {}-wide records.", name,
+              dtype->to_string(), width);
+}
+
+// Kernel/transfer producers, previous AS builds and queries may precede this
+// command on the same runtime queue. buffer_copy itself inserts no dependency.
+// Also order reuse of provider-owned geometry, AS storage and build scratch.
+void geometry_reuse_barrier(VkCommandBuffer commands) {
+  VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+  barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT |
+                          VK_ACCESS_TRANSFER_WRITE_BIT |
+                          VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                          VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT |
+                          VK_ACCESS_TRANSFER_WRITE_BIT |
+                          VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR |
+                          VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+  vkCmdPipelineBarrier(
+      commands,
+      VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT |
+          VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+      VK_PIPELINE_STAGE_TRANSFER_BIT |
+          VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+      0, 1, &barrier, 0, nullptr, 0, nullptr);
+}
+
 static const std::uint32_t kRayQueryTrianglesSpv[] =
 #include "taichi/program/vulkan_sort_shaders/ray_query_triangles.comp.spv.h"
     ;
@@ -222,23 +264,23 @@ class VulkanTriangleRayScene {
   }
 
   void record_build(CommandList *command_list,
-                    DeviceAllocation source_vertices,
-                    DeviceAllocation source_indices) {
+                    DevicePtr source_vertices,
+                    DevicePtr source_indices) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto *vk_commands = static_cast<vulkan::VulkanCommandList *>(command_list);
     auto command_buffer = vk_commands->vk_command_buffer();
 
-    command_list->buffer_copy(vertex_buffer_.get_ptr(),
-                              source_vertices.get_ptr(), vertex_bytes_);
-    command_list->buffer_copy(index_buffer_.get_ptr(), source_indices.get_ptr(),
+    geometry_reuse_barrier(command_buffer->buffer);
+    command_list->buffer_copy(vertex_buffer_.get_ptr(), source_vertices,
+                              vertex_bytes_);
+    command_list->buffer_copy(index_buffer_.get_ptr(), source_indices,
                               index_bytes_);
 
     VkMemoryBarrier input_barrier{};
     input_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     input_barrier.srcAccessMask =
         VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
-    input_barrier.dstAccessMask =
-        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    input_barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
     vkCmdPipelineBarrier(
         command_buffer->buffer,
         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
@@ -255,15 +297,12 @@ class VulkanTriangleRayScene {
 
     VkMemoryBarrier blas_barrier{};
     blas_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    blas_barrier.srcAccessMask =
-        VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-    blas_barrier.dstAccessMask =
-        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-    vkCmdPipelineBarrier(
-        command_buffer->buffer,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1,
-        &blas_barrier, 0, nullptr, 0, nullptr);
+    blas_barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    blas_barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    vkCmdPipelineBarrier(command_buffer->buffer,
+                         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                         0, 1, &blas_barrier, 0, nullptr, 0, nullptr);
 
     const auto tlas_geometry = make_tlas_geometry();
     auto tlas_build = make_tlas_build_info(tlas_geometry);
@@ -276,32 +315,29 @@ class VulkanTriangleRayScene {
     query_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     query_barrier.srcAccessMask =
         VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-    query_barrier.dstAccessMask =
-        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-    vkCmdPipelineBarrier(
-        command_buffer->buffer,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &query_barrier, 0, nullptr,
-        0, nullptr);
+    query_barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    vkCmdPipelineBarrier(command_buffer->buffer,
+                         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
+                         &query_barrier, 0, nullptr, 0, nullptr);
 
     retain_build_resources(command_buffer);
   }
 
-  void record_refit(CommandList *command_list,
-                    DeviceAllocation source_vertices) {
+  void record_refit(CommandList *command_list, DevicePtr source_vertices) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto *vk_commands = static_cast<vulkan::VulkanCommandList *>(command_list);
     auto command_buffer = vk_commands->vk_command_buffer();
 
-    command_list->buffer_copy(vertex_buffer_.get_ptr(),
-                              source_vertices.get_ptr(), vertex_bytes_);
+    geometry_reuse_barrier(command_buffer->buffer);
+    command_list->buffer_copy(vertex_buffer_.get_ptr(), source_vertices,
+                              vertex_bytes_);
 
     VkMemoryBarrier input_barrier{};
     input_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     input_barrier.srcAccessMask =
         VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT;
-    input_barrier.dstAccessMask =
-        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    input_barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
     vkCmdPipelineBarrier(
         command_buffer->buffer,
         VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_HOST_BIT,
@@ -316,12 +352,29 @@ class VulkanTriangleRayScene {
     const VkAccelerationStructureBuildRangeInfoKHR *ranges[] = {&range};
     cmd_build_(command_buffer->buffer, 1, &build, ranges);
 
+    // The BLAS may move outside the bounds encoded by the existing TLAS.
+    // This owner contains both structures, so refit must refresh both. Reuse
+    // its one-instance build storage/scratch; no host bounds readback is
+    // needed.
+    VkMemoryBarrier blas_barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    blas_barrier.srcAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    blas_barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    vkCmdPipelineBarrier(command_buffer->buffer,
+                         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                         0, 1, &blas_barrier, 0, nullptr, 0, nullptr);
+    const auto tlas_geometry = make_tlas_geometry();
+    auto tlas_build = make_tlas_build_info(tlas_geometry);
+    const VkAccelerationStructureBuildRangeInfoKHR tlas_range{1, 0, 0, 0};
+    const VkAccelerationStructureBuildRangeInfoKHR *tlas_ranges[] = {
+        &tlas_range};
+    cmd_build_(command_buffer->buffer, 1, &tlas_build, tlas_ranges);
+
     VkMemoryBarrier query_barrier{};
     query_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     query_barrier.srcAccessMask =
         VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
-    query_barrier.dstAccessMask =
-        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    query_barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
     vkCmdPipelineBarrier(command_buffer->buffer,
                          VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1,
@@ -332,6 +385,10 @@ class VulkanTriangleRayScene {
 
   std::size_t vertex_count() const {
     return vertex_count_;
+  }
+
+  std::size_t triangle_count() const {
+    return triangle_count_;
   }
 
   void prepare_query_variant(unsigned variant) {
@@ -703,40 +760,29 @@ class VulkanTriangleBlasResource final : public VulkanRayResource {
   }
 
   void record_build(CommandList *command_list,
-                    DeviceAllocation source_vertices,
-                    DeviceAllocation source_indices,
+                    DevicePtr source_vertices,
+                    DevicePtr source_indices,
                     bool update) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto *vk_commands = static_cast<vulkan::VulkanCommandList *>(command_list);
     auto command_buffer = vk_commands->vk_command_buffer();
 
-    VkMemoryBarrier reuse_barrier{};
-    reuse_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    reuse_barrier.srcAccessMask =
-        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-    reuse_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(
-        command_buffer->buffer,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &reuse_barrier, 0, nullptr, 0,
-        nullptr);
+    geometry_reuse_barrier(command_buffer->buffer);
 
-    command_list->buffer_copy(vertex_buffer_.get_ptr(),
-                              source_vertices.get_ptr(), vertex_bytes_);
+    command_list->buffer_copy(vertex_buffer_.get_ptr(), source_vertices,
+                              vertex_bytes_);
     if (!update) {
-      command_list->buffer_copy(index_buffer_.get_ptr(),
-                                source_indices.get_ptr(), index_bytes_);
+      command_list->buffer_copy(index_buffer_.get_ptr(), source_indices,
+                                index_bytes_);
     }
 
     VkMemoryBarrier input_barrier{};
     input_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
     input_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    input_barrier.dstAccessMask =
-        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-    vkCmdPipelineBarrier(
-        command_buffer->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR, 0, 1,
-        &input_barrier, 0, nullptr, 0, nullptr);
+    input_barrier.dstAccessMask = VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    vkCmdPipelineBarrier(command_buffer->buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
+                         0, 1, &input_barrier, 0, nullptr, 0, nullptr);
 
     const auto geometry = make_geometry();
     auto build = make_build_info(
@@ -1011,16 +1057,7 @@ class VulkanInstanceTlasResource final : public VulkanRayResource {
 
     auto *vk_commands = static_cast<vulkan::VulkanCommandList *>(command_list);
     auto command_buffer = vk_commands->vk_command_buffer();
-    VkMemoryBarrier reuse_barrier{};
-    reuse_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    reuse_barrier.srcAccessMask =
-        VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR;
-    reuse_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-    vkCmdPipelineBarrier(
-        command_buffer->buffer,
-        VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR,
-        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &reuse_barrier, 0, nullptr, 0,
-        nullptr);
+    geometry_reuse_barrier(command_buffer->buffer);
 
     const auto instance_vk_buffer =
         device_->get_vkbuffer(instance_buffer_.get_ptr());
@@ -1295,58 +1332,35 @@ Program::vulkan_ray_query_properties() const {
 }
 
 std::uint64_t Program::create_vulkan_triangle_ray_scene(
-    Ndarray *vertices,
-    Ndarray *indices,
+    const storage::DenseStorageDescriptor &vertices,
+    const storage::DenseStorageDescriptor &indices,
     std::size_t vertex_count,
     std::size_t triangle_count) {
-  auto submission_guard = acquire_runtime_resource_submission_guard();
   TI_ERROR_IF(!vulkan_ray_query_available(),
               "Vulkan triangle ray scenes require "
               "VK_KHR_acceleration_structure and VK_KHR_ray_query.");
-  TI_ERROR_IF(!vertices || !indices,
-              "Vulkan triangle ray scene received a null ndarray.");
-  const auto check_array = [](const char *name, Ndarray *array, DataType dtype,
-                              std::size_t item_count, std::size_t width) {
-    const auto element_shape = array->get_element_shape();
-    const bool scalar_layout =
-        element_shape.empty() &&
-        array->get_nelement() == checked_mul(item_count, width, name) &&
-        array->get_element_size() == sizeof(std::uint32_t);
-    const bool vector_layout =
-        element_shape == std::vector<int>{static_cast<int>(width)} &&
-        array->get_nelement() == item_count &&
-        array->get_element_size() == width * sizeof(std::uint32_t);
-    TI_ERROR_IF(array->get_element_data_type() != dtype ||
-                    (!scalar_layout && !vector_layout),
-                "Vulkan triangle ray {} must be a compact scalar ndarray with "
-                "shape (N, {}) or an AOS vector-{} ndarray with shape (N,).",
-                name, width, width);
-  };
-  check_array("vertices", vertices, PrimitiveType::f32, vertex_count, 3);
-  check_array("indices", indices, PrimitiveType::i32, triangle_count, 3);
-  TI_ERROR_IF(vertices->owning_program() != this ||
-                  indices->owning_program() != this,
-              "Vulkan triangle ray geometry must belong to the active runtime.");
-
-  auto leases = acquire_ndarray_leases({vertices, indices});
-  pin_ndarray_launch_leases(leases);
-  auto scene = std::make_shared<VulkanTriangleRayScene>(
-      this, vertex_count, triangle_count);
-  const auto vertex_allocation = vertices->get_device_allocation();
-  const auto index_allocation = indices->get_device_allocation();
-  enqueue_compute_op_lambda(
-      [scene, vertex_allocation, index_allocation](Device *,
-                                                   CommandList *commands) {
-        scene->record_build(commands, vertex_allocation, index_allocation);
-      },
-      {});
-  mark_runtime_submission_pending();
-
-  std::lock_guard<std::mutex> lock(vulkan_ray_scene_mutex_);
-  TI_ERROR_IF(next_vulkan_ray_scene_handle_ == 0,
-              "Vulkan ray scene handle space exhausted.");
-  const std::uint64_t handle = next_vulkan_ray_scene_handle_++;
-  vulkan_ray_scenes_.emplace(handle, std::move(scene));
+  check_ray_storage(vertices, vertex_count, 3, PrimitiveType::f32, "vertices");
+  check_ray_storage(indices, triangle_count, 3, PrimitiveType::i32, "indices");
+  auto storage = prepare_native_storage({&vertices, &indices}, {false, false});
+  std::uint64_t handle = 0;
+  with_prepared_native_storage(*storage, [&] {
+    auto scene = std::make_shared<VulkanTriangleRayScene>(this, vertex_count,
+                                                          triangle_count);
+    const auto vertex_pointer = storage->binding(0).pointer;
+    const auto index_pointer = storage->binding(1).pointer;
+    enqueue_compute_op_lambda(
+        [scene, vertex_pointer, index_pointer](Device *,
+                                               CommandList *commands) {
+          scene->record_build(commands, vertex_pointer, index_pointer);
+        },
+        {});
+    mark_runtime_submission_pending();
+    std::lock_guard<std::mutex> lock(vulkan_ray_scene_mutex_);
+    TI_ERROR_IF(next_vulkan_ray_scene_handle_ == 0,
+                "Vulkan ray scene handle space exhausted.");
+    handle = next_vulkan_ray_scene_handle_++;
+    vulkan_ray_scenes_.emplace(handle, std::move(scene));
+  });
   return handle;
 }
 
@@ -1380,24 +1394,9 @@ VulkanRayQueryCommand Program::prepare_vulkan_ray_query_storage(
       compile_config().arch != Arch::vulkan || ray_count == 0 ||
           ray_count > (std::numeric_limits<std::uint32_t>::max)(),
       "Vulkan ray query requires Vulkan storage and a positive uint32 count.");
-  auto check_storage = [ray_count](const storage::DenseStorageDescriptor &value,
-                                   unsigned width, DataType dtype,
-                                   const char *name) {
-    const auto shape = value.index_shape();
-    const auto element = value.element_shape();
-    const bool scalar =
-        element.empty() &&
-        shape == std::vector<std::int64_t>{static_cast<std::int64_t>(ray_count),
-                                           width};
-    const bool vector = element == std::vector<std::int64_t>{width} &&
-                        shape == std::vector<std::int64_t>{
-                                     static_cast<std::int64_t>(ray_count)};
-    TI_ERROR_IF(value.scalar_type() != dtype || (!scalar && !vector),
-                "Vulkan ray {} requires dtype {} and {}-wide records.", name,
-                dtype->to_string(), width);
-  };
-  check_storage(rays, 8, PrimitiveType::f32, "rays");
-  check_storage(hits, 4, PrimitiveType::f32, "hits");
+  check_ray_storage(rays, ray_count, 8, PrimitiveType::f32, "rays");
+  check_ray_storage(hits, ray_count, 4, PrimitiveType::f32, "hits");
+
   std::vector<const storage::DenseStorageDescriptor *> descriptors{&rays,
                                                                    &hits};
   std::vector<bool> writable{false, true};
@@ -1405,7 +1404,7 @@ VulkanRayQueryCommand Program::prepare_vulkan_ray_query_storage(
     const auto dtype = hit_indices->scalar_type();
     TI_ERROR_IF(dtype != PrimitiveType::i32 && dtype != PrimitiveType::u32,
                 "Vulkan ray hit_indices requires dtype i32 or u32.");
-    check_storage(*hit_indices, 4, dtype, "hit_indices");
+    check_ray_storage(*hit_indices, ray_count, 4, dtype, "hit_indices");
     descriptors.push_back(hit_indices);
     writable.push_back(true);
   }
@@ -1524,57 +1523,93 @@ std::size_t Program::vulkan_triangle_ray_query(std::uint64_t handle,
       handle, false, rays, hits, ray_count, hit_indices));
 }
 
-std::size_t Program::vulkan_triangle_ray_refit(std::uint64_t handle,
-                                               Ndarray *vertices,
-                                               std::size_t vertex_count) {
+VulkanRayGeometryCommand Program::prepare_vulkan_ray_geometry(
+    std::uint64_t handle,
+    bool independent_blas,
+    const storage::DenseStorageDescriptor &vertices,
+    const storage::DenseStorageDescriptor *indices,
+    std::size_t vertex_count,
+    std::size_t triangle_count) {
+  TI_ERROR_IF(compile_config().arch != Arch::vulkan,
+              "Vulkan ray geometry requires Vulkan storage.");
+  TI_ERROR_IF(!independent_blas && indices,
+              "TriangleScene refit cannot replace topology.");
+  check_ray_storage(vertices, vertex_count, 3, PrimitiveType::f32, "vertices");
+  std::vector<const storage::DenseStorageDescriptor *> descriptors{&vertices};
+  if (indices) {
+    check_ray_storage(*indices, triangle_count, 3, PrimitiveType::i32,
+                      "indices");
+    descriptors.push_back(indices);
+  }
+  VulkanRayGeometryCommand command;
+  command.storage = prepare_native_storage(
+      descriptors, std::vector<bool>(descriptors.size(), false));
+  command.handle = handle;
+  command.independent_blas = independent_blas;
+  command.update = indices == nullptr;
+  // Handle/count validation is cold; execution only resolves the live owner.
   auto submission_guard = acquire_runtime_resource_submission_guard();
-  TI_ERROR_IF(!vertices,
-              "Vulkan triangle ray refit received a null vertex ndarray.");
-  TI_ERROR_IF(vertex_count == 0 ||
-                  vertex_count > static_cast<std::size_t>(
-                                     (std::numeric_limits<
-                                         std::uint32_t>::max)()),
-              "Vulkan triangle ray refit vertex_count must be in [1, "
-              "UINT32_MAX].");
-  const auto element_shape = vertices->get_element_shape();
-  const bool scalar_layout =
-      element_shape.empty() &&
-      vertices->get_nelement() ==
-          checked_mul(vertex_count, std::size_t{3}, "refit vertices") &&
-      vertices->get_element_size() == sizeof(float);
-  const bool vector_layout =
-      element_shape == std::vector<int>{3} &&
-      vertices->get_nelement() == vertex_count &&
-      vertices->get_element_size() == 3 * sizeof(float);
-  TI_ERROR_IF(vertices->get_element_data_type() != PrimitiveType::f32 ||
-                  (!scalar_layout && !vector_layout),
-              "Vulkan triangle ray refit vertices must be a compact scalar "
-              "f32 ndarray with shape (N, 3) or an AOS vector-3 ndarray "
-              "with shape (N,).");
-  TI_ERROR_IF(vertices->owning_program() != this,
-              "Vulkan triangle ray refit vertices must belong to the active "
-              "runtime.");
-
-  std::shared_ptr<VulkanTriangleRayScene> scene;
-  {
-    std::lock_guard<std::mutex> lock(vulkan_ray_scene_mutex_);
+  std::lock_guard<std::mutex> lock(vulkan_ray_scene_mutex_);
+  if (independent_blas) {
+    const auto found = vulkan_ray_resources_.find(handle);
+    TI_ERROR_IF(found == vulkan_ray_resources_.end(),
+                "Vulkan triangle BLAS handle is stale or closed.");
+    const auto blas =
+        std::dynamic_pointer_cast<VulkanTriangleBlasResource>(found->second);
+    TI_ERROR_IF(!blas, "Vulkan ray resource is not a triangle BLAS.");
+    TI_ERROR_IF(vertex_count != blas->vertex_count() ||
+                    triangle_count != blas->triangle_count(),
+                "Vulkan triangle BLAS build must preserve geometry counts.");
+  } else {
     const auto found = vulkan_ray_scenes_.find(handle);
     TI_ERROR_IF(found == vulkan_ray_scenes_.end(),
                 "Vulkan triangle ray scene handle is stale or closed.");
-    scene = found->second;
+    TI_ERROR_IF(vertex_count != found->second->vertex_count() ||
+                    triangle_count != found->second->triangle_count(),
+                "Vulkan triangle ray refit must preserve geometry counts.");
   }
-  TI_ERROR_IF(vertex_count != scene->vertex_count(),
-              "Vulkan triangle ray refit must preserve vertex_count {}.",
-              scene->vertex_count());
-  auto leases = acquire_ndarray_leases({vertices});
-  pin_ndarray_launch_leases(leases);
-  const auto vertex_allocation = vertices->get_device_allocation();
-  enqueue_compute_op_lambda(
-      [scene, vertex_allocation](Device *, CommandList *commands) {
-        scene->record_refit(commands, vertex_allocation);
-      },
-      {});
-  mark_runtime_submission_pending();
+  return command;
+}
+
+std::size_t Program::execute_vulkan_ray_geometry(
+    const VulkanRayGeometryCommand &command) {
+  with_prepared_native_storage(*command.storage, [&] {
+    const auto vertices = command.storage->binding(0).pointer;
+    if (command.independent_blas) {
+      std::shared_ptr<VulkanTriangleBlasResource> resource;
+      {
+        std::lock_guard<std::mutex> lock(vulkan_ray_scene_mutex_);
+        const auto found = vulkan_ray_resources_.find(command.handle);
+        TI_ERROR_IF(found == vulkan_ray_resources_.end(),
+                    "Vulkan triangle BLAS handle is stale or closed.");
+        resource =
+            std::static_pointer_cast<VulkanTriangleBlasResource>(found->second);
+      }
+      const auto indices =
+          command.update ? DevicePtr{} : command.storage->binding(1).pointer;
+      enqueue_compute_op_lambda(
+          [resource, vertices, indices, update = command.update](
+              Device *, CommandList *commands) {
+            resource->record_build(commands, vertices, indices, update);
+          },
+          {});
+    } else {
+      std::shared_ptr<VulkanTriangleRayScene> scene;
+      {
+        std::lock_guard<std::mutex> lock(vulkan_ray_scene_mutex_);
+        const auto found = vulkan_ray_scenes_.find(command.handle);
+        TI_ERROR_IF(found == vulkan_ray_scenes_.end(),
+                    "Vulkan triangle ray scene handle is stale or closed.");
+        scene = found->second;
+      }
+      enqueue_compute_op_lambda(
+          [scene, vertices](Device *, CommandList *commands) {
+            scene->record_refit(commands, vertices);
+          },
+          {});
+    }
+    mark_runtime_submission_pending();
+  });
   return 0;
 }
 
@@ -1593,75 +1628,6 @@ std::uint64_t Program::create_vulkan_triangle_blas_resource(
   const std::uint64_t handle = next_vulkan_ray_resource_handle_++;
   vulkan_ray_resources_.emplace(handle, std::move(resource));
   return handle;
-}
-
-std::size_t Program::vulkan_triangle_blas_build(std::uint64_t handle,
-                                                Ndarray *vertices,
-                                                Ndarray *indices,
-                                                std::size_t vertex_count,
-                                                std::size_t triangle_count,
-                                                bool update) {
-  auto submission_guard = acquire_runtime_resource_submission_guard();
-  TI_ERROR_IF(!vertices || (!update && !indices),
-              "Vulkan triangle BLAS build received a null ndarray.");
-  const auto check_array = [](const char *name, Ndarray *array, DataType dtype,
-                              std::size_t item_count, std::size_t width) {
-    const auto element_shape = array->get_element_shape();
-    const bool scalar_layout =
-        element_shape.empty() &&
-        array->get_nelement() == checked_mul(item_count, width, name) &&
-        array->get_element_size() == sizeof(std::uint32_t);
-    const bool vector_layout =
-        element_shape == std::vector<int>{static_cast<int>(width)} &&
-        array->get_nelement() == item_count &&
-        array->get_element_size() == width * sizeof(std::uint32_t);
-    TI_ERROR_IF(array->get_element_data_type() != dtype ||
-                    (!scalar_layout && !vector_layout),
-                "Vulkan triangle BLAS {} must be a compact scalar ndarray "
-                "with shape (N, {}) or an AOS vector-{} ndarray with shape "
-                "(N,).",
-                name, width, width);
-  };
-  check_array("vertices", vertices, PrimitiveType::f32, vertex_count, 3);
-  if (!update) {
-    check_array("indices", indices, PrimitiveType::i32, triangle_count, 3);
-  }
-  TI_ERROR_IF(vertices->owning_program() != this ||
-                  (!update && indices->owning_program() != this),
-              "Vulkan triangle BLAS geometry must belong to the active "
-              "runtime.");
-
-  std::shared_ptr<VulkanTriangleBlasResource> resource;
-  {
-    std::lock_guard<std::mutex> lock(vulkan_ray_scene_mutex_);
-    const auto found = vulkan_ray_resources_.find(handle);
-    TI_ERROR_IF(found == vulkan_ray_resources_.end(),
-                "Vulkan triangle BLAS handle is stale or closed.");
-    resource =
-        std::dynamic_pointer_cast<VulkanTriangleBlasResource>(found->second);
-  }
-  TI_ERROR_IF(!resource, "Vulkan ray resource is not a triangle BLAS.");
-  TI_ERROR_IF(vertex_count != resource->vertex_count() ||
-                  triangle_count != resource->triangle_count(),
-              "Vulkan triangle BLAS build must preserve vertex_count {} and "
-              "triangle_count {}.",
-              resource->vertex_count(), resource->triangle_count());
-
-  auto leases = update ? acquire_ndarray_leases({vertices})
-                       : acquire_ndarray_leases({vertices, indices});
-  pin_ndarray_launch_leases(leases);
-  const auto vertex_allocation = vertices->get_device_allocation();
-  const auto index_allocation =
-      update ? kDeviceNullAllocation : indices->get_device_allocation();
-  enqueue_compute_op_lambda(
-      [resource, vertex_allocation, index_allocation,
-       update](Device *, CommandList *commands) {
-        resource->record_build(commands, vertex_allocation, index_allocation,
-                               update);
-      },
-      {});
-  mark_runtime_submission_pending();
-  return 0;
 }
 
 std::uint64_t Program::create_vulkan_instance_tlas_resource(
@@ -1912,8 +1878,8 @@ Program::vulkan_ray_query_properties() const {
 }
 
 std::uint64_t Program::create_vulkan_triangle_ray_scene(
-    Ndarray *,
-    Ndarray *,
+    const storage::DenseStorageDescriptor &,
+    const storage::DenseStorageDescriptor &,
     std::size_t,
     std::size_t) {
   TI_ERROR("Vulkan ray query requires TI_WITH_VULKAN=ON.");
@@ -1950,10 +1916,19 @@ std::size_t Program::vulkan_triangle_ray_query(std::uint64_t,
   TI_ERROR("Vulkan ray query requires TI_WITH_VULKAN=ON.");
 }
 
-std::size_t Program::vulkan_triangle_ray_refit(std::uint64_t,
-                                               Ndarray *,
-                                               std::size_t) {
-  TI_ERROR("Vulkan ray refit requires TI_WITH_VULKAN=ON.");
+VulkanRayGeometryCommand Program::prepare_vulkan_ray_geometry(
+    std::uint64_t,
+    bool,
+    const storage::DenseStorageDescriptor &,
+    const storage::DenseStorageDescriptor *,
+    std::size_t,
+    std::size_t) {
+  TI_ERROR("Vulkan ray geometry requires TI_WITH_VULKAN=ON.");
+}
+
+std::size_t Program::execute_vulkan_ray_geometry(
+    const VulkanRayGeometryCommand &) {
+  TI_ERROR("Vulkan ray geometry requires TI_WITH_VULKAN=ON.");
 }
 
 VulkanTriangleRaySceneMemoryStatistics
@@ -1963,15 +1938,6 @@ Program::vulkan_triangle_ray_scene_memory_statistics(std::uint64_t) {
 
 std::uint64_t Program::create_vulkan_triangle_blas_resource(std::size_t,
                                                             std::size_t) {
-  TI_ERROR("Vulkan ray query requires TI_WITH_VULKAN=ON.");
-}
-
-std::size_t Program::vulkan_triangle_blas_build(std::uint64_t,
-                                                Ndarray *,
-                                                Ndarray *,
-                                                std::size_t,
-                                                std::size_t,
-                                                bool) {
   TI_ERROR("Vulkan ray query requires TI_WITH_VULKAN=ON.");
 }
 

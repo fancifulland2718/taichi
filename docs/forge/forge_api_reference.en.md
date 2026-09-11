@@ -458,8 +458,17 @@ Only 4-byte data alignment is required: descriptor offsets are aligned during
 preparation and a subrange shader addresses the remaining offset. Unaligned
 output uses 2 KiB (4 KiB typed) of workgroup memory to coalesce writes, not an extra
 global conversion buffer. Tree destruction invalidates prepared query bindings.
-Geometry construction/refit still requires ndarray inputs at this stage.
-`graph.bind(...)` prepares immutable native packets without tracing rays.
+Geometry construction, BLAS build/refit, and `TriangleScene.refit` accept the same
+compact storage kinds with f32 vertices and i32 indices in scalar `(N, 3)` or
+packed vector-3 `(N,)` layout. Subranges retain their byte offsets. Geometry is
+copied device-to-device into the provider's retained build buffers; field inputs
+do not require an intermediate ndarray or host readback. Fixed shape/counts are
+qualified when preparing the native packet, not rescanned on bound execution.
+`TriangleScene.refit` refreshes both its BLAS and one-instance TLAS bounds.
+With independent owners, record BLAS build/refit followed by TLAS build/refit
+before querying displaced geometry; Forge does not discover external TLAS users.
+`graph.bind(...)` prepares immutable native packets without tracing rays or
+building acceleration structures.
 Reusing that binding does not revalidate shapes, dtypes, or non-aliasing;
 `binding.update(...)` prepares a replacement. Provider close/reset and in-flight
 resource retention remain enforced by the native owner.

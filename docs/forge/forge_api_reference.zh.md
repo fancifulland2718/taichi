@@ -381,8 +381,13 @@ Graph 节点，绑定 `rays`、`hits`、`hit_indices` 后由后续 kernel 直接
 包括同一 SNodeTree 内不相交的区间。shape/dtype 合同不变，不隐式 packing。数据只需
 4-byte 对齐；准备时按设备要求对齐 descriptor，子区间 shader 处理剩余偏移。未对齐输出使用
 2 KiB（typed 为 4 KiB）workgroup memory 合并写出，不增加全局转换缓冲。Tree 销毁使旧查询绑定失效。
-本阶段 geometry construction/refit 仍要求 ndarray 输入。
-`graph.bind(...)` 准备不可变 native packet，不执行射线查询；复用该绑定不重复验证
+geometry construction、BLAS build/refit 与 `TriangleScene.refit` 也接受这些 compact 存储类型：
+f32 vertices、i32 indices，scalar `(N, 3)` 或 packed vector-3 `(N,)` 布局，保留子区间字节偏移。
+几何数据仍以 device copy 写入 provider 持有的构建缓冲，但 field 输入不需要中转 ndarray 或 host readback。
+固定 shape/count 在 native packet 准备阶段校验，不在绑定后的执行中重复扫描。
+`TriangleScene.refit` 同时刷新其 BLAS 和单实例 TLAS 的包围范围；独立 owner 则需显式按
+BLAS build/refit → TLAS build/refit → query 排序，Forge 不隐式搜寻外部 TLAS 使用者。
+`graph.bind(...)` 准备不可变 native packet，不执行射线查询或 AS 构建；复用该绑定不重复验证
 shape、dtype 或 non-aliasing，`binding.update(...)` 则准备替代 packet。
 provider 的 close/reset 和在途资源保留仍由 native owner 管理。
 

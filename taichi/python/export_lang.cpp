@@ -1297,6 +1297,7 @@ void export_lang(py::module &m) {
       .def_readwrite("custom_index", &VulkanRayInstanceInfo::custom_index);
 
   py::class_<VulkanRayQueryCommand>(m, "_VulkanRayQueryCommand");
+  py::class_<VulkanRayGeometryCommand>(m, "_VulkanRayGeometryCommand");
   py::class_<PreparedVulkanBufferCommands>(m, "_PreparedVulkanBufferCommands");
 
   py::class_<Program>(m, "Program")
@@ -3147,10 +3148,12 @@ void export_lang(py::module &m) {
       .def("_execute_vulkan_ray_query",
            tracked_native_program_method(&Program::execute_vulkan_ray_query),
            py::call_guard<py::gil_scoped_release>())
-      .def("_vulkan_triangle_ray_refit",
-           tracked_native_program_method(
-               &Program::vulkan_triangle_ray_refit),
-           py::arg("handle"), py::arg("vertices"), py::arg("vertex_count"),
+      .def("_prepare_vulkan_ray_geometry", &Program::prepare_vulkan_ray_geometry,
+           py::arg("handle"), py::arg("independent_blas"), py::arg("vertices"),
+           py::arg("indices"), py::arg("vertex_count"), py::arg("triangle_count"),
+           py::call_guard<py::gil_scoped_release>())
+      .def("_execute_vulkan_ray_geometry",
+           tracked_native_program_method(&Program::execute_vulkan_ray_geometry),
            py::call_guard<py::gil_scoped_release>())
       .def("_vulkan_triangle_ray_scene_memory_stats",
            [](Program &program, std::uint64_t handle) {
@@ -3178,12 +3181,6 @@ void export_lang(py::module &m) {
                &Program::create_vulkan_triangle_blas_resource),
            py::arg("vertex_count"), py::arg("triangle_count"),
            py::call_guard<py::gil_scoped_release>())
-      .def("_vulkan_triangle_blas_build",
-           tracked_native_program_method(
-               &Program::vulkan_triangle_blas_build),
-           py::arg("handle"), py::arg("vertices"), py::arg("indices"),
-           py::arg("vertex_count"), py::arg("triangle_count"),
-           py::arg("update"), py::call_guard<py::gil_scoped_release>())
       .def("_create_vulkan_instance_tlas_resource",
            tracked_native_program_method(
                &Program::create_vulkan_instance_tlas_resource),
