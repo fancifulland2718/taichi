@@ -280,6 +280,45 @@ def test_vulkan_texture_hardware_sampling_qualification():
     assert capability.graph_integration == "inline"
 
 
+@test_utils.test(arch=ti.vulkan, offline_cache=False, advanced_optimization=False)
+def test_rgba32f_store_is_a_side_effect_without_a_temporary_result():
+    image = ti.Texture(ti.Format.rgba32f, (3, 2))
+    source = ti.ndarray(ti.f32, (2, 3, 4))
+    output = ti.ndarray(ti.f32, (2, 3, 4))
+
+    @ti.kernel
+    def constant(texture: ti.types.rw_texture(num_dimensions=2, fmt=ti.Format.rgba32f, lod=0)):
+        texture.store(ti.Vector([0, 0]), ti.Vector([0.25, 0.5, 0.75, 1.0]))
+
+    @ti.kernel
+    def upload(
+        texture: ti.types.rw_texture(num_dimensions=2, fmt=ti.Format.rgba32f, lod=0),
+        values: ti.types.ndarray(dtype=ti.f32, ndim=3),
+    ):
+        for y, x in ti.ndrange(2, 3):
+            texture.store(ti.Vector([x, y]), ti.Vector([values[y, x, c] for c in ti.static(range(4))]))
+
+    @ti.kernel
+    def fetch(
+        texture: ti.types.texture(num_dimensions=2),
+        values: ti.types.ndarray(dtype=ti.f32, ndim=3),
+    ):
+        for y, x in ti.ndrange(2, 3):
+            value = texture.fetch(ti.Vector([x, y]), 0)
+            for c in ti.static(range(4)):
+                values[y, x, c] = value[c]
+
+    constant(image)
+    fetch(image, output)
+    np.testing.assert_array_equal(output.to_numpy()[0, 0], [0.25, 0.5, 0.75, 1.0])
+    values = np.arange(24, dtype=np.float32).reshape(2, 3, 4) / 32
+    for expected in (values, 1 - values):
+        source.from_numpy(expected)
+        upload(image, source)
+        fetch(image, output)
+        np.testing.assert_array_equal(output.to_numpy(), expected)
+
+
 @ti.func
 def taichi_logo(pos: ti.template(), scale: float = 1 / 1.11):
     p = (pos - 0.5) / scale + 0.5

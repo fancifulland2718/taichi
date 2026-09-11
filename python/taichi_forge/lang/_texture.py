@@ -76,7 +76,9 @@ class RWTextureAccessor:
         ast_builder = impl.get_runtime().compiling_callable.ast_builder()
         dbg_info = _ti_core.DebugInfo(impl.get_runtime().get_current_src_info())
         args_group = make_expr_group(*_get_entries(index), *_get_entries(value))
-        impl.expr_init(
+        # A storage-image write has no result. Binding it to a temporary would
+        # leave an unknown-typed alloca when optional optimizations are disabled.
+        ast_builder.insert_expr_stmt(
             ast_builder.make_texture_op_expr(_ti_core.TextureOpType.kStore, self.ptr_expr, args_group, dbg_info)
         )
 
