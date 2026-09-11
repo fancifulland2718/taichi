@@ -20,6 +20,7 @@ capability.
 | --- | --- |
 | `ti.algorithms.sort(keys, values=None, ...)` | Stable Forge sort dispatcher. |
 | `ti.algorithms.sort_by_key(keys, values, ...)` | Sort keys and permute payload values. |
+| `ti.algorithms.prepare_sort(keys, values=None, ...)` | Prepare fixed dense bindings for repeated native stable sort (0.6.3). |
 | `ti.algorithms.parallel_sort(keys, values=None)` | Vanilla-compatible legacy sorter. |
 | `ti.algorithms.PrefixSumExecutor(n).run(values)` | Prefix sum / scan. |
 | `ti.algorithms.device_prefix(values, extent, ...)` | Compose fixed-capacity primitive inputs through a device-resident valid count. |
@@ -52,6 +53,45 @@ capability.
 
 The `experimental_` prefix means the entry point is Forge public API but may
 evolve more conservatively than long-standing vanilla APIs.
+
+## Prepared sort (0.6.3)
+
+```python
+plan = ti.algorithms.prepare_sort(keys, values)
+plan.run()  # Sort current contents; update the same storage in place and repeat.
+builder = ti.graph.GraphBuilder()
+builder.append_native(plan.record())
+graph = builder.compile()
+graph.run({})
+graph.close()
+plan.close()
+```
+
+`PreparedSortPlan` supports CUDA/Vulkan compact, naturally aligned 1D scalar
+ndarrays and qualified dense fields/views, with i32/u32/f32/i64/u64/f64 keys and
+optional equally sized scalar payloads. Key/payload ranges must not overlap.
+Sorting is stable and ascending. Both backends accept `nan_policy="last"`;
+CUDA additionally accepts the existing `"bitwise"` sortable-key order.
+
+Preparation does not execute the sort, submit GPU work, synchronize, or allocate
+scratch. It freezes storage descriptors and resource generations without copying
+fields into ndarrays. Existing backend pipelines/workspace remain lazy and shared
+by the Program; warm execution before timing. Workspace growth may synchronize.
+Mixed-width Vulkan field layouts can place u64 at a merely 4-byte-aligned offset;
+such ranges are rejected, not silently copied. Use naturally aligned storage.
+
+`record()` exposes a root-Graph native action, **not a capture-safe CUDA sort**.
+The action reports runtime-ordered execution and may segment an enclosing Graph.
+`report()` gives the stable physical plan identity and last native workspace size;
+it is not a dedicated per-plan VRAM allocation or a performance claim. No new raw
+sort/provider axis is exposed to CompileIQ.
+
+Changing contents is allowed; replacing storage or changing structure requires
+preparation again. Runtime reset or source retirement invalidates the plan.
+`close()` is idempotent and invalidates its recordings without clearing shared
+scratch or waiting for GPU completion. Pending native work retains storage through
+the existing runtime completion mechanism. Do not close a plan before its Graph's
+last submission; close the Graph first when retiring both objects.
 
 ## Backend Selection
 

@@ -126,6 +126,8 @@ class PreparedNativeStorage {
   mutable std::uint64_t validated_tree_epoch_{0};
 };
 
+class PreparedPrimitiveSort;
+
 // Cold storage bindings for a Python-owned CUDA C-ABI adapter. No vendor API
 // or resource ownership is introduced into Program by this packet.
 struct PreparedExternalCudaStorage {
@@ -1140,6 +1142,11 @@ class TI_DLL_EXPORT Program {
       const std::vector<bool> &writable);
   void with_prepared_native_storage(const PreparedNativeStorage &storage,
                                    const std::function<void()> &submit);
+  std::shared_ptr<PreparedPrimitiveSort> prepare_primitive_sort(
+      const storage::DenseStorageDescriptor &keys,
+      const storage::DenseStorageDescriptor *values,
+      int nan_policy);
+  std::size_t execute_primitive_sort(const PreparedPrimitiveSort &plan);
   intptr_t get_dense_storage_data_ptr_as_int(
       const storage::ResolvedDenseBinding &binding);
 

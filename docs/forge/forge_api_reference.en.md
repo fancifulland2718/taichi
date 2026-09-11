@@ -1071,6 +1071,16 @@ Limits:
 - Whole StructNdarray payloads are not treated as sort keys; member views may
   be accepted by supported native paths.
 
+#### `ti.algorithms.prepare_sort(keys, values=None, *, nan_policy="last")`
+
+Returns `PreparedSortPlan` with `run()`, `record()`, `report()` and idempotent
+`close()` (also a context manager). Fixed compact, naturally aligned 1D scalar
+CUDA/Vulkan storage is validated without executing the sort; contents may then
+change in place. Backend workspace remains lazy and Program-owned. Recording is
+a runtime-ordered Graph action, not a capture-safe CUDA sort. See
+[prepared sort](native_algorithms.en.md#prepared-sort-063) for dtype, alignment,
+NaN policy and lifetime boundaries.
+
 ### Prefix Sum
 
 #### `ti.algorithms.PrefixSumExecutor(length).run(input_arr)`

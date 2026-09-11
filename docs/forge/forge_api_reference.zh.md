@@ -897,6 +897,13 @@ kernel fallback，scan 与 grouped-reduce 明确拒绝；离散/不可微 family
 - key part 必须是长度匹配的 1D scalar 数组。
 - 整个 StructNdarray 不作为 sort key；已支持 native path 可接受 member view。
 
+#### `ti.algorithms.prepare_sort(keys, values=None, *, nan_policy="last")`
+
+返回 `PreparedSortPlan`，提供 `run()`、`record()`、`report()`、幂等 `close()` 及上下文管理。
+固定紧凑、自然对齐的一维 CUDA/Vulkan 标量存储在不执行排序的情况下完成验证，随后可原位更新内容。
+后端 workspace 仍由 Program 按需持有。recording 是 runtime-ordered Graph action，不是可 capture 的 CUDA
+sort。dtype、对齐、NaN 策略和生命周期边界见 [prepared sort](native_algorithms.zh.md#prepared-sort063)。
+
 ### Prefix Sum
 
 #### `ti.algorithms.PrefixSumExecutor(length).run(input_arr)`

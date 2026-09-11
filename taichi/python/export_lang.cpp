@@ -38,6 +38,7 @@
 #include "taichi/program/cuda_cusparselt_capture.h"
 #include "taichi/program/extension.h"
 #include "taichi/program/ndarray.h"
+#include "taichi/program/prepared_primitive.h"
 #include "taichi/program/matrix.h"
 #include "taichi/program/runtime_statistics.h"
 #include "taichi/program/storage_view.h"
@@ -1299,6 +1300,8 @@ void export_lang(py::module &m) {
   py::class_<VulkanRayQueryCommand>(m, "_VulkanRayQueryCommand");
   py::class_<VulkanRayGeometryCommand>(m, "_VulkanRayGeometryCommand");
   py::class_<PreparedVulkanBufferCommands>(m, "_PreparedVulkanBufferCommands");
+  py::class_<PreparedPrimitiveSort, std::shared_ptr<PreparedPrimitiveSort>>(
+      m, "_PreparedPrimitiveSort");
   py::class_<PreparedExternalCudaStorage>(m, "_PreparedExternalCudaStorage")
       .def_readonly("pointers", &PreparedExternalCudaStorage::pointers);
 
@@ -2754,6 +2757,13 @@ void export_lang(py::module &m) {
           py::arg("commands"))
       .def("_execute_vulkan_buffer_commands",
            tracked_native_program_method(&Program::execute_vulkan_buffer_commands),
+           py::call_guard<py::gil_scoped_release>())
+      .def("_prepare_primitive_sort", &Program::prepare_primitive_sort,
+           py::arg("keys"), py::arg("values") = nullptr,
+           py::arg("nan_policy") = 0,
+           py::call_guard<py::gil_scoped_release>())
+      .def("_execute_primitive_sort",
+           tracked_native_program_method(&Program::execute_primitive_sort),
            py::call_guard<py::gil_scoped_release>())
       .def("vulkan_graphics_pipeline_available",
            &Program::vulkan_graphics_pipeline_available)

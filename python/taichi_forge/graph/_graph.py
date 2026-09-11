@@ -5435,7 +5435,11 @@ class _CompiledNativeGraphNode:
             )
         )
         self.runtime_arg_names = public_runtime_arg_names
-        self.needs_runtime_args = bool(self.recording_runtime_arg_names)
+        # Even an argument-free backend recording needs the prepared native
+        # action context. Its public argument schema can still be empty.
+        self.needs_runtime_args = bool(self.recording_runtime_arg_names) or isinstance(
+            self.recordable_action, BackendCommandGraphAction
+        )
         self.lifetime_leases = (
             executable,
             *tuple(executable.lifetime_leases),

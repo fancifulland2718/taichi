@@ -16,6 +16,7 @@
 | --- | --- |
 | `ti.algorithms.sort(keys, values=None, ...)` | Forge 稳定排序调度器。 |
 | `ti.algorithms.sort_by_key(keys, values, ...)` | 排序 keys 并同步移动 payload values。 |
+| `ti.algorithms.prepare_sort(keys, values=None, ...)` | 为重复 native 稳定排序准备固定 dense 绑定（0.6.3）。 |
 | `ti.algorithms.parallel_sort(keys, values=None)` | vanilla 兼容的 legacy sorter。 |
 | `ti.algorithms.PrefixSumExecutor(n).run(values)` | Prefix sum / scan。 |
 | `ti.algorithms.device_prefix(values, extent, ...)` | 通过 device-resident 有效数量组合固定容量 primitive 输入。 |
@@ -47,6 +48,36 @@
 | `ti.algorithms.max_abs(values, ...)` / `max_abs_delta(values, reference, ...)` | 在 device 上计算收敛/误差类最大绝对值指标。 |
 
 名称里的 `experimental_` 表示这是 Forge 公开入口，但演进节奏会比长期 vanilla API 更保守。
+
+## Prepared sort（0.6.3）
+
+```python
+plan = ti.algorithms.prepare_sort(keys, values)
+plan.run()  # 排序当前内容；之后可原位更新同一存储并重复执行。
+builder = ti.graph.GraphBuilder()
+builder.append_native(plan.record())
+graph = builder.compile()
+graph.run({})
+graph.close()
+plan.close()
+```
+
+`PreparedSortPlan` 支持 CUDA/Vulkan 上紧凑、自然对齐的一维标量 ndarray 和合格 dense field/view。
+keys 与可选等长 payload 支持 i32/u32/f32/i64/u64/f64，两个范围不得重叠；固定为升序稳定排序。
+两后端都支持 `nan_policy="last"`，CUDA 还支持现有 `"bitwise"` sortable-key 位序。
+
+准备不执行排序、不提交 GPU 工作、不同步、不分配 scratch；只冻结存储描述与资源 generation，不做
+field→ndarray 复制。后端 pipeline/workspace 仍由 Program 按需共享，计时前需预热，workspace 增长可能同步。
+Vulkan 混合位宽 field 布局可能把 u64 放在仅 4 字节对齐的偏移上；这种范围明确拒绝，不隐式复制，需使用自然
+对齐存储。
+
+`record()` 提供 root Graph native action，**并非可 capture 的 CUDA sort**，报告 runtime-ordered 执行，可能使
+整图分段。`report()` 给出稳定物理计划身份与最近的 native workspace 大小；它不是每 plan 独占显存或性能结论。
+本接口不向 CompileIQ 新增裸 sort/provider 搜索轴。
+
+内容可原位改变；换存储、改结构需重新准备。runtime reset 或源资源退休使 plan 失效。`close()` 幂等并使已有
+recording 失效，不清共享 scratch、不等待 GPU；已提交工作的存储由原有 runtime completion 保留。
+不要在 Graph 最后一次提交前关闭 plan；同时退休时先关闭 Graph。
 
 ## 后端选择
 
