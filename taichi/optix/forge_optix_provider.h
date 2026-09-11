@@ -41,6 +41,8 @@ typedef enum TiForgeOptixFeature {
   TI_FORGE_OPTIX_FEATURE_BATCH_CLOSEST_HIT = 1ull << 3,
   TI_FORGE_OPTIX_FEATURE_RUNTIME_ORDERED_STREAM = 1ull << 4,
   TI_FORGE_OPTIX_FEATURE_EXACT_DEVICE_MEMORY = 1ull << 5,
+  TI_FORGE_OPTIX_FEATURE_TYPED_HITS = 1ull << 6,
+  TI_FORGE_OPTIX_FEATURE_WORD_ALIGNED_QUERY_STORAGE = 1ull << 7,
 } TiForgeOptixFeature;
 
 typedef struct TiForgeOptixProviderInfo {
@@ -80,6 +82,17 @@ typedef struct TiForgeOptixTraceDesc {
   uint64_t cuda_stream;
 } TiForgeOptixTraceDesc;
 
+// hits: float4(t, u, v, 0); hit_indices: uint4(primitive, instance, custom, hit).
+// A miss writes (-1, 0, 0, 0) and (UINT32_MAX, UINT32_MAX, UINT32_MAX, 0).
+typedef struct TiForgeOptixTypedTraceDesc {
+  uint32_t struct_size;
+  uint32_t ray_count;
+  uint64_t rays;
+  uint64_t hits;
+  uint64_t hit_indices;
+  uint64_t cuda_stream;
+} TiForgeOptixTypedTraceDesc;
+
 typedef struct TiForgeOptixSceneMemory {
   uint32_t struct_size;
   uint32_t reserved;
@@ -118,6 +131,11 @@ typedef TiForgeOptixResult (*TiForgeOptixDestroyTriangleSceneFn)(
     TiForgeOptixTriangleScene scene);
 typedef size_t (*TiForgeOptixGetLastErrorFn)(char *destination,
                                              size_t destination_size);
+typedef TiForgeOptixResult (*TiForgeOptixPrepareTypedFn)(
+    TiForgeOptixContext context);
+typedef TiForgeOptixResult (*TiForgeOptixTraceTypedFn)(
+    TiForgeOptixTriangleScene scene,
+    const TiForgeOptixTypedTraceDesc *desc);
 
 typedef struct TiForgeOptixProviderApi {
   uint32_t struct_size;
@@ -132,6 +150,9 @@ typedef struct TiForgeOptixProviderApi {
   TiForgeOptixGetSceneMemoryFn get_scene_memory;
   TiForgeOptixDestroyTriangleSceneFn destroy_triangle_scene;
   TiForgeOptixGetLastErrorFn get_last_error;
+  // Optional ABI-1 suffix. Callers negotiate via struct_size + feature bits.
+  TiForgeOptixPrepareTypedFn prepare_typed;
+  TiForgeOptixTraceTypedFn trace_typed;
 } TiForgeOptixProviderApi;
 
 typedef TiForgeOptixResult (*TiForgeOptixProviderQueryFn)(

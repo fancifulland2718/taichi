@@ -225,7 +225,7 @@ def ray_optional_operations(_operation):
             ),
             public_api="ti.hardware.ray.OptixTriangleScene.record_refit",
             notes=(
-                "Graph replay reissues one provider update on the runtime default stream.",
+                "Graph execution reissues an ordered GAS and identity-IAS update without a per-refit host wait.",
                 "The explicit provider and its scene must outlive every retained Graph recording.",
             ),
         ),
@@ -253,11 +253,13 @@ def ray_optional_operations(_operation):
                 "bundled Forge OptiX provider ABI 1",
                 "installed driver runtime accepting OPTIX_ABI_VERSION 93, 105, or 118",
                 "fixed Forge f32x8 ray and f32x4 closest-hit storage ABI",
+                "compact program-owned ndarray, dense field or view; typed indices require the optional ABI-1 suffix",
             ),
             public_api="ti.hardware.ray.OptixTriangleScene.record",
             notes=(
                 "The runtime wheel carries thin adapters compiled from pinned official headers; it does not bundle nvoptix or the CUDA Toolkit.",
                 "Provider loading is explicit and failure-isolated; normal CUDA initialization and every other provider remain independent.",
+                "record_typed writes f32(t,u,v,0) and i32/u32(primitive,instance,custom,hit); fixed Graph bindings prepare storage before submission.",
                 "No kernel-inline route, automatic selection, cross-device qualification, or performance claim is made.",
             ),
         ),

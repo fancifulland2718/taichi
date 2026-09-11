@@ -9658,6 +9658,56 @@ Program::begin_external_cuda_submission() {
       new ExternalCudaSubmissionScope(this));
 }
 
+PreparedExternalCudaStorage Program::prepare_external_cuda_storage(
+    const std::vector<const storage::DenseStorageDescriptor *> &descriptors,
+    const std::vector<bool> &writable) {
+  TI_ERROR_IF(compile_config().arch != Arch::cuda,
+              "External CUDA storage requires the CUDA backend");
+  // Hold both lifetime boundaries through pointer resolution. Preparing a
+  // packet does not issue work or pin an in-flight allocation.
+  std::optional<SNodeTreeLifecycleReadGuard> lifecycle_guard;
+  if (active_snode_tree_lifecycle_program != this) {
+    lifecycle_guard.emplace(acquire_snode_tree_lifecycle_read_guard());
+  }
+  auto submission_guard = acquire_runtime_resource_submission_guard();
+  PreparedExternalCudaStorage packet;
+  packet.storage = prepare_native_storage(descriptors, writable);
+  for (std::size_t i = 0; i < descriptors.size(); ++i) {
+    const auto &binding = packet.storage->binding(i);
+    auto *base = program_impl_->get_device_alloc_info_ptr(
+        DeviceAllocation{binding.pointer.device, binding.pointer.alloc_id});
+    TI_ERROR_IF(!base, "External CUDA storage has no device pointer");
+    packet.pointers.push_back(reinterpret_cast<std::uintptr_t>(base) +
+                              binding.pointer.offset);
+    for (std::size_t j = 0; j < i; ++j) {
+      const auto &other = packet.storage->binding(j);
+      const auto left = packet.pointers[j];
+      const auto right = packet.pointers[i];
+      TI_ERROR_IF((writable[i] || writable[j]) &&
+                      left < right + binding.bytes &&
+                      right < left + other.bytes,
+                  "External CUDA writable storage ranges must not overlap");
+    }
+  }
+  return packet;
+}
+
+void Program::invoke_external_cuda_prepared(
+    const PreparedExternalCudaStorage &packet,
+    const std::function<void()> &invoke) {
+  with_prepared_native_storage(*packet.storage, [&] {
+    // Resource generations are checked and pinned before the adapter can
+    // enqueue work, including a partially successful call that then fails.
+    mark_runtime_submission(RuntimeSubmissionKind::kNative);
+    try {
+      invoke();
+    } catch (...) {
+      record_runtime_submission_failure();
+      throw;
+    }
+  });
+}
+
 void Program::fill_ndarray_fast_u32(Ndarray *ndarray, uint32_t val) {
   ScopedCpuPrimitiveProgram cpu_primitive_program_scope(this);
   TI_ERROR_IF(!ndarray, "fill_ndarray_fast_u32 received a null ndarray.");

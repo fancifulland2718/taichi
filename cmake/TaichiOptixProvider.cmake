@@ -73,8 +73,6 @@ function(_ti_add_optix_provider target_name root)
     _ti_validate_optix_root("${root}" any _header_abi)
     set(_generated_dir
         "${CMAKE_CURRENT_BINARY_DIR}/generated/optix_provider_${_header_abi}")
-    set(_ptx "${_generated_dir}/device_program.ptx")
-    set(_ptx_header "${_generated_dir}/device_program_ptx.h")
     # This custom PTX command does not enable CMake's CUDA language, so honor
     # its explicit host-compiler setting ourselves. The PTX toolchain may use
     # an older supported MSVC than the native runtime/shim toolchain.
@@ -83,34 +81,43 @@ function(_ti_add_optix_provider target_name root)
         list(APPEND _ptx_host_options
              --compiler-bindir "${CMAKE_CUDA_HOST_COMPILER}")
     endif()
-    add_custom_command(
-        OUTPUT "${_ptx}"
-        COMMAND ${CMAKE_COMMAND} -E make_directory "${_generated_dir}"
-        COMMAND "${CUDAToolkit_NVCC_EXECUTABLE}"
-                ${_ptx_host_options}
-                --ptx --std=c++17 --use_fast_math
-                --gpu-architecture=compute_75
-                -I "${root}/include"
-                "${CMAKE_CURRENT_SOURCE_DIR}/taichi/optix/provider/device_program.cu"
-                -o "${_ptx}"
-        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/taichi/optix/provider/device_program.cu"
-        VERBATIM)
-    add_custom_command(
-        OUTPUT "${_ptx_header}"
-        COMMAND ${CMAKE_COMMAND}
-                "-DINPUT_FILE=${_ptx}"
-                "-DOUTPUT_FILE=${_ptx_header}"
-                "-DSYMBOL_NAME=ti_forge_optix_device_ptx"
-                "-DEXPECTED_PTX_VERSION=${_ti_optix_expected_ptx_version}"
-                "-DEXPECTED_PTX_TARGET=sm_75"
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedText.cmake"
-        DEPENDS "${_ptx}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedText.cmake"
-        VERBATIM)
+    set(_ptx_headers)
+    # Keep the legacy four-payload module independent from typed-hit payloads.
+    # Both artifacts retain the same portable PTX version and target contract.
+    foreach(_typed IN ITEMS 0 1)
+        set(_ptx "${_generated_dir}/device_program_${_typed}.ptx")
+        set(_ptx_header "${_generated_dir}/device_program_${_typed}_ptx.h")
+        list(APPEND _ptx_headers "${_ptx_header}")
+        add_custom_command(
+            OUTPUT "${_ptx}"
+            COMMAND ${CMAKE_COMMAND} -E make_directory "${_generated_dir}"
+            COMMAND "${CUDAToolkit_NVCC_EXECUTABLE}"
+                    ${_ptx_host_options}
+                    --ptx --std=c++17 --use_fast_math
+                    --gpu-architecture=compute_75
+                    -DTI_FORGE_OPTIX_TYPED=${_typed}
+                    -I "${root}/include"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/taichi/optix/provider/device_program.cu"
+                    -o "${_ptx}"
+            DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/taichi/optix/provider/device_program.cu"
+            VERBATIM)
+        add_custom_command(
+            OUTPUT "${_ptx_header}"
+            COMMAND ${CMAKE_COMMAND}
+                    "-DINPUT_FILE=${_ptx}"
+                    "-DOUTPUT_FILE=${_ptx_header}"
+                    "-DSYMBOL_NAME=ti_forge_optix_device_${_typed}_ptx"
+                    "-DEXPECTED_PTX_VERSION=${_ti_optix_expected_ptx_version}"
+                    "-DEXPECTED_PTX_TARGET=sm_75"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedText.cmake"
+            DEPENDS "${_ptx}" "${CMAKE_CURRENT_SOURCE_DIR}/cmake/EmbedText.cmake"
+            VERBATIM)
+    endforeach()
 
     add_library(${target_name} SHARED
         "${CMAKE_CURRENT_SOURCE_DIR}/taichi/optix/provider/provider.cpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/taichi/optix/forge_optix_provider.h"
-        "${_ptx_header}")
+        ${_ptx_headers})
     target_compile_features(${target_name} PRIVATE cxx_std_17)
     target_compile_definitions(${target_name}
         PRIVATE TI_FORGE_OPTIX_PROVIDER_BUILD OPTIX_ENABLE_SDK_MIXING)

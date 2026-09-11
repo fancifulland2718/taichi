@@ -2,6 +2,7 @@
 
 import ctypes
 from dataclasses import dataclass
+from functools import partial
 import importlib.util
 import os
 from pathlib import Path
@@ -14,7 +15,6 @@ from taichi_forge._hardware_telemetry import (
 )
 from taichi_forge.graph._ir import GraphAccess, ResourceEffect
 from taichi_forge.graph._native import BackendCommandRecording
-from taichi_forge.hardware._external_cuda_submission import external_cuda_submission
 from taichi_forge.hardware._memory import HardwareMemoryComponent, make_memory_report
 from taichi_forge.hardware._native_adapter import (
     native_recording_node,
@@ -26,8 +26,9 @@ from taichi_forge.hardware._native_adapter import (
 from taichi_forge.hardware._runtime import active_backend
 from taichi_forge.lang import impl
 from taichi_forge.lang._ndarray import Ndarray
+from taichi_forge.lang._storage_view import describe_storage
 from taichi_forge.lang.exception import TaichiRuntimeError
-from taichi_forge.types.primitive_types import f32, i32
+from taichi_forge.types.primitive_types import f32, i32, u32
 
 
 PROVIDER_ABI_VERSION = 1
@@ -38,6 +39,8 @@ SUPPORTED_OPTIX_ABIS = (93, 105, 118)
 _SUCCESS = 0
 _OPTIX_UNAVAILABLE = 4
 _REQUIRED_FEATURES = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 4)
+_TYPED_HITS = 1 << 6
+_WORD_ALIGNED_QUERY_STORAGE = 1 << 7
 _loaded_providers = weakref.WeakSet()
 
 
@@ -129,6 +132,17 @@ class _SceneMemory(ctypes.Structure):
     ]
 
 
+class _TypedTraceDesc(ctypes.Structure):
+    _fields_ = [
+        ("struct_size", ctypes.c_uint32),
+        ("ray_count", ctypes.c_uint32),
+        ("rays", ctypes.c_uint64),
+        ("hits", ctypes.c_uint64),
+        ("hit_indices", ctypes.c_uint64),
+        ("cuda_stream", ctypes.c_uint64),
+    ]
+
+
 _ProbeRuntime = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_char_p)
 _CreateContext = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.POINTER(_ContextDesc), ctypes.POINTER(ctypes.c_void_p)
@@ -148,6 +162,10 @@ _GetSceneMemory = ctypes.CFUNCTYPE(
     ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_SceneMemory)
 )
 _DestroyScene = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
+_PrepareTyped = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
+_TraceTyped = ctypes.CFUNCTYPE(
+    ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(_TypedTraceDesc)
+)
 _GetLastError = ctypes.CFUNCTYPE(
     ctypes.c_size_t, ctypes.POINTER(ctypes.c_char), ctypes.c_size_t
 )
@@ -167,6 +185,8 @@ class _ProviderApi(ctypes.Structure):
         ("get_scene_memory", _GetSceneMemory),
         ("destroy_triangle_scene", _DestroyScene),
         ("get_last_error", _GetLastError),
+        ("prepare_typed", _PrepareTyped),
+        ("trace_typed", _TraceTyped),
     ]
 
 
@@ -191,7 +211,7 @@ def _provider_error(api):
 
 
 def _check_api(api):
-    if api.struct_size < ctypes.sizeof(_ProviderApi):
+    if api.struct_size < _ProviderApi.prepare_typed.offset:
         raise RuntimeError("OptiX provider returned a truncated Forge API table")
     if api.provider_abi_version != PROVIDER_ABI_VERSION:
         raise RuntimeError("OptiX provider returned a mismatched Forge ABI")
@@ -393,13 +413,15 @@ def passive_status():
     }
 
 
-def _item_count(value, width, dtype, name):
-    if not isinstance(value, Ndarray):
-        raise TaichiRuntimeError(f"OptiX ray {name} must be a Taichi ndarray")
-    shape = tuple(value.shape)
-    element_shape = tuple(value.element_shape)
-    if value.dtype != dtype:
-        raise TaichiRuntimeError(f"OptiX ray {name} must use dtype {dtype}")
+def _ray_storage(value, width, dtypes, name):
+    description = describe_storage(value)
+    descriptor = description.descriptor
+    if descriptor is None or not description.supported:
+        raise TaichiRuntimeError(f"OptiX ray {name} requires canonical dense storage")
+    shape = tuple(descriptor.index_shape)
+    element_shape = tuple(descriptor.element_shape)
+    if descriptor.scalar_type not in dtypes:
+        raise TaichiRuntimeError(f"OptiX ray {name} must use dtype {dtypes}")
     if element_shape == () and len(shape) == 2 and shape[1] == width:
         count = shape[0]
     elif element_shape == (width,) and len(shape) == 1:
@@ -411,14 +433,39 @@ def _item_count(value, width, dtype, name):
         )
     if count <= 0:
         raise TaichiRuntimeError(f"OptiX ray {name} must not be empty")
-    return count
+    return description, count
 
 
-def _device_pointer(value):
-    program = impl.get_runtime().prog
-    if program is None:
-        raise TaichiRuntimeError("OptiX device storage requires an active runtime")
-    return int(program.get_ndarray_data_ptr_as_int(value.arr))
+def _invoke_checked(api, function, *args):
+    if int(function(*args)) != _SUCCESS:
+        raise TaichiRuntimeError(_provider_error(api))
+
+
+@dataclass(frozen=True)
+class _PreparedOptixCall:
+    owner: object
+    storage: object
+    call: object
+    owners: tuple
+
+    def __call__(self):
+        self.owner._validate_lifetime()
+        with hardware_failure_phase("provider_execution_failure"):
+            self.owner._runtime_prog._invoke_external_cuda_prepared(
+                self.storage, self.call
+            )
+
+
+def _prepare_storage(owner, values, descriptions, writable):
+    packet = owner._runtime_prog._prepare_external_cuda_storage(
+        tuple(item.descriptor for item in descriptions), writable
+    )
+    owners = (
+        *values,
+        *descriptions,
+        *(value.arr for value in values if isinstance(value, Ndarray)),
+    )
+    return packet, owners
 
 
 class OptixProvider:
@@ -497,6 +544,8 @@ class OptixProvider:
         self._runtime_prog = program
         self._runtime_generation = int(impl.runtime_generation())
         self._scenes = weakref.WeakSet()
+        self._typed_prepared = False
+        self._shared_pipeline_sbt_bytes = 0
         info = loaded.api.info
         self.identity = MappingProxyType(
             {
@@ -522,6 +571,37 @@ class OptixProvider:
     def triangle_scene(self, vertices, indices, *, allow_update=True):
         self._validate_lifetime()
         return OptixTriangleScene(self, vertices, indices, allow_update=allow_update)
+
+    def _prepare_typed(self, scene):
+        self._validate_lifetime()
+        if self._typed_prepared:
+            return
+        api = self._loaded.api
+        if (
+            api.struct_size < ctypes.sizeof(_ProviderApi)
+            or not int(api.info.features) & _TYPED_HITS
+            or not bool(api.prepare_typed)
+            or not bool(api.trace_typed)
+        ):
+            raise TaichiRuntimeError(
+                "OptiX adapter does not support typed hits; use a newer Forge adapter"
+            )
+        with hardware_failure_phase("provider_plan_failure"):
+            # The existing submission gate also orders explicit scene/context
+            # close against this cold adapter preparation; no work is replayed.
+            scope = self._runtime_prog._begin_external_cuda_submission()
+            try:
+                scene._validate_lifetime()
+                _invoke_checked(api, api.prepare_typed, self._context)
+                memory = _SceneMemory()
+                memory.struct_size = ctypes.sizeof(memory)
+                _invoke_checked(
+                    api, api.get_scene_memory, scene._scene, ctypes.byref(memory)
+                )
+                self._shared_pipeline_sbt_bytes = int(memory.shared_pipeline_sbt_bytes)
+            finally:
+                del scope
+        self._typed_prepared = True
 
     def _validate_lifetime(self):
         if self._context is None:
@@ -563,7 +643,7 @@ class OptixProvider:
 class OptixRayQueryRecording(BackendCommandRecording):
     """One runtime-ordered OptiX launch against a fixed scene generation."""
 
-    def __init__(self, scene, ray_count, *, rays="rays", hits="hits"):
+    def __init__(self, scene, ray_count, *, rays="rays", hits="hits", hit_indices=None):
         if not isinstance(scene, OptixTriangleScene):
             raise TypeError("OptiX ray query recording requires an OptixTriangleScene")
         if (
@@ -572,13 +652,14 @@ class OptixRayQueryRecording(BackendCommandRecording):
             or not 1 <= ray_count <= 0xFFFFFFFF
         ):
             raise ValueError("OptiX ray count must be in [1, UINT32_MAX]")
-        if any(not isinstance(name, str) or not name for name in (rays, hits)):
+        names = (rays, hits) if hit_indices is None else (rays, hits, hit_indices)
+        if any(not isinstance(name, str) or not name for name in names):
             raise ValueError("OptiX ray bindings must be nonempty strings")
-        if rays == hits:
+        if len(set(names)) != len(names):
             raise ValueError("OptiX ray bindings must be unique")
         super().__init__(
             backend="cuda",
-            binding_names=(rays, hits),
+            binding_names=names,
             command_count=1,
             queue="compute",
             stream_binding="runtime_ordered",
@@ -591,25 +672,69 @@ class OptixRayQueryRecording(BackendCommandRecording):
         object.__setattr__(self, "ray_count", ray_count)
         object.__setattr__(self, "rays", rays)
         object.__setattr__(self, "hits", hits)
+        object.__setattr__(self, "hit_indices", hit_indices)
+        if hit_indices is not None:
+            scene.provider._prepare_typed(scene)
 
     @property
     def resource_effects(self):
-        return (
+        effects = (
             ResourceEffect(self.rays, GraphAccess.READ),
             ResourceEffect(self.hits, GraphAccess.WRITE),
             static_resource_effect(self.scene._effect_name, GraphAccess.READ),
         )
+        if self.hit_indices is not None:
+            effects += (ResourceEffect(self.hit_indices, GraphAccess.WRITE),)
+        return effects
 
     def execute(self, bindings):
+        return self.prepare_graph_execute(bindings)()
+
+    def _binding_descriptions(self, bindings):
+        specs = [(self.rays, (f32,), 8), (self.hits, (f32,), 4)]
+        if self.hit_indices is not None:
+            specs.append((self.hit_indices, (i32, u32), 4))
+        descriptions = []
+        for name, dtypes, width in specs:
+            description, count = _ray_storage(bindings[name], width, dtypes, name)
+            if count != self.ray_count:
+                raise TaichiRuntimeError(
+                    f"OptiX {name} binding has the wrong ray count"
+                )
+            descriptions.append(description)
+        return descriptions
+
+    def validate_graph_bindings(self, bindings):
+        self._binding_descriptions(bindings)
+
+    def prepare_graph_execute(self, bindings):
         validate_exact_bindings(self, bindings, "OptiX ray query")
         self.validate_graph_lifetime()
-        rays = bindings[self.rays]
-        hits = bindings[self.hits]
-        if _item_count(rays, 8, f32, self.rays) != self.ray_count:
-            raise TaichiRuntimeError("OptiX ray binding has the wrong ray count")
-        if _item_count(hits, 4, f32, self.hits) != self.ray_count:
-            raise TaichiRuntimeError("OptiX hit binding has the wrong ray count")
-        self.scene._execute_query(rays, hits, self.ray_count)
+        descriptions = self._binding_descriptions(bindings)
+        values = tuple(bindings[name] for name in self.binding_names)
+        storage, owners = _prepare_storage(
+            self.scene, values, descriptions, (False, *([True] * (len(values) - 1)))
+        )
+        api = self.scene.provider._loaded.api
+        if not int(api.info.features) & _WORD_ALIGNED_QUERY_STORAGE:
+            if any(pointer % 16 for pointer in storage.pointers):
+                raise TaichiRuntimeError(
+                    "This OptiX adapter requires 16-byte aligned ray/hit storage; "
+                    "use a newer Forge adapter for word-aligned dense views"
+                )
+        descriptor_type = _TraceDesc if self.hit_indices is None else _TypedTraceDesc
+        function = api.trace if self.hit_indices is None else api.trace_typed
+        desc = descriptor_type(
+            ctypes.sizeof(descriptor_type), self.ray_count, *storage.pointers, 0
+        )
+        return _PreparedOptixCall(
+            self.scene,
+            storage,
+            partial(
+                _invoke_checked, api, function, self.scene._scene, ctypes.byref(desc)
+            ),
+            owners,
+        )
 
     def validate_graph_lifetime(self):
         self.scene._validate_lifetime()
@@ -625,7 +750,9 @@ class OptixRayQueryRecording(BackendCommandRecording):
                 "kind": "optix_triangle_ray_query",
                 "ray_count": item.ray_count,
                 "provider_abi": PROVIDER_ABI_NAME,
+                "hit_layout": "legacy_float4" if item.hit_indices is None else "typed",
             },
+            publish_time_binding_validation_stable=True,
         )
 
 
@@ -660,9 +787,48 @@ class OptixRayRefitRecording(BackendCommandRecording):
         )
 
     def execute(self, bindings):
+        return self.prepare_graph_execute(bindings)()
+
+    def _binding_descriptions(self, bindings):
+        description, count = _ray_storage(
+            bindings[self.vertices], 3, (f32,), self.vertices
+        )
+        if count != self.scene.vertex_count:
+            raise TaichiRuntimeError("OptiX refit must preserve the vertex count")
+        return description, self.scene._indices_description
+
+    def validate_graph_bindings(self, bindings):
+        self._binding_descriptions(bindings)
+
+    def prepare_graph_execute(self, bindings):
         validate_exact_bindings(self, bindings, "OptiX ray refit")
         self.validate_graph_lifetime()
-        self.scene.refit(bindings[self.vertices])
+        descriptions = self._binding_descriptions(bindings)
+        values = (bindings[self.vertices], self.scene._indices)
+        storage, owners = _prepare_storage(
+            self.scene, values, descriptions, (False, False)
+        )
+        desc = _TriangleSceneDesc(
+            ctypes.sizeof(_TriangleSceneDesc),
+            self.scene.vertex_count,
+            self.scene.triangle_count,
+            1,
+            *storage.pointers,
+            0,
+        )
+        api = self.scene.provider._loaded.api
+        return _PreparedOptixCall(
+            self.scene,
+            storage,
+            partial(
+                _invoke_checked,
+                api,
+                api.update_triangle_scene,
+                self.scene._scene,
+                ctypes.byref(desc),
+            ),
+            owners,
+        )
 
     def validate_graph_lifetime(self):
         self.scene._validate_lifetime()
@@ -678,6 +844,7 @@ class OptixRayRefitRecording(BackendCommandRecording):
                 "kind": "optix_triangle_gas_update",
                 "vertex_count": item.scene.vertex_count,
             },
+            publish_time_binding_validation_stable=True,
         )
 
 
@@ -690,32 +857,38 @@ class OptixTriangleScene:
         if not isinstance(allow_update, bool):
             raise TypeError("allow_update must be a bool")
         provider._validate_lifetime()
-        vertex_count = _item_count(vertices, 3, f32, "vertices")
-        triangle_count = _item_count(indices, 3, i32, "indices")
+        vertex_description, vertex_count = _ray_storage(vertices, 3, (f32,), "vertices")
+        index_description, triangle_count = _ray_storage(indices, 3, (i32,), "indices")
+        storage, owners = _prepare_storage(
+            provider,
+            (vertices, indices),
+            (vertex_description, index_description),
+            (False, False),
+        )
         scene = ctypes.c_void_p()
-        with external_cuda_submission(
-            provider._runtime_prog, (vertices, indices)
-        ) as submission:
-            desc = _TriangleSceneDesc(
-                ctypes.sizeof(_TriangleSceneDesc),
-                vertex_count,
-                triangle_count,
-                int(allow_update),
-                _device_pointer(vertices),
-                _device_pointer(indices),
-                0,
+        desc = _TriangleSceneDesc(
+            ctypes.sizeof(_TriangleSceneDesc),
+            vertex_count,
+            triangle_count,
+            int(allow_update),
+            *storage.pointers,
+            0,
+        )
+        api = provider._loaded.api
+        with hardware_failure_phase("provider_plan_failure"):
+            provider._runtime_prog._invoke_external_cuda_prepared(
+                storage,
+                partial(
+                    _invoke_checked,
+                    api,
+                    api.create_triangle_scene,
+                    provider._context,
+                    ctypes.byref(desc),
+                    ctypes.byref(scene),
+                ),
             )
-            with hardware_failure_phase("provider_plan_failure"):
-                result = int(
-                    submission.invoke(
-                        provider._loaded.api.create_triangle_scene,
-                        provider._context,
-                        ctypes.byref(desc),
-                        ctypes.byref(scene),
-                    )
-                )
-                if result != _SUCCESS or not scene.value:
-                    raise TaichiRuntimeError(_provider_error(provider._loaded.api))
+            if not scene.value:
+                raise TaichiRuntimeError("OptiX provider returned an empty scene")
         self.provider = provider
         self._scene = scene
         self._runtime_prog = provider._runtime_prog
@@ -724,6 +897,8 @@ class OptixTriangleScene:
         self.triangle_count = triangle_count
         self.allow_update = allow_update
         self._indices = indices
+        self._indices_description = index_description
+        self._index_owner = indices.arr if isinstance(indices, Ndarray) else indices
         self._effect_name = (
             f"optix-ray-scene:{self._runtime_generation}:{int(scene.value)}"
         )
@@ -735,6 +910,7 @@ class OptixTriangleScene:
             self._scene = None
             raise TaichiRuntimeError(_provider_error(provider._loaded.api))
         self._memory = memory
+        provider._shared_pipeline_sbt_bytes = int(memory.shared_pipeline_sbt_bytes)
         provider._scenes.add(self)
 
     @property
@@ -746,9 +922,30 @@ class OptixTriangleScene:
         return OptixRayQueryRecording(self, ray_count, rays=rays, hits=hits)
 
     def trace(self, rays, hits):
-        ray_count = _item_count(rays, 8, f32, "rays")
+        ray_count = _ray_storage(rays, 8, (f32,), "rays")[1]
         self.record(ray_count).execute({"rays": rays, "hits": hits})
         return hits
+
+    def record_typed(
+        self, ray_count, *, rays="rays", hits="hits", hit_indices="hit_indices"
+    ):
+        """Record f32 (t,u,v,0) and i32/u32 (primitive,instance,custom,hit).
+
+        Misses write (-1,0,0,0) and (-1,-1,-1,0), with UINT32_MAX for u32.
+        This single-instance scene has instance ordinal and custom ID zero.
+        t is the ray parameter (distance only for unit directions); triangle
+        weights are (1-u-v,u,v). Scalar (N,4) and AOS vector-4 layouts are accepted.
+        """
+        self._validate_lifetime()
+        return OptixRayQueryRecording(
+            self, ray_count, rays=rays, hits=hits, hit_indices=hit_indices
+        )
+
+    def trace_typed(self, rays, hits, hit_indices):
+        self.record_typed(_ray_storage(rays, 8, (f32,), "rays")[1]).execute(
+            {"rays": rays, "hits": hits, "hit_indices": hit_indices}
+        )
+        return hits, hit_indices
 
     def record_refit(self, *, vertices="vertices"):
         self._validate_lifetime()
@@ -757,55 +954,8 @@ class OptixTriangleScene:
         return OptixRayRefitRecording(self, vertices=vertices)
 
     def refit(self, vertices):
-        self._validate_lifetime()
-        if not self.allow_update:
-            raise TaichiRuntimeError("OptiX scene was not created for updates")
-        if _item_count(vertices, 3, f32, "vertices") != self.vertex_count:
-            raise TaichiRuntimeError("OptiX refit must preserve the vertex count")
-        with external_cuda_submission(
-            self._runtime_prog, (vertices, self._indices)
-        ) as submission:
-            desc = _TriangleSceneDesc(
-                ctypes.sizeof(_TriangleSceneDesc),
-                self.vertex_count,
-                self.triangle_count,
-                1,
-                _device_pointer(vertices),
-                _device_pointer(self._indices),
-                0,
-            )
-            with hardware_failure_phase("provider_execution_failure"):
-                result = int(
-                    submission.invoke(
-                        self.provider._loaded.api.update_triangle_scene,
-                        self._scene,
-                        ctypes.byref(desc),
-                    )
-                )
-                if result != _SUCCESS:
-                    raise TaichiRuntimeError(_provider_error(self.provider._loaded.api))
+        self.record_refit().execute({"vertices": vertices})
         return self
-
-    def _execute_query(self, rays, hits, ray_count):
-        self._validate_lifetime()
-        with external_cuda_submission(self._runtime_prog, (rays, hits)) as submission:
-            desc = _TraceDesc(
-                ctypes.sizeof(_TraceDesc),
-                ray_count,
-                _device_pointer(rays),
-                _device_pointer(hits),
-                0,
-            )
-            with hardware_failure_phase("provider_execution_failure"):
-                result = int(
-                    submission.invoke(
-                        self.provider._loaded.api.trace,
-                        self._scene,
-                        ctypes.byref(desc),
-                    )
-                )
-                if result != _SUCCESS:
-                    raise TaichiRuntimeError(_provider_error(self.provider._loaded.api))
 
     def _validate_lifetime(self):
         if self._scene is None:
@@ -854,7 +1004,7 @@ class OptixTriangleScene:
             ),
             HardwareMemoryComponent(
                 "shared_pipeline_sbt",
-                int(memory.shared_pipeline_sbt_bytes),
+                self.provider._shared_pipeline_sbt_bytes,
                 True,
                 "runtime",
                 "provider",

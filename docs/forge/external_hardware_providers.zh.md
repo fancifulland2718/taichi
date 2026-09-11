@@ -631,6 +631,31 @@ provider 持有 OptiX context，scene 持有 provider，已提交 Graph work 同
 host；scene 构建与显式 close 仍是可能同步的冷生命周期边界。可更新 scene 保留 IAS scratch，
 `memory_report()` 将其计入 build/update scratch，不在每次 refit 时分配。
 
+scene 构建/refit 与查询可消费 compact program-owned ndarray、dense field 和 view，
+支持非零 byte offset。几何为 packed f32/i32 triples，ray 为 f32 `(N,8)`；输出支持 scalar
+`(N,4)` 或 AOS vector-4。固定 `graph.bind(...)` 在准备时验证并解析绑定；原位内容更新可直接
+消费，替换存储需 bind/update。读写范围不得重叠，不插入 field→ndarray 转换分配。
+当前仍是 runtime-ordered native commands，不是 CUDA Graph capture 或 kernel-inline OptiX。
+
+`scene.record_typed(N, rays="rays", hits="hits", hit_indices="hit_indices")`
+或 `scene.trace_typed(rays, hits, hit_indices)` 写入两个 caller-owned 输出：
+
+| 输出 | dtype | 内容 | miss |
+| --- | --- | --- | --- |
+| `hits` | f32 | `(t,u,v,0)` | `(-1,0,0,0)` |
+| `hit_indices` | i32/u32 | `(primitive,instance,custom,hit)` | `(-1,-1,-1,0)`；u32 缺失索引为 UINT32_MAX |
+
+`t` 是 ray parameter，只有单位方向时才等于距离；三角形权重为 `(1-u-v,u,v)`。
+索引保留整数位，i32 将其解释为有符号整数。当前 single-instance scene 的 instance ordinal
+与 custom ID 均为零。既有 `record()` / `trace()` float4 输出不变。
+
+typed hit 通过 table size 与 feature bit 协商 ABI-1 可选尾部；旧 Forge adapter 仍可执行 legacy，
+typed 准备时明确拒绝，不偷偷将 float ID 转成整数。首次 `record_typed()` 显式准备独立 typed
+pipeline，不扩大 legacy 四 payload pipeline。其 SBT 存储进入被动显存报告，driver opaque
+pipeline memory 仍为 unknown。typed caller 输出为每 ray 32 bytes，旧布局为 16 bytes。
+word-aligned query storage 使用独立 adapter feature bit。没有此能力的旧 adapter 要求
+ray/hit 地址按 16 bytes 对齐，不满足时在准备阶段拒绝，不把未对齐指针传给旧 PTX。
+
 ## 显式 optional runtime 执行 provider
 
 标准 runtime wheel 随附以下三个 Forge 自有薄 adapter。adapter 不包含也不链接 vendor

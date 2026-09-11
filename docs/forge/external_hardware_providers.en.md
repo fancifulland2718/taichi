@@ -798,6 +798,38 @@ per-refit host wait. Scene construction and explicit close remain cold lifecycle
 boundaries that may synchronize. Update-enabled scenes retain IAS scratch;
 `memory_report()` includes it in build/update scratch, with no per-refit allocation.
 
+Scene construction/refit and queries accept compact program-owned ndarrays,
+dense fields, and views, including nonzero byte offsets. Geometry uses packed
+f32/i32 triples; rays use f32 `(N, 8)`. Query outputs accept scalar `(N, 4)` or
+AOS vector-4 storage. Fixed `graph.bind(...)` validates and resolves these
+bindings once; in-place content changes remain visible, while storage replacement
+requires bind/update. Read/write ranges may not overlap. No field-to-ndarray
+conversion allocation is inserted. Execution remains runtime-ordered native
+commands, not CUDA Graph capture or kernel-inline OptiX.
+
+`scene.record_typed(N, rays="rays", hits="hits", hit_indices="hit_indices")`
+(or `scene.trace_typed(rays, hits, hit_indices)`) writes two caller-owned outputs:
+
+| Output | dtype | Values | Miss |
+| --- | --- | --- | --- |
+| `hits` | f32 | `(t, u, v, 0)` | `(-1, 0, 0, 0)` |
+| `hit_indices` | i32/u32 | `(primitive, instance, custom, hit)` | `(-1, -1, -1, 0)`; absent u32 indices use UINT32_MAX |
+
+`t` is the ray parameter, a metric distance only for unit directions. Triangle
+weights are `(1-u-v, u, v)`. Indices preserve their integer bits; i32 interprets
+them as signed. This single-instance scene has instance ordinal and custom ID
+zero. Existing `record()` / `trace()` float4 outputs are unchanged.
+
+Typed hits use an optional ABI-1 suffix negotiated by table size and feature bit.
+Older Forge adapters retain legacy execution and reject typed preparation clearly;
+they do not silently convert float IDs. The typed pipeline is prepared explicitly
+on first `record_typed()`, independently of the legacy four-payload pipeline.
+Its SBT storage appears in passive memory reports; opaque driver pipeline memory
+remains unknown. Typed outputs require 32 bytes per ray instead of the legacy 16.
+Word-aligned query storage is a separate adapter feature bit. Legacy adapters
+without that feature require 16-byte aligned ray/hit addresses, rejected at
+preparation if unmet; no misaligned access is passed to their old PTX.
+
 ## Explicit optional runtime execution providers
 
 The standard runtime wheel contains Forge-owned thin adapters for the following

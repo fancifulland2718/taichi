@@ -161,25 +161,13 @@ class _FakeOptixLibrary:
         self._query = query
 
 
-def test_optix_device_pointer_resolves_ndarray_data_not_allocation_descriptor(
-    monkeypatch,
-):
-    allocation = object()
-
-    class FakeProgram:
-        def get_ndarray_data_ptr_as_int(self, value):
-            assert value is allocation
-            return 0x12345678
-
-    class FakeRuntime:
-        prog = FakeProgram()
-
-    class FakeNdarray:
-        arr = allocation
-
-    monkeypatch.setattr(_optix.impl, "get_runtime", FakeRuntime)
-
-    assert _optix._device_pointer(FakeNdarray()) == 0x12345678
+def test_optix_legacy_api_prefix_remains_compatible():
+    fake = _FakeOptixLibrary()
+    fake._api.struct_size = _optix._ProviderApi.prepare_typed.offset
+    _optix._check_api(fake._api)
+    fake._api.struct_size -= 1
+    with pytest.raises(RuntimeError, match="truncated"):
+        _optix._check_api(fake._api)
 
 
 @pytest.mark.parametrize(
@@ -408,6 +396,22 @@ def test_fake_optix_provider_scene_graph_lifetime_and_memory(monkeypatch):
         "native_submissions"
     ]
     scene = provider.triangle_scene(vertices, indices)
+    with pytest.raises(RuntimeError, match="does not support typed hits"):
+        scene.record_typed(2)
+    fb = ti.FieldsBuilder()
+    padding = ti.field(ti.i32)
+    fb.place(padding)
+    old_adapter_rays = ti.field(ti.f32)
+    fb.dense(ti.ij, (2, 8)).place(old_adapter_rays)
+    tree = fb.finalize()
+    try:
+        with pytest.raises(RuntimeError, match="16-byte aligned"):
+            scene.record(2).prepare_graph_execute(
+                {"rays": old_adapter_rays, "hits": hits}
+            )
+        assert fake.calls["trace"] == 0
+    finally:
+        tree.destroy()
     native_after_scene = program._runtime_statistics_snapshot()["submission"][
         "native_submissions"
     ]
@@ -438,14 +442,15 @@ def test_fake_optix_provider_scene_graph_lifetime_and_memory(monkeypatch):
     assert fake.calls["destroy_context"] == 1
 
 
+@pytest.mark.parametrize("use_field", [False, True])
 @test_utils.test(arch=ti.cuda, offline_cache=False)
-def test_optix_refit_refreshes_instance_bounds_in_graph():
+def test_optix_refit_refreshes_instance_bounds_in_graph(use_field, monkeypatch):
     status = _optix.probe_provider()
     if status["discovery"] != "present":
         pytest.skip(f"OptiX runtime unavailable: {status['unavailable_reason']}")
-    vertices = ti.ndarray(ti.f32, (3, 3))
+    vertices = ti.field(ti.f32, (3, 3)) if use_field else ti.ndarray(ti.f32, (3, 3))
     vertices.from_numpy(np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], np.float32))
-    indices = ti.ndarray(ti.i32, (1, 3))
+    indices = ti.field(ti.i32, (1, 3)) if use_field else ti.ndarray(ti.i32, (1, 3))
     indices.from_numpy(np.array([[0, 1, 2]], np.int32))
     rays = ti.ndarray(ti.f32, (2, 8))
     rays.from_numpy(
@@ -471,17 +476,22 @@ def test_optix_refit_refreshes_instance_bounds_in_graph():
             builder.append_native(scene.record_refit(), admission="explicit")
             builder.append_native(scene.record(2), admission="explicit")
             graph = builder.compile()
+            binding = graph.bind(
+                {"vertices": vertices, "offset": 8.0, "rays": rays, "hits": hits}
+            )
             before_bytes = scene.memory_report().known_resident_requested_bytes
             try:
                 for offset in (8.0, 0.0, 8.0):
-                    ticket = graph.submit(
-                        {
-                            "vertices": vertices,
-                            "offset": offset,
-                            "rays": rays,
-                            "hits": hits,
-                        }
-                    )
+                    binding.update(offset=offset)
+
+                    def forbidden(*args, **kwargs):
+                        raise AssertionError(
+                            "Fixed refit re-entered storage preparation"
+                        )
+
+                    with monkeypatch.context() as patched:
+                        patched.setattr(_optix, "_ray_storage", forbidden)
+                        ticket = graph.submit(binding)
                     ticket.wait()
                     actual = hits.to_numpy()
                     selected = int(offset != 0)
@@ -492,3 +502,184 @@ def test_optix_refit_refreshes_instance_bounds_in_graph():
                 )
             finally:
                 graph.close()
+
+
+@pytest.mark.parametrize("storage_kind", ["ndarray", "vector", "field"])
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_optix_typed_hits_dense_bindings_and_retirement(storage_kind, monkeypatch):
+    status = _optix.probe_provider()
+    if status["discovery"] != "present":
+        pytest.skip(f"OptiX runtime unavailable: {status['unavailable_reason']}")
+    count = 131
+    types = {
+        "vertices": (ti.f32, (6, 3)),
+        "indices": (ti.i32, (2, 3)),
+        "rays": (ti.f32, (count, 8)),
+        "hits": (ti.f32, (count, 4)),
+        "hit_indices": (ti.u32 if storage_kind == "field" else ti.i32, (count, 4)),
+    }
+    tree = None
+    if storage_kind == "field":
+        fb = ti.FieldsBuilder()
+        padding = ti.field(ti.i32)
+        fb.dense(ti.i, 7).place(padding)
+        values = {}
+        for name, (dtype, shape) in types.items():
+            values[name] = ti.field(dtype)
+            fb.dense(ti.ij, shape).place(values[name])
+        tree = fb.finalize()
+        padding.fill(921)
+        assert _optix.describe_storage(values["rays"]).descriptor.byte_offset % 16 != 0
+    elif storage_kind == "vector":
+        values = {
+            name: ti.Vector.ndarray(shape[1], dtype, shape[0])
+            for name, (dtype, shape) in types.items()
+        }
+    else:
+        values = {
+            name: ti.ndarray(dtype, shape) for name, (dtype, shape) in types.items()
+        }
+    values["vertices"].from_numpy(
+        np.array(
+            [[0, 0, 0], [1, 0, 0], [0, 1, 0], [2, 0, 0], [3, 0, 0], [2, 1, 0]],
+            np.float32,
+        )
+    )
+    values["indices"].from_numpy(np.array([[0, 1, 2], [3, 4, 5]], np.int32))
+    data = np.tile(np.array([2.2, 0.3, 2, 0, 0, 0, -2, 10], np.float32), (count, 1))
+    data[1::2, 0] = -2
+    values["rays"].from_numpy(data)
+    values["hits"].fill(17)
+    values["hit_indices"].fill(19)
+    if tree is not None:
+        # Mix direct fields and views in a single immutable Graph frame.
+        bound_values = {
+            name: (
+                ti.experimental.ndarray_view(value)
+                if name in ("hits", "hit_indices")
+                else value
+            )
+            for name, value in values.items()
+        }
+    else:
+        bound_values = values
+    with ti.hardware.ray.load_optix_provider() as provider:
+        with provider.triangle_scene(values["vertices"], values["indices"]) as scene:
+            before = scene.memory_report().known_resident_requested_bytes
+            assert not provider._typed_prepared
+            recording = scene.record_typed(count)
+            assert provider._typed_prepared
+            assert scene.memory_report().known_resident_requested_bytes > before
+            # The new adapter still writes only the legacy table's requested bytes.
+            api_size = _optix._ProviderApi.prepare_typed.offset
+            prefix = (ctypes.c_ubyte * (api_size + 16))(*([0xA5] * (api_size + 16)))
+            query = provider._loaded.library.taichi_forge_optix_provider_query
+            assert (
+                query(
+                    1,
+                    api_size,
+                    ctypes.cast(prefix, ctypes.POINTER(_optix._ProviderApi)),
+                )
+                == 0
+            )
+            assert list(prefix)[api_size:] == [0xA5] * 16
+            builder = ti.graph.GraphBuilder()
+            builder.append_native(recording, admission="explicit")
+            summary = None
+            if storage_kind != "vector":
+                index_dtype = types["hit_indices"][0]
+
+                @ti.kernel
+                def consume(
+                    h: ti.types.ndarray(ti.f32, ndim=2),
+                    ids: ti.types.ndarray(index_dtype, ndim=2),
+                    result: ti.types.ndarray(ti.f32, ndim=1),
+                ):
+                    for i in result:
+                        result[i] = -8.0
+                        if ids[i, 3] != 0:
+                            result[i] = (
+                                h[i, 0]
+                                + 2 * h[i, 1]
+                                + 3 * h[i, 2]
+                                + ti.cast(ids[i, 0], ti.f32)
+                            )
+
+                summary = ti.ndarray(ti.f32, (count,))
+                builder.dispatch(
+                    consume,
+                    ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "hits", ti.f32, ndim=2),
+                    ti.graph.Arg(
+                        ti.graph.ArgKind.NDARRAY, "hit_indices", index_dtype, ndim=2
+                    ),
+                    ti.graph.Arg(ti.graph.ArgKind.NDARRAY, "summary", ti.f32, ndim=1),
+                )
+            graph = builder.compile()
+            arguments = {name: bound_values[name] for name in recording.binding_names}
+            if summary is not None:
+                arguments["summary"] = summary
+            binding = graph.bind(arguments)
+            assert binding.fast_path_qualified, binding.statistics()
+            assert np.all(values["hits"].to_numpy() == 17)
+            assert np.all(values["hit_indices"].to_numpy() == 19)
+            try:
+
+                def forbidden(*args, **kwargs):
+                    raise AssertionError(
+                        "Storage description re-entered fixed OptiX replay"
+                    )
+
+                with monkeypatch.context() as patched:
+                    patched.setattr(_optix, "_ray_storage", forbidden)
+                    graph.submit(binding).wait()
+                hit_data = values["hits"].to_numpy()
+                hit_ids = values["hit_indices"].to_numpy()
+                if summary is not None:
+                    np.testing.assert_allclose(
+                        summary.to_numpy()[::2], np.full(66, 3.3), atol=2e-6
+                    )
+                    np.testing.assert_array_equal(
+                        summary.to_numpy()[1::2], np.full(65, -8.0)
+                    )
+                np.testing.assert_allclose(
+                    hit_data[::2], np.tile([1, 0.2, 0.3, 0], (66, 1)), atol=2e-6
+                )
+                np.testing.assert_array_equal(
+                    hit_ids[::2], np.tile([1, 0, 0, 1], (66, 1))
+                )
+                np.testing.assert_array_equal(
+                    hit_data[1::2], np.tile([-1, 0, 0, 0], (65, 1))
+                )
+                absent = 0xFFFFFFFF if storage_kind == "field" else -1
+                np.testing.assert_array_equal(
+                    hit_ids[1::2], np.tile([absent, absent, absent, 0], (65, 1))
+                )
+                revision = binding.revision
+                with pytest.raises(RuntimeError, match="dtype"):
+                    binding.update(hits=bound_values["hit_indices"])
+                assert binding.revision == revision
+                description = _optix.describe_storage(values["hits"])
+                with pytest.raises(RuntimeError, match="overlap"):
+                    scene._runtime_prog._prepare_external_cuda_storage(
+                        (description.descriptor, description.descriptor), (False, True)
+                    )
+                data[:, 0] = -3
+                values["rays"].from_numpy(data)
+                graph.submit(binding).wait()
+                assert not np.any(values["hit_indices"].to_numpy()[:, 3])
+                if tree is not None:
+                    assert all(padding[i] == 921 for i in range(7))
+                    tree.destroy()
+                    tree = None
+                    with pytest.raises(
+                        RuntimeError, match="retired|destroyed|generation"
+                    ):
+                        graph.submit(binding)
+                else:
+                    scene.close()
+                    with pytest.raises(RuntimeError, match="closed"):
+                        graph.submit(binding)
+            finally:
+                graph.close()
+                if tree is not None:
+                    tree.destroy()

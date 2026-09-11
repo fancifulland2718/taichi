@@ -1299,6 +1299,8 @@ void export_lang(py::module &m) {
   py::class_<VulkanRayQueryCommand>(m, "_VulkanRayQueryCommand");
   py::class_<VulkanRayGeometryCommand>(m, "_VulkanRayGeometryCommand");
   py::class_<PreparedVulkanBufferCommands>(m, "_PreparedVulkanBufferCommands");
+  py::class_<PreparedExternalCudaStorage>(m, "_PreparedExternalCudaStorage")
+      .def_readonly("pointers", &PreparedExternalCudaStorage::pointers);
 
   py::class_<Program>(m, "Program")
       .def(py::init<>())
@@ -2006,6 +2008,10 @@ void export_lang(py::module &m) {
            py::arg("cuda_concurrent_batch") = false)
       .def("_begin_external_cuda_submission",
            &Program::begin_external_cuda_submission)
+      .def("_prepare_external_cuda_storage",
+           &Program::prepare_external_cuda_storage)
+      .def("_invoke_external_cuda_prepared",
+           &Program::invoke_external_cuda_prepared)
       .def("_debug_runtime_completion_stats",
            &Program::debug_runtime_completion_stats)
       .def("_set_cpu_scheduler_telemetry_enabled",

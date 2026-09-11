@@ -126,6 +126,13 @@ class PreparedNativeStorage {
   mutable std::uint64_t validated_tree_epoch_{0};
 };
 
+// Cold storage bindings for a Python-owned CUDA C-ABI adapter. No vendor API
+// or resource ownership is introduced into Program by this packet.
+struct PreparedExternalCudaStorage {
+  std::shared_ptr<PreparedNativeStorage> storage;
+  std::vector<std::uintptr_t> pointers;
+};
+
 enum class VulkanBufferCommandKind : std::uint8_t {
   kFillU32,
   kCopy,
@@ -955,6 +962,11 @@ class TI_DLL_EXPORT Program {
   }
   std::unique_ptr<ExternalCudaSubmissionScope>
   begin_external_cuda_submission();
+  PreparedExternalCudaStorage prepare_external_cuda_storage(
+      const std::vector<const storage::DenseStorageDescriptor *> &descriptors,
+      const std::vector<bool> &writable);
+  void invoke_external_cuda_prepared(const PreparedExternalCudaStorage &packet,
+                                     const std::function<void()> &invoke);
 
   RuntimeResourceHandle capture_argpack_resource_handle(
       const ArgPack *view) const;
