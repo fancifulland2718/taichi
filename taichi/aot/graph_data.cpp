@@ -6060,14 +6060,13 @@ void CompiledGraph::jit_run_cached(
 #if defined(TI_WITH_CUDA)
   if (compile_config.arch == Arch::cuda) {
     TI_ASSERT(program != nullptr);
-    // A dispatch label describes one physical kernel launch. Native CUDA
-    // replay can expose that host-side annotation only while capturing, not on
-    // every replay, so labeled graphs deliberately keep the ordinary cached
-    // launch path below. Unlabeled graphs remain replay-first.
-    if (!has_dispatch_labels() &&
-        try_run_cuda_graph(*this, compile_config, args, cache, *program,
-                           &program->runtime_statistics(),
-                           cuda_concurrent_batch_lane)) {
+    // Labels describe dispatches; they are not a request to replay host-side
+    // profiler annotations. Capture retains the labels in its launch packets,
+    // and explicit telemetry can correlate later invocations. Merely naming a
+    // dispatch must not change its physical execution path.
+    if (try_run_cuda_graph(*this, compile_config, args, cache, *program,
+                          &program->runtime_statistics(),
+                          cuda_concurrent_batch_lane)) {
       program->mark_runtime_submission(
           RuntimeSubmissionKind::kGraphBackendSubmission);
       if (resource_guard) {

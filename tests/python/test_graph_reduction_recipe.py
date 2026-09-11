@@ -143,6 +143,10 @@ def test_graph_reduction_compileiq_materializes_complete_typed_domain():
                     rebuilt.run(bindings)
                 ti.sync()
                 assert output.to_numpy()[0] == expected
+                segment = rebuilt.execution_stats().segments[0]
+                assert segment.last_path == "cuda_exact_replay"
+                assert segment.backend_replay_path
+                assert segment.fallback_reason == "none"
                 statistics = rebuilt.binding_statistics()
                 assert statistics["raw_replay_validations"] == 0
                 assert statistics["version_volatile_replays"] == 0
