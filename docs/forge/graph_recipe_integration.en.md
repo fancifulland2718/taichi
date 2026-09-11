@@ -55,7 +55,8 @@ need renewal. Neither Python executable deserialization nor AOT binary reuse is 
 The example's descriptor owns stable namespace, versions, semantic fingerprint and assembly
 protocol. `discover` recognizes only its known operation; `resolve` reconstructs by stable key;
 `expand` returns real survivor neighbors or an empty sequence. `materialize` enrolls owned
-resources in `scope.own(..., release=...)` for rollback. `assemble` returns an executor and
+resources in `scope.own(..., release=...)` for rollback. Enroll a completed executor with
+`scope.own_executor(graph)` before physical observation, which can also fail. `assemble` returns an executor and
 actual physical observation. `describe` supplies JSON-safe claims, not measured conclusions.
 
 `PROVIDER_OWNED_WHOLE_GRAPH_V1` requires complete semantic coverage. It does not allow arbitrary
@@ -82,6 +83,11 @@ Equal physical IDs permit candidate comparison, not sharing mutable executors. C
 instance sharing is disabled unless the provider explicitly returns
 `GraphMaterializationProduct(..., shareable_executor=True)` and guarantees safe shared state.
 Repeated requests for the same recipe within one context still reuse that context's instance.
+
+Closing the last handle explicitly retires its Forge Graph, even if another Python variable
+still references that executor. `Graph.close()` is idempotent; caller-owned inputs remain valid.
+Runtime reset closes live materialization contexts. Rebuild a definition after reset rather
+than retaining old runtime executables. Custom executor types must supply their release callback.
 
 ## Evaluation boundaries
 

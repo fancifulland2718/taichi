@@ -219,6 +219,27 @@ class GraphMaterializationScope:
         self._transaction.own(_OwnedValue(value, release, label, physical))
         return value
 
+    def own_executor(self, executor, *, release=None):
+        """Enroll the executor before observing it; retire a Forge Graph explicitly.
+
+        Other executor types retain their provider-supplied release policy.
+        Re-enrolling the same executor during publication must not close it twice.
+        """
+        from taichi_forge.graph._graph import Graph
+
+        for owner in self._transaction.owners:
+            if owner.value is executor:
+                if release is not None:
+                    if owner.release is not None and owner.release != release:
+                        raise ValueError("Graph executor has conflicting release owners")
+                    owner.release = release
+                if owner.release is None and isinstance(executor, Graph):
+                    owner.release = Graph.close
+                return executor
+        if release is None and isinstance(executor, Graph):
+            release = Graph.close
+        return self.own(executor, release=release, label="whole Graph executor")
+
     def allocate(self, requirement):
         """Allocate and immediately enroll one fragment resource in rollback."""
 
@@ -416,6 +437,7 @@ def _default_baseline_materializer(scope, definition, recipe):
         workspace_lanes=scope._context.workspace_lanes,
         workspace_saturation=scope._context.workspace_saturation,
     )
+    scope.own_executor(graph)
     manifest = observe_baseline_physical_manifest(definition, recipe, graph)
     return GraphMaterializationProduct(graph, manifest)
 
@@ -516,6 +538,10 @@ class GraphMaterializationContext:
             "rollback_failures": 0,
             "releases": 0,
         }
+        if runtime_identity_provider is None:
+            from taichi_forge.lang import impl
+
+            impl.get_runtime().register_runtime_object(self)
 
     def _require_open_locked(self):
         if self._state == "poisoned":
@@ -759,6 +785,7 @@ class GraphMaterializationContext:
                     "Graph whole-recipe materializer must return "
                     "GraphMaterializationProduct"
                 )
+            scope.own_executor(product.executor, release=product.release)
             manifest = product.manifest
             if (
                 manifest.semantic_graph_id != self.definition.semantic_graph_id
@@ -782,11 +809,6 @@ class GraphMaterializationContext:
                     recipe_id=recipe.recipe_id,
                     phase="observe",
                 )
-            scope.own(
-                product.executor,
-                release=product.release,
-                label="whole Graph executor",
-            )
             phase = "publish"
             with self._lock:
                 self._require_open_locked()
@@ -893,6 +915,9 @@ class GraphMaterializationContext:
                     cleanup_complete=False,
                     rollback_errors=tuple(errors),
                 )
+
+    def _invalidate_runtime(self):
+        self.close()
 
     def __enter__(self):
         with self._lock:

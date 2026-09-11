@@ -667,7 +667,7 @@ def test_allocated_resources_must_match_requirements_and_appear_in_manifest():
     with pytest.raises(GraphMaterializationError, match="omits") as failure:
         context.materialize(recipe)
     assert failure.value.cleanup_complete
-    assert releases == ["workspace"]
+    assert releases == ["executor", "workspace"]
     assert context.statistics()["live_physical_materializations"] == 0
 
     include_resource["value"] = True
@@ -675,7 +675,7 @@ def test_allocated_resources_must_match_requirements_and_appear_in_manifest():
     assert result.manifest.persistent_requested_bytes == 4096
     assert result.manifest.persistent_allocated_bytes == 4352
     result.close()
-    assert releases == ["workspace", "executor", "workspace"]
+    assert releases == ["executor", "workspace", "executor", "workspace"]
 
 
 def test_runtime_generation_change_aborts_publish_and_rolls_back_the_candidate():
@@ -950,6 +950,7 @@ def test_native_task_observation_produces_stable_complete_baseline_manifest():
         values = ti.ndarray(ti.i32, shape=8)
         output = ti.ndarray(ti.i32, shape=8)
         values.from_numpy(__import__("numpy").arange(8, dtype="int32"))
+        retained_executor = first.executor
         first.executor.run({"values": values, "output": output})
         assert output.to_numpy().tolist() == list(range(1, 9))
         warmed = CompiledGraphPhysicalManifest.from_graph(
@@ -962,6 +963,10 @@ def test_native_task_observation_produces_stable_complete_baseline_manifest():
             warmed.persistent_allocated_bytes
             >= first.manifest.persistent_allocated_bytes
         )
+        first.close()
+        first.close()
+        second.executor.run({"values": values, "output": output})
+        assert output.to_numpy().tolist() == list(range(1, 9))
     finally:
         first.close()
         second.close()
@@ -971,3 +976,39 @@ def test_native_task_observation_produces_stable_complete_baseline_manifest():
     one_shot.close()
     with pytest.raises(GraphMaterializationError, match="closed"):
         _ = one_shot.executor
+    with pytest.raises(RuntimeError, match="closed"):
+        retained_executor.run({"values": values, "output": output})
+
+
+@test_utils.test(arch=ti.cuda, offline_cache=False)
+def test_materialization_failure_and_reset_retire_retained_executors(monkeypatch):
+    from taichi_forge.examples.graph.complete_recipe_provider import make_builder
+    from taichi_forge.graph._recipes import families
+
+    definition = make_builder().freeze()
+    failed_executors = []
+
+    def fail_observation(definition, recipe, graph):
+        failed_executors.append(graph)
+        raise ValueError("injected baseline observation failure")
+
+    context = definition.materialization_context()
+    with monkeypatch.context() as patch:
+        patch.setattr(families, "observe_graph_physical_manifest", fail_observation)
+        with pytest.raises(GraphMaterializationError, match="injected baseline"):
+            context.materialize()
+    assert not failed_executors[0]._runtime_valid
+    assert context.statistics()["live_owned_resources"] == 0
+
+    handle = context.materialize()
+    executor = handle.executor
+    source, output = ti.ndarray(ti.i32, 257), ti.ndarray(ti.i32, 257)
+    source.fill(3)
+    executor.run(executor.bind({"source": source, "output": output}))
+    ti.reset()
+    assert context.statistics()["state"] == "closed"
+    assert not executor._runtime_valid
+    with pytest.raises(GraphMaterializationError, match="closed"):
+        _ = handle.executor
+    handle.close()
+    context.close()

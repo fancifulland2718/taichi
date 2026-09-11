@@ -19108,7 +19108,7 @@ class Graph:
     def _check_runtime_valid(self):
         if not self._runtime_valid:
             raise TaichiRuntimeError(
-                "This graph was compiled before ti.reset() or a runtime "
+                "This graph is closed or was compiled before ti.reset() or a runtime "
                 "reinitialization. Please rebuild the graph after ti.init()."
             )
         self._spec.validate_lifetime_leases()
@@ -19145,6 +19145,15 @@ class Graph:
     def _cancel_snode_tree_retirement(self, dependency):
         with self._lifecycle_lock:
             self._stale_snode_tree_dependencies.discard(tuple(dependency))
+
+    def close(self):
+        """Retire this executable and its owned resources; safe to call twice.
+
+        Backend retirement waits for this executable's retained work when
+        necessary. Caller-owned arrays/textures and frozen definitions remain
+        owned by their callers. No close-time work is added to normal replay.
+        """
+        self._invalidate_runtime()
 
     def _invalidate_runtime(self):
         with self._lifecycle_lock:

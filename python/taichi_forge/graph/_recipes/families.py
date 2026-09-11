@@ -517,12 +517,8 @@ def assemble_runtime_graph_recipe(
         workspace_saturation=scope._context.workspace_saturation,
     )
     release = assembly.executor_release
-    try:
-        manifest = observe_graph_physical_manifest(definition, recipe, graph)
-    except BaseException:
-        if release is not None:
-            release(graph)
-        raise
+    scope.own_executor(graph, release=release)
+    manifest = observe_graph_physical_manifest(definition, recipe, graph)
     return GraphMaterializationProduct(graph, manifest, release=release)
 
 
@@ -555,6 +551,7 @@ def materialize_runtime_graph_baseline(scope, definition, recipe):
             workspace_lanes=scope._context.workspace_lanes,
             workspace_saturation=scope._context.workspace_saturation,
         )
+    scope.own_executor(graph)
     manifest = observe_graph_physical_manifest(definition, recipe, graph)
     return GraphMaterializationProduct(graph, manifest)
 

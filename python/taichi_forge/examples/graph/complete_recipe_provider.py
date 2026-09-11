@@ -100,7 +100,7 @@ class AffineProvider:
 
     def materialize(self, scope, fragment):
         graph = make_builder(single_pass=True).freeze().compile()
-        scope.own(graph)  # Graph owns normal runtime retirement; no custom buffers.
+        scope.own_executor(graph)  # Enroll explicit retirement before observation.
         return ti.graph.GraphMaterializedFragment.create(fragment, graph)
 
     def assemble(self, scope, definition, recipe, fragments):

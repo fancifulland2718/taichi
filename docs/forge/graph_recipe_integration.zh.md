@@ -75,6 +75,11 @@ python -m taichi_forge.examples.graph.complete_recipe_provider --output restored
 
 ## 执行身份与内存观测
 
+provider 在物理观测前应调用 `scope.own_executor(graph)` 登记执行器，因为观测本身也可能失败。
+最后一个 handle 关闭时显式退役其 Forge Graph，即使其他 Python 变量仍引用执行器；`Graph.close()` 可重复调用，
+不销毁调用者输入。runtime reset 会关闭已有 materialization context。reset 后重新构造 definition，
+不要继续使用旧 runtime 执行器；自定义执行器类型仍需提供自己的 release 回调。
+
 物理 manifest schema v2 将执行/分配方案和显存观测分开。`materialized_physical_id` 对编译工作、绑定和
 `resource_plan`（请求大小、分组、生命周期）求身份，不包含冷/热缓存分配或 backing page 大小；
 `resources`、`memory` 保留观测。旧 v1 physical ID 与 v2 不等价，需重新解析结构选择，并按需更新测量证据。
