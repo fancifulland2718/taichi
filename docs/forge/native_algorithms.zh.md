@@ -17,6 +17,8 @@
 | `ti.algorithms.sort(keys, values=None, ...)` | Forge 稳定排序调度器。 |
 | `ti.algorithms.sort_by_key(keys, values, ...)` | 排序 keys 并同步移动 payload values。 |
 | `ti.algorithms.prepare_sort(keys, values=None, ...)` | 为重复 native 稳定排序准备固定 dense 绑定（0.6.3）。 |
+| `ti.algorithms.prepare_compact(values, flags, output, count)` | 固定绑定的稳定 compact，计数保留在设备（0.6.3）。 |
+| `ti.algorithms.prepare_unique(...)` / `prepare_unique_by_key(...)` | 连续 unique 的公开 prepared plan，key/payload 共享一次前缀计算（0.6.3）。 |
 | `ti.algorithms.parallel_sort(keys, values=None)` | vanilla 兼容的 legacy sorter。 |
 | `ti.algorithms.PrefixSumExecutor(n).run(values)` | Prefix sum / scan。 |
 | `ti.algorithms.device_prefix(values, extent, ...)` | 通过 device-resident 有效数量组合固定容量 primitive 输入。 |
@@ -78,6 +80,34 @@ Vulkan 混合位宽 field 布局可能把 u64 放在仅 4 字节对齐的偏移�
 内容可原位改变；换存储、改结构需重新准备。runtime reset 或源资源退休使 plan 失效。`close()` 幂等并使已有
 recording 失效，不清共享 scratch、不等待 GPU；已提交工作的存储由原有 runtime completion 保留。
 不要在 Graph 最后一次提交前关闭 plan；同时退休时先关闭 Graph。
+
+## Prepared compact 与连续 unique（0.6.3）
+
+这两类 plan 与 prepared sort 一样提供 `run()`、`record()`、`report()`、`close()`。支持 CUDA/Vulkan 上紧凑、
+自然对齐的一维 ndarray 和合格 dense field/view。compact 的输入/输出可为标量、向量、矩阵 record，元素类型必须
+匹配，标量分量支持 i32/u32/f32/i64/u64/f64。flags 为标量 i32，非零表示保留。容量须为正且不超过 INT_MAX，输出
+容量覆盖输入。可写范围不能与任何其他绑定范围重叠；纯输入之间允许重叠。
+
+`count` 为非空 i32 ndarray 或标量 i32 field，结果写入设备侧 `count[0]` / `count[None]`，不会隐式回读计数。
+只有输出的 `[:count]` 前缀有定义；输入与 flags 可原位改变后重用 plan。
+
+```python
+plan = ti.algorithms.prepare_unique_by_key(
+    keys, values, unique_keys, unique_values, count, size=None,
+)
+plan.run()
+builder.append_native(plan.record())
+```
+
+unique 保留每个**连续**等 key 段的第一项，不执行排序。keys 限标量 i32/u32/i64/u64；payload 遵循 compact 的
+record 类型。`size` 是准备时固定的 0 到 capacity 整数，`None` 表示全容量。准备编译 head kernel，并拥有每项
+4 字节的私有 flags，但不运行数学、不提交或等待 GPU。head 首次读取前覆盖整个 flags 范围；key/payload 只共用
+一次 native 前缀计算，后端 scratch 仍按需建立并由 Program 共享。
+
+unique 在 **root Graph 构建时**展开为 head dispatch + native compact，不嵌套调用 Graph，也不允许把 native
+compact 放入结构化 while/if。head 可使用既有 replay，但 compact 仍为 runtime-ordered 边界，不承诺整操作
+CUDA capture。报告分别显示私有 flags 与最近观测到的共享 native workspace，不把它们伪称为每 plan 独占显存。
+固定算法不向 CompileIQ 新增裸 primitive/provider 轴。关闭、结构变化、reset 的约束与 prepared sort 相同。
 
 ## 后端选择
 

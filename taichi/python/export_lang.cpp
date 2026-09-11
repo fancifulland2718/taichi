@@ -1302,6 +1302,8 @@ void export_lang(py::module &m) {
   py::class_<PreparedVulkanBufferCommands>(m, "_PreparedVulkanBufferCommands");
   py::class_<PreparedPrimitiveSort, std::shared_ptr<PreparedPrimitiveSort>>(
       m, "_PreparedPrimitiveSort");
+  py::class_<PreparedPrimitiveCompact, std::shared_ptr<PreparedPrimitiveCompact>>(
+      m, "_PreparedPrimitiveCompact");
   py::class_<PreparedExternalCudaStorage>(m, "_PreparedExternalCudaStorage")
       .def_readonly("pointers", &PreparedExternalCudaStorage::pointers);
 
@@ -2764,6 +2766,11 @@ void export_lang(py::module &m) {
            py::call_guard<py::gil_scoped_release>())
       .def("_execute_primitive_sort",
            tracked_native_program_method(&Program::execute_primitive_sort),
+           py::call_guard<py::gil_scoped_release>())
+      .def("_prepare_primitive_compact", &Program::prepare_primitive_compact,
+           py::call_guard<py::gil_scoped_release>())
+      .def("_execute_primitive_compact",
+           tracked_native_program_method(&Program::execute_primitive_compact),
            py::call_guard<py::gil_scoped_release>())
       .def("vulkan_graphics_pipeline_available",
            &Program::vulkan_graphics_pipeline_available)

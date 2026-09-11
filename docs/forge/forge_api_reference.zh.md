@@ -904,6 +904,19 @@ kernel fallback，scan 与 grouped-reduce 明确拒绝；离散/不可微 family
 后端 workspace 仍由 Program 按需持有。recording 是 runtime-ordered Graph action，不是可 capture 的 CUDA
 sort。dtype、对齐、NaN 策略和生命周期边界见 [prepared sort](native_algorithms.zh.md#prepared-sort063)。
 
+#### `ti.algorithms.prepare_compact(values, flags, output, count)`
+
+返回 `PreparedCompactPlan`，对固定 CUDA/Vulkan dense 绑定按非零 i32 flags 稳定筛选；支持 32/64 位分量的
+标量、向量、矩阵 record，计数留在设备。准备不执行数学操作。
+
+#### `ti.algorithms.prepare_unique(values, output, count, *, size=None)`
+#### `ti.algorithms.prepare_unique_by_key(keys, values, unique_keys, unique_values, count, *, size=None)`
+
+返回 `PreparedUniquePlan`，保留连续整数 key 段的首项/首 payload，不排序。`size` 在准备时固定；key/payload
+共用一次 native 前缀计算。plan 拥有私有 flags，在 root Graph 展开为执行 action，不承诺整操作 capture，也不
+支持结构化控制节点。两类 plan 均提供上述 prepared 生命周期；完整存储、输出前缀、显存与 recording 边界见
+[prepared compact/unique](native_algorithms.zh.md#prepared-compact-与连续-unique063)。
+
 ### Prefix Sum
 
 #### `ti.algorithms.PrefixSumExecutor(length).run(input_arr)`

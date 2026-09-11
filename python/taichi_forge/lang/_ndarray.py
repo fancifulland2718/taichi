@@ -681,6 +681,24 @@ class ScalarNdarray(Ndarray):
         self.element_type = dtype
 
     @classmethod
+    def _private_scratch_storage(cls, dtype, arr_shape):
+        """Uninitialized provider scratch with ordinary runtime ownership.
+
+        Internal callers must overwrite the full range before its first read.
+        Public ndarray construction keeps its zero-initialization contract.
+        """
+        value = cls.__new__(cls)
+        Ndarray.__init__(value)
+        value.dtype = cook_dtype(dtype)
+        value.arr = impl.get_runtime().prog.create_ndarray(
+            value.dtype, arr_shape, layout=Layout.NULL, zero_fill=False
+        )
+        value._register_runtime_object()
+        value.shape = tuple(value.arr.shape)
+        value.element_type = dtype
+        return value
+
+    @classmethod
     def _graph_pool_storage(cls, dtype, arr_shape, pool):
         """Materialize private Graph storage in an owned native CUDA pool."""
 

@@ -14205,6 +14205,19 @@ std::size_t Program::vulkan_compact_dense_field(SNode *values,
                   count_stride < sizeof(int32_t),
               "Vulkan native dense field compact requires contiguous values, "
               "flags, and output fields.");
+  return vulkan_compact_ranges(
+      get_dense_field_device_ptr(values), get_dense_field_device_ptr(flags),
+      get_dense_field_device_ptr(output), get_dense_field_device_ptr(count),
+      item_bytes, n, false);
+}
+
+std::size_t Program::vulkan_compact_ranges(DevicePtr values_ptr,
+                                         DevicePtr flags_ptr,
+                                         DevicePtr output_ptr,
+                                         DevicePtr count_ptr,
+                                         std::size_t item_bytes,
+                                         std::size_t n,
+                                         bool reuse_prefix) {
   if (n == 0) {
     return 0;
   }
@@ -14228,10 +14241,6 @@ std::size_t Program::vulkan_compact_dense_field(SNode *values,
   cache.ensure_prefix(prefix_bytes);
   const size_t value_total_bytes = n * item_bytes;
 
-  DevicePtr values_ptr = get_dense_field_device_ptr(values);
-  DevicePtr flags_ptr = get_dense_field_device_ptr(flags);
-  DevicePtr output_ptr = get_dense_field_device_ptr(output);
-  DevicePtr count_ptr = get_dense_field_device_ptr(count);
   DeviceAllocation values_alloc{values_ptr.device, values_ptr.alloc_id};
   DeviceAllocation flags_alloc{flags_ptr.device, flags_ptr.alloc_id};
   DeviceAllocation output_alloc{output_ptr.device, output_ptr.alloc_id};
@@ -14266,7 +14275,7 @@ std::size_t Program::vulkan_compact_dense_field(SNode *values,
               output_offset, count_alloc, count_offset)
           .bindings;
 
-  if (use_fused_recording) {
+  if (use_fused_recording && !reuse_prefix) {
     auto scan_plan = prepare_vulkan_i32_scan(this, cache.scan, prefix_alloc, n);
     cache.cached_bytes = cache.allocated_bytes();
     auto record_compact_fused =
@@ -14297,8 +14306,8 @@ std::size_t Program::vulkan_compact_dense_field(SNode *values,
           cmdlist->buffer_barrier(count_alloc);
         };
     VulkanCommandReplayKey command_key = make_vulkan_compact_fused_command_key(
-        true, value_type, values_alloc, values_offset, value_total_bytes,
-        flags_alloc, flags_offset, output_alloc, output_offset, count_alloc,
+        true, static_cast<int>(item_words), values_alloc, values_offset,
+        value_total_bytes, flags_alloc, flags_offset, output_alloc, output_offset, count_alloc,
         count_offset, prefix_alloc, prefix_bytes, flag_groups, word_groups,
         flags_pipeline, scatter_pipeline, flags_resource_set,
         scatter_resource_set, scan_plan);
@@ -14330,13 +14339,15 @@ std::size_t Program::vulkan_compact_dense_field(SNode *values,
   flags_command_key.push(flag_groups);
   flags_command_key.push_ptr(flags_pipeline);
   flags_command_key.push_ptr(flags_resource_set);
-  if (!cache.dense_field_flags_command_replay.submit_or_record(
-          this, device, flags_command_key, profiler_scopes,
-          record_compact_flags)) {
+  if (!reuse_prefix &&
+      !cache.dense_field_flags_command_replay.submit_or_record(
+          this, device, flags_command_key, profiler_scopes, record_compact_flags)) {
     enqueue_compute_op_lambda(record_compact_flags, {});
   }
 
-  enqueue_vulkan_i32_scan(this, cache.scan, prefix_alloc, n, profiler_scopes);
+  if (!reuse_prefix) {
+    enqueue_vulkan_i32_scan(this, cache.scan, prefix_alloc, n, profiler_scopes);
+  }
   cache.cached_bytes = cache.allocated_bytes();
 
   auto record_compact_scatter =
@@ -14355,7 +14366,7 @@ std::size_t Program::vulkan_compact_dense_field(SNode *values,
       };
   VulkanCommandReplayKey scatter_command_key;
   scatter_command_key.push(73);
-  scatter_command_key.push(static_cast<uint64_t>(value_type));
+  scatter_command_key.push(static_cast<uint64_t>(item_words));
   push_vulkan_command_key_range(scatter_command_key, values_alloc,
                                 values_offset, value_total_bytes);
   push_vulkan_command_key_range(scatter_command_key, flags_alloc, flags_offset,
@@ -19946,6 +19957,17 @@ std::size_t Program::vulkan_compact_dense_field(SNode *values,
                                                 int value_type,
                                                 std::size_t n) {
   TI_ERROR("Vulkan native dense field compact requires TI_WITH_VULKAN=ON.");
+  return 0;
+}
+
+std::size_t Program::vulkan_compact_ranges(DevicePtr values,
+                                         DevicePtr flags,
+                                         DevicePtr output,
+                                         DevicePtr count,
+                                         std::size_t item_bytes,
+                                         std::size_t n,
+                                         bool reuse_prefix) {
+  TI_ERROR("Vulkan native compact requires TI_WITH_VULKAN=ON.");
   return 0;
 }
 

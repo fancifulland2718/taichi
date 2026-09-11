@@ -247,9 +247,14 @@ def describe_storage(obj, *, access="readwrite"):
     """Describe an existing dense storage object without resolving a pointer."""
 
     if isinstance(obj, DenseNdarrayView):
-        if access != obj.descriptor.access.removeprefix("k").lower():
-            if access != "readwrite" or obj.descriptor.access != "kReadWrite":
-                return StorageDescription(_failure_reason="kReadOnlySource")
+        requested = {"read": "readonly", "write": "writeonly"}.get(access, access)
+        if requested not in ("readonly", "writeonly", "readwrite"):
+            raise ValueError("storage access must be read, write, or readwrite")
+        available = obj.descriptor.access.removeprefix("k").lower()
+        # Preserve the source descriptor's actual permission. A consumer may
+        # require only reads from a writable view; that does not widen access.
+        if requested != available and available != "readwrite":
+            return StorageDescription(_failure_reason="kReadOnlySource")
         return obj.description
     if isinstance(obj, StructNdarrayScalarMemberView):
         result = _ti_core._describe_struct_member_storage(

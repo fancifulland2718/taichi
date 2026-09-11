@@ -9,7 +9,60 @@ from taichi_forge.lang._storage_view import describe_storage
 from taichi_forge.lang.exception import TaichiRuntimeError
 
 
-class PreparedSortPlan:
+class _PreparedNativePlan:
+    """Shared fixed-binding lifetime and recording, not a new dispatch registry."""
+
+    def _validate_lifetime(self):
+        if self._command is None:
+            raise TaichiRuntimeError(f"{type(self).__name__} is closed")
+        if impl.get_runtime().prog is not self._program:
+            raise TaichiRuntimeError(f"{type(self).__name__} belongs to another runtime")
+
+    def run(self):
+        """Execute on current contents without host readback."""
+        self._validate_lifetime()
+        self._workspace_bytes = self._execute(self._command)
+
+    def close(self):
+        """Drop bindings without clearing shared scratch or waiting for GPU work."""
+        self._command = None
+        self._owners = ()
+        self._execute = None
+        self._program = None
+
+    def __enter__(self):
+        self._validate_lifetime()
+        return self
+
+    def __exit__(self, *_):
+        self.close()
+
+    def report(self):
+        return {
+            **self._description,
+            "physical_plan_id": self._physical_id,
+            "closed": self._command is None,
+            "binding_policy": "fixed_dense_storage",
+            "replay_mode": "rerecord",
+            "stream_binding": "runtime_ordered",
+            "workspace_owner": "program_primitive_arena",
+            "workspace_preparation": "lazy_first_execution",
+            "workspace_bytes_last_observed": self._workspace_bytes,
+            "device_capture": False,
+        }
+
+    def record(self):
+        """Return a runtime-ordered root-Graph action, not a capture recipe.
+
+        The action retains these fixed bindings. Explicitly closing this plan
+        invalidates its recordings; an enclosing Graph may use segmented or
+        ordinary execution.
+        """
+        self._validate_lifetime()
+        return _native_recording(self)
+
+
+class PreparedSortPlan(_PreparedNativePlan):
     """A stable ascending in-place sort over fixed CUDA/Vulkan dense storage.
 
     Keys and optional payload are equally sized, compact 1D scalar ranges with
@@ -67,56 +120,8 @@ class PreparedSortPlan:
         }
         canonical = json.dumps(self._description, sort_keys=True, separators=(",", ":"))
         self._physical_id = "prepared-native-sort-v1:" + hashlib.sha256(canonical.encode()).hexdigest()
-
-    def _validate_lifetime(self):
-        if self._command is None:
-            raise TaichiRuntimeError("Prepared sort plan is closed")
-        if impl.get_runtime().prog is not self._program:
-            raise TaichiRuntimeError("Prepared sort plan belongs to another runtime")
-
-    def run(self):
-        """Sort current contents; no host readback of keys or payload."""
-        self._validate_lifetime()
-        self._workspace_bytes = self._execute(self._command)
-
-    def close(self):
-        """Drop this plan's bindings without clearing shared backend scratch."""
-        self._command = None
-        self._owners = ()
-        self._execute = None
-        self._program = None
-
-    def __enter__(self):
-        self._validate_lifetime()
-        return self
-
-    def __exit__(self, *_):
-        self.close()
-
-    def report(self):
-        """Structural facts and last workspace observation, not timing claims."""
-        return {
-            **self._description,
-            "physical_plan_id": self._physical_id,
-            "closed": self._command is None,
-            "binding_policy": "fixed_dense_storage",
-            "replay_mode": "rerecord",
-            "stream_binding": "runtime_ordered",
-            "workspace_owner": "program_primitive_arena",
-            "workspace_preparation": "lazy_first_execution",
-            "workspace_bytes_last_observed": self._workspace_bytes,
-            "device_capture": False,
-        }
-
-    def record(self):
-        """Return one root-Graph native action with the same fixed bindings.
-
-        This is runtime-ordered execution, not a capture-safe sort description.
-        A graph containing it can segment or use ordinary execution. The action
-        retains this plan; closing the plan explicitly invalidates the action.
-        """
-        self._validate_lifetime()
-        return _sort_recording(self)
+        self._access = ("read_write",) * len(owners)
+        self._workspace_effect = "forge-native-sort-workspace"
 
 
 def prepare_sort(keys, values=None, *, nan_policy="last"):
@@ -124,14 +129,14 @@ def prepare_sort(keys, values=None, *, nan_policy="last"):
     return PreparedSortPlan(keys, values, nan_policy=nan_policy)
 
 
-def _sort_recording(plan):
+def _native_recording(plan):
     # Import the existing generic recording seam only when requested. Ordinary
     # algorithms import neither Graph nor hardware provider discovery.
     from taichi_forge.graph._ir import GraphAccess, ResourceEffect
     from taichi_forge.graph._native import BackendCommandRecording
     from taichi_forge.hardware._native_adapter import native_recording_node
 
-    class SortRecording(BackendCommandRecording):
+    class PrimitiveRecording(BackendCommandRecording):
         def __init__(self):
             super().__init__(
                 backend=plan._backend,
@@ -146,8 +151,11 @@ def _sort_recording(plan):
             object.__setattr__(
                 self,
                 "_effects",
-                tuple(ResourceEffect(value, GraphAccess.READ_WRITE, runtime_bound=False) for value in plan._owners)
-                + (ResourceEffect("forge-native-sort-workspace", GraphAccess.READ_WRITE, runtime_bound=False),),
+                tuple(
+                    ResourceEffect(value, GraphAccess(access), runtime_bound=False)
+                    for value, access in zip(plan._owners, plan._access)
+                )
+                + (ResourceEffect(plan._workspace_effect, GraphAccess.READ_WRITE, runtime_bound=False),),
             )
             object.__setattr__(self, "_graph_physical_plan_id", plan._physical_id)
 
@@ -167,10 +175,10 @@ def _sort_recording(plan):
                 self,
                 runtime_bindings=(),
                 lifetime_leases=(self._plan,),
-                debug_info={"kind": "prepared_native_sort", **self._plan._description},
+                debug_info=self._plan._description,
             )
 
-    return SortRecording()
+    return PrimitiveRecording()
 
 
 __all__ = ["PreparedSortPlan", "prepare_sort"]

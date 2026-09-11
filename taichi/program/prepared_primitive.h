@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "taichi/program/ndarray.h"
 
@@ -27,6 +28,17 @@ class PreparedPrimitiveSort {
   int nan_policy_{0};
   std::size_t key_bytes_{0};
   std::size_t value_bytes_{0};
+};
+
+// Columns share one predicate/prefix and a device count. All bindings are
+// resolved together; no other submission may interleave the column scatters.
+class PreparedPrimitiveCompact {
+ private:
+  friend class Program;
+  std::shared_ptr<PreparedNativeStorage> storage_;
+  std::vector<std::uintptr_t> cuda_pointers_;
+  std::vector<std::size_t> column_bytes_;
+  int count_{0};
 };
 
 }  // namespace taichi::lang

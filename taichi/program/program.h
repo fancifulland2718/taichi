@@ -127,6 +127,7 @@ class PreparedNativeStorage {
 };
 
 class PreparedPrimitiveSort;
+class PreparedPrimitiveCompact;
 
 // Cold storage bindings for a Python-owned CUDA C-ABI adapter. No vendor API
 // or resource ownership is introduced into Program by this packet.
@@ -1147,6 +1148,20 @@ class TI_DLL_EXPORT Program {
       const storage::DenseStorageDescriptor *values,
       int nan_policy);
   std::size_t execute_primitive_sort(const PreparedPrimitiveSort &plan);
+  std::shared_ptr<PreparedPrimitiveCompact> prepare_primitive_compact(
+      const std::vector<const storage::DenseStorageDescriptor *> &inputs,
+      const storage::DenseStorageDescriptor &flags,
+      const std::vector<const storage::DenseStorageDescriptor *> &outputs,
+      const storage::DenseStorageDescriptor &count);
+  std::size_t execute_primitive_compact(const PreparedPrimitiveCompact &plan);
+  // Internal continuation used only by one ordered multi-column submission.
+  std::size_t vulkan_compact_ranges(DevicePtr values,
+                                    DevicePtr flags,
+                                    DevicePtr output,
+                                    DevicePtr count,
+                                    std::size_t item_bytes,
+                                    std::size_t n,
+                                    bool reuse_prefix);
   intptr_t get_dense_storage_data_ptr_as_int(
       const storage::ResolvedDenseBinding &binding);
 

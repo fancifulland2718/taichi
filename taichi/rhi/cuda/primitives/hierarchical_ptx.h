@@ -309,7 +309,8 @@ std::size_t driver_compact_strided(void *values,
                                    std::size_t output_stride,
                                    std::size_t count_offset,
                                    void *stream,
-                                   PrimitiveWorkspaceArena *workspace_arena);
+                                   PrimitiveWorkspaceArena *workspace_arena,
+                                   bool reuse_prefix = false);
 
 std::size_t driver_bucket_builder_strided(
     void *keys,

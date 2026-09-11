@@ -1081,6 +1081,23 @@ a runtime-ordered Graph action, not a capture-safe CUDA sort. See
 [prepared sort](native_algorithms.en.md#prepared-sort-063) for dtype, alignment,
 NaN policy and lifetime boundaries.
 
+#### `ti.algorithms.prepare_compact(values, flags, output, count)`
+
+Returns `PreparedCompactPlan` for stable nonzero-i32-flag selection over fixed
+CUDA/Vulkan dense bindings. Scalar/vector/matrix records use 32/64-bit lanes;
+the count stays on device. Preparation does not execute the operation.
+
+#### `ti.algorithms.prepare_unique(values, output, count, *, size=None)`
+#### `ti.algorithms.prepare_unique_by_key(keys, values, unique_keys, unique_values, count, *, size=None)`
+
+Return `PreparedUniquePlan` for consecutive integer-key runs, retaining their first
+item/payload without sorting. `size` is fixed at preparation; key/payload outputs
+share one native prefix calculation. The plan owns flags and expands into root
+Graph actions, not a fully captured operation or a structured-control node. Both
+plan types expose the prepared lifecycle above. See
+[prepared compact and unique](native_algorithms.en.md#prepared-compact-and-consecutive-unique-063)
+for storage, output-prefix, workspace and recording boundaries.
+
 ### Prefix Sum
 
 #### `ti.algorithms.PrefixSumExecutor(length).run(input_arr)`

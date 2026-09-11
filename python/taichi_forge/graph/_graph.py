@@ -17481,6 +17481,16 @@ class GraphBuilder:
 
     def _append_native_executable(self, executable, *, admission):
         """Record a frozen native executable during build, never during replay."""
+        root_actions = executable.recordable_root_actions(
+            f"__native_root_{len(self._nodes)}_{self._dispatch_count}"
+        )
+        if root_actions is not None:
+            root_actions = tuple(root_actions)
+            if not root_actions:
+                raise TaichiRuntimeError("A native root expansion must contain an action")
+            for action in root_actions:
+                self._append_native_executable(action, admission=admission)
+            return self
         structured = executable.recordable_sequence
         if structured is not None:
             sequence = Sequential()

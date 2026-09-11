@@ -21,6 +21,8 @@ capability.
 | `ti.algorithms.sort(keys, values=None, ...)` | Stable Forge sort dispatcher. |
 | `ti.algorithms.sort_by_key(keys, values, ...)` | Sort keys and permute payload values. |
 | `ti.algorithms.prepare_sort(keys, values=None, ...)` | Prepare fixed dense bindings for repeated native stable sort (0.6.3). |
+| `ti.algorithms.prepare_compact(values, flags, output, count)` | Prepare fixed-binding stable compaction with a device count (0.6.3). |
+| `ti.algorithms.prepare_unique(values, output, count, ...)` / `prepare_unique_by_key(...)` | Prepare consecutive unique, sharing one prefix across key/payload outputs (0.6.3). |
 | `ti.algorithms.parallel_sort(keys, values=None)` | Vanilla-compatible legacy sorter. |
 | `ti.algorithms.PrefixSumExecutor(n).run(values)` | Prefix sum / scan. |
 | `ti.algorithms.device_prefix(values, extent, ...)` | Compose fixed-capacity primitive inputs through a device-resident valid count. |
@@ -92,6 +94,44 @@ preparation again. Runtime reset or source retirement invalidates the plan.
 scratch or waiting for GPU completion. Pending native work retains storage through
 the existing runtime completion mechanism. Do not close a plan before its Graph's
 last submission; close the Graph first when retiring both objects.
+
+## Prepared compact and consecutive unique (0.6.3)
+
+These plans have the same `run()`, `record()`, `report()` and `close()` lifecycle
+as prepared sort. CUDA/Vulkan bindings are compact, naturally aligned 1D dense
+ndarrays or qualified fields/views. Compact accepts scalar/vector/matrix records
+with i32/u32/f32/i64/u64/f64 lanes and matching input/output element types. Flags
+are scalar i32; nonzero selects a record. Capacity is positive and at most INT_MAX.
+Output capacity covers the input. Writable ranges cannot overlap any other bound
+range; read-only inputs may overlap each other.
+
+`count` is a nonempty i32 ndarray or scalar i32 field: the result remains on device
+in `count[0]` or `count[None]`. Only `output[:count]` is defined. There is no implicit
+host count readback. Inputs and flags may change in place between runs.
+
+```python
+plan = ti.algorithms.prepare_unique_by_key(
+    keys, values, unique_keys, unique_values, count, size=None,
+)
+plan.run()
+builder.append_native(plan.record())
+```
+
+Unique retains the first record of each **consecutive** equal-key run; it does not
+sort. Keys must be scalar i32/u32/i64/u64. `size` is fixed at preparation, between
+zero and capacity; `None` uses capacity. Payloads follow compact's record types.
+Preparation compiles the head kernel and owns 4 bytes/item of private flags,
+without executing mathematics or submitting/waiting for GPU work. The head kernel
+initializes the entire scratch range before use. Key/payload compaction shares one
+native prefix calculation; backend workspace remains lazy and Program-owned.
+
+Unique expands into head dispatch + native compaction at **root Graph build time**.
+This is not a nested Graph call or permission to put native compaction inside
+structured while/if blocks. The head can use existing replay, while native compact
+remains runtime-ordered: neither plan promises whole-operation CUDA capture.
+Reports distinguish private flags from last-observed shared native workspace;
+those bytes are not a per-plan exclusive VRAM measurement. These fixed algorithms
+do not add raw provider/primitive axes to CompileIQ.
 
 ## Backend Selection
 

@@ -943,7 +943,8 @@ std::size_t driver_compact_strided(void *values,
                                    std::size_t output_stride,
                                    std::size_t count_offset,
                                    void *stream,
-                                   PrimitiveWorkspaceArena *workspace_arena) {
+                                   PrimitiveWorkspaceArena *workspace_arena,
+                                   bool reuse_prefix) {
   TI_ERROR_IF(num_items < 0 || item_words <= 0,
               "CUDA Driver compact received an invalid size.");
   const std::size_t item_bytes =
@@ -987,16 +988,18 @@ std::size_t driver_compact_strided(void *values,
                                 &flags_stride_arg, &prefix_arg,
                                 &tile_counts_arg, &count_arg};
   const unsigned tile_grid = static_cast<unsigned>(tile_count);
-  CUDAContext::get_instance().launch(
-      kernels().compact_rank_tiles, "cuda_driver_compact_rank_tiles",
-      rank_args, {}, tile_grid, kBlockDim, 0, stream);
-  const std::size_t scan_bytes =
-      tile_count > 1
-          ? driver_inclusive_scan_strided(
-                tile_counts, static_cast<int>(tile_count),
-                CudaTransformValueType::i32, 0, sizeof(std::int32_t), false,
-                stream, workspace_arena)
-          : 0;
+  std::size_t scan_bytes = 0;
+  if (!reuse_prefix) {
+    CUDAContext::get_instance().launch(
+        kernels().compact_rank_tiles, "cuda_driver_compact_rank_tiles",
+        rank_args, {}, tile_grid, kBlockDim, 0, stream);
+    scan_bytes = tile_count > 1
+                     ? driver_inclusive_scan_strided(
+                           tile_counts, static_cast<int>(tile_count),
+                           CudaTransformValueType::i32, 0,
+                           sizeof(std::int32_t), false, stream, workspace_arena)
+                     : 0;
+  }
 
   void *values_arg = values;
   std::uint64_t values_offset_arg = values_offset;
